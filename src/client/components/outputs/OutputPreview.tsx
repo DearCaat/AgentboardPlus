@@ -4,6 +4,7 @@ import { ICON_SIZE } from '../controlStyles'
 import type { SessionMedia } from '@shared/types'
 import { LinkExternal01Icon, XCloseIcon } from '../icons'
 import { useSuspendTerminalInput } from '../settings/useDialogFocus'
+import { useTranslation } from '../../locale'
 
 const control = 'flex min-h-[44px] items-center justify-center rounded px-3 text-[12px] text-secondary hover:bg-hover hover:text-primary'
 
@@ -20,6 +21,7 @@ export function OutputPreview({ item, mobile, open, onClose, onChoose, status }:
   onChoose: () => void
   status?: string
 }) {
+  const t = useTranslation()
   const [load, setLoad] = useState<{ url: string } | { error: string; candidates?: string[]; attemptedPath?: string } | null>(null)
   const [width, setWidth] = useState(48)
   const [revision, setRevision] = useState(0)
@@ -90,13 +92,13 @@ export function OutputPreview({ item, mobile, open, onClose, onChoose, status }:
       hidden={!open}
       style={!open ? { display: 'none' } : mobile ? undefined : { width: `${width}%`, position: 'relative' }}
       data-testid="output-preview"
-      aria-label={item.label || 'Output preview'}
+      aria-label={item.label || t('Output preview')}
       className={mobile
         ? 'fixed inset-0 z-[55] flex flex-col bg-base pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]'
         : 'flex min-w-0 w-[48%] min-h-0 flex-col border-l border-border bg-base'}
     >
       {!mobile && <div
-        role="separator" aria-label="Resize output preview" aria-orientation="vertical"
+        role="separator" aria-label={t('Resize output preview')} aria-orientation="vertical"
         aria-valuemin={30} aria-valuemax={70} aria-valuenow={width} tabIndex={0}
         className="absolute -left-1 top-0 bottom-0 z-10 w-2 cursor-col-resize touch-none hover:bg-accent/30 focus-visible:bg-accent/30"
         onPointerDown={event => event.currentTarget.setPointerCapture(event.pointerId)}
@@ -114,36 +116,36 @@ export function OutputPreview({ item, mobile, open, onClose, onChoose, status }:
       />}
       {mobile && open && <MobileInputLock />}
       <div className="flex shrink-0 flex-wrap items-center gap-1 border-b border-border px-2 py-1">
-        {mobile && <button type="button" onClick={onClose} className={control}>← Terminal</button>}
+        {mobile && <button type="button" onClick={onClose} className={control}>{t('← Terminal')}</button>}
         <div className={`min-w-0 flex-1 px-1 ${mobile ? 'order-last basis-full py-1' : ''}`}>
-          <div className="truncate text-[13px] font-medium text-primary">{item.label || 'Output preview'}</div>
-          <div className="text-[12px] text-muted">{item.kind === 'link' ? 'Web page' : item.kind === 'visualization' ? 'Codex visualization' : item.kind === 'html' ? 'HTML report' : 'Live app'}</div>
+          <div className="truncate text-[13px] font-medium text-primary">{item.label || t('Output preview')}</div>
+          <div className="text-[12px] text-muted">{item.kind === 'link' ? t('Web page') : item.kind === 'visualization' ? t('Codex visualization') : item.kind === 'html' ? t('HTML report') : t('Live app')}</div>
         </div>
-        <button type="button" onClick={onChoose} className={control}>{item.kind === 'link' ? 'Links' : 'Previews'}</button>
-        <button type="button" onClick={() => setRevision(v => v + 1)} className={control}>Reload</button>
-        <a href={load && 'url' in load ? load.url : item.externalUrl ?? item.url} target="_blank" rel="noopener noreferrer" aria-label="Open output in new tab" className={control}>
-          <LinkExternal01Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} /><span className="ml-1">Open original</span>
+        <button type="button" onClick={onChoose} className={control}>{item.kind === 'link' ? t('Links') : t('Previews')}</button>
+        <button type="button" onClick={() => setRevision(v => v + 1)} className={control}>{t('Reload')}</button>
+        <a href={load && 'url' in load ? load.url : item.externalUrl ?? item.url} target="_blank" rel="noopener noreferrer" aria-label={t('Open output in new tab')} className={control}>
+          <LinkExternal01Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} /><span className="ml-1">{t('Open original')}</span>
         </a>
-        {!mobile && <button type="button" onClick={onClose} aria-label="Close preview" className={control}><XCloseIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} /></button>}
+        {!mobile && <button type="button" onClick={onClose} aria-label={t('Close preview')} className={control}><XCloseIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} /></button>}
       </div>
-      {item.kind === 'link' && <p className="shrink-0 border-b border-border px-3 py-2 text-[12px] text-muted">If this page stays blank or refuses to connect, use Open original.</p>}
+      {item.kind === 'link' && <p className="shrink-0 border-b border-border px-3 py-2 text-[12px] text-muted">{t('If this page stays blank or refuses to connect, use Open original.')}</p>}
       {load && 'error' in load ? (
         <div role="alert" className="min-h-0 overflow-y-auto p-5 text-[13px] text-secondary">
           <p>{load.error}</p>
-          {load.attemptedPath && <p className="mt-3 break-all">Looked for: <code>{load.attemptedPath}</code></p>}
-          {load.candidates && <ul aria-label="Matching session files" className="mt-3 space-y-2">
+          {load.attemptedPath && <p className="mt-3 break-all">{t('Looked for:')}{' '}<code>{load.attemptedPath}</code></p>}
+          {load.candidates && <ul aria-label={t('Matching session files')} className="mt-3 space-y-2">
             {load.candidates.map(candidate => <li key={candidate}><button type="button"
               className="min-h-[44px] w-full break-all rounded border border-border px-3 py-2 text-left hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
               onClick={() => setSelection({ itemUrl: item.url, path: candidate })}>{candidate}</button></li>)}
           </ul>}
-          <button type="button" onClick={() => { setSelection(null); setRevision(v => v + 1) }} className="mt-3 rounded border border-border px-3 py-2">Try again</button>
+          <button type="button" onClick={() => { setSelection(null); setRevision(v => v + 1) }} className="mt-3 rounded border border-border px-3 py-2">{t('Try again')}</button>
         </div>
       ) : (
         <>
-          {waiting && <div role="status" className="px-4 py-3 text-[12px] text-muted">{slow ? 'Still connecting. Preview ports must be reachable from this device. Try opening in a new tab or check your network.' : 'Opening preview…'}</div>}
+          {waiting && <div role="status" className="px-4 py-3 text-[12px] text-muted">{slow ? t('Still connecting. Preview ports must be reachable from this device. Try opening in a new tab or check your network.') : t('Opening preview…')}</div>}
           {load && 'url' in load && <iframe
             key={revision}
-            title={item.label || 'Output preview'}
+            title={item.label || t('Output preview')}
             src={load.url}
             className="min-h-0 w-full flex-1 border-0 bg-white"
             sandbox="allow-scripts allow-same-origin allow-forms allow-downloads"
@@ -152,7 +154,7 @@ export function OutputPreview({ item, mobile, open, onClose, onChoose, status }:
           />}
         </>
       )}
-      {mobile && <div className="shrink-0 border-t border-border px-3 py-2 text-[12px] text-muted">Agent {status === 'working' ? 'is still working' : status === 'permission' ? 'needs permission' : 'status: ' + (status || 'unknown')}</div>}
+      {mobile && <div className="shrink-0 border-t border-border px-3 py-2 text-[12px] text-muted">{t('Agent')}{' '}{status === 'working' ? 'is still working' : status === 'permission' ? 'needs permission' : 'status: ' + (status || 'unknown')}</div>}
     </section>
   )
 }

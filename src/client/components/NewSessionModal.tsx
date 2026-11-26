@@ -12,6 +12,7 @@ import {
   yoloConflict,
   yoloFlagFor,
 } from '@shared/yolo'
+import { useTranslation } from '../locale'
 
 interface NewSessionModalProps {
   isOpen: boolean
@@ -47,6 +48,7 @@ export default function NewSessionModal({
   initialPath,
   initialCommand,
 }: NewSessionModalProps) {
+  const t = useTranslation()
   const [projectPath, setProjectPath] = useState('')
   const [name, setName] = useState('')
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null)
@@ -314,11 +316,11 @@ export default function NewSessionModal({
   // Build button list: presets + Custom
   const allOptions = [
     ...commandPresets.map(p => ({ id: p.id, label: p.label, isCustom: false, agentType: p.agentType, command: p.command })),
-    { id: 'custom', label: 'Custom', isCustom: true, agentType: undefined, command: undefined },
+    { id: 'custom', label: t('Custom'), isCustom: true, agentType: undefined, command: undefined },
   ]
 
   const hostOptions = [
-    { id: '', label: 'Local', ok: true, error: undefined },
+    { id: '', label: t('Local'), ok: true, error: undefined },
     ...remoteHosts.map((hostStatus) => ({
       id: hostStatus.host,
       label: hostStatus.host,
@@ -346,19 +348,19 @@ export default function NewSessionModal({
         className="max-h-[calc(100dvh-2rem)] w-full max-w-md overflow-y-auto border border-border bg-elevated p-6"
       >
         <h2 id="new-session-title" className="text-sm font-semibold uppercase tracking-wider text-primary text-balance">
-          New Session
+          {t('New Session')}
         </h2>
 
         <div className="mt-4 space-y-4">
           {showHostPicker && (
             <div>
               <label className="mb-1.5 block text-xs text-secondary">
-                Host
+                {t('Host')}
               </label>
               <div
                 className="flex flex-wrap gap-2"
                 role="radiogroup"
-                aria-label="Host"
+                aria-label={t('Host')}
                 data-testid="host-select"
               >
                 {hostOptions.map((option, index) => {
@@ -371,7 +373,7 @@ export default function NewSessionModal({
                       role="radio"
                       aria-checked={isActive}
                       aria-label={option.label}
-                      title={!option.ok ? (option.error || 'Unreachable') : undefined}
+                      title={!option.ok ? (option.error || t('Unreachable')) : undefined}
                       tabIndex={isActive ? 0 : -1}
                       onClick={() => setSelectedHost(option.id)}
                       onKeyDown={(e) => {
@@ -403,12 +405,12 @@ export default function NewSessionModal({
 
           <div>
             <label className="mb-1.5 block text-xs text-secondary">
-              Command
+              {t('Command')}
             </label>
             <div
               className="flex flex-wrap gap-2"
               role="radiogroup"
-              aria-label="Command preset"
+              aria-label={t('Command preset')}
               data-testid="command-select"
             >
               {allOptions.map((option, index) => {
@@ -469,7 +471,7 @@ export default function NewSessionModal({
             <input
               value={command}
               onChange={(event) => setCommand(event.target.value)}
-              placeholder="Enter command..."
+              placeholder={t('Enter command...')}
               className="input mt-2 font-mono text-xs"
             />
 
@@ -485,7 +487,7 @@ export default function NewSessionModal({
                 disabled={yoloDisabled}
                 onChange={(event) => handleYoloToggle(event.target.checked)}
               />
-              yolo mode — skip permission prompts
+              {t('yolo mode — skip permission prompts')}
             </label>
           </div>
           <ProjectPathInput
@@ -494,16 +496,16 @@ export default function NewSessionModal({
             onChange={setProjectPath}
             remote={isRemoteHost}
             onBrowse={() => setShowBrowser(true)}
-            placeholder={isRemoteHost ? '/home/user/project' : activeProjectPath || lastProjectPath || defaultProjectDir || 'Find a recent project or enter a path…'}
+            placeholder={isRemoteHost ? '/home/user/project' : activeProjectPath || lastProjectPath || defaultProjectDir || t('Find a recent project or enter a path…')}
           />
           <div>
             <label className="mb-1.5 block text-xs text-secondary">
-              Display Name
+              {t('Display Name')}
             </label>
             <input
               value={name}
               onChange={(event) => setName(event.target.value)}
-              placeholder="auto-generated"
+              placeholder={t('auto-generated')}
               className="input text-sm placeholder:italic"
             />
           </div>
@@ -511,10 +513,10 @@ export default function NewSessionModal({
 
         <div className="mt-6 flex justify-end gap-2">
           <button type="button" onClick={onClose} className="btn">
-            Cancel
+            {t('Cancel')}
           </button>
           <button type="submit" className="btn btn-primary">
-            Create
+            {t('Create')}
           </button>
         </div>
       </form>

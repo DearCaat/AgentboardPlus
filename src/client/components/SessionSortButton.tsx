@@ -3,6 +3,7 @@ import { useEffect, useId, useRef } from 'react'
 import { useSettingsStore } from '../stores/settingsStore'
 import { ICON_SIZE, TOUCH_TARGET_CLASS, iconButtonClass } from './controlStyles'
 import { CheckIcon, SwitchVertical01Icon } from './icons'
+import { useTranslation } from '../locale'
 
 const options = [
   { id: 'newest', label: 'Newest first' },
@@ -19,6 +20,7 @@ interface Props {
 }
 
 export default function SessionSortButton({ open, onOpenChange, placement = 'down', showAnchorControl = false }: Props) {
+  const t = useTranslation()
   const anchor = useSettingsStore((state) => state.sidebarAnchor)
   const setAnchor = useSettingsStore((state) => state.setSidebarAnchor)
   const anchorLabelId = useId()
@@ -74,8 +76,8 @@ export default function SessionSortButton({ open, onOpenChange, placement = 'dow
       <button
         ref={triggerRef}
         type="button"
-        title={`Sort: ${label}`}
-        aria-label={`Sort: ${label}`}
+        title={t('Sort: {label}', { label: t(label) })}
+        aria-label={t('Sort: {label}', { label: t(label) })}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
@@ -94,7 +96,7 @@ export default function SessionSortButton({ open, onOpenChange, placement = 'dow
         <div
           id={menuId}
           role="menu"
-          aria-label="Sort sessions"
+          aria-label={t('Sort sessions')}
           className={`absolute left-2 right-2 z-20 ${placement === 'up' ? 'bottom-full mb-1' : 'top-full mt-1'} rounded border border-border bg-surface p-1.5 text-xs shadow-lg`}
           onKeyDown={(event) => {
             if (event.key === 'Escape') {
@@ -112,7 +114,7 @@ export default function SessionSortButton({ open, onOpenChange, placement = 'dow
             }
           }}
         >
-          <div className="px-2 py-1.5 text-[11px] font-medium text-secondary">Sort sessions</div>
+          <div className="px-2 py-1.5 text-[11px] font-medium text-secondary">{t('Sort sessions')}</div>
           {options.map((option, index) => (
             <button
               key={option.id}
@@ -134,8 +136,8 @@ export default function SessionSortButton({ open, onOpenChange, placement = 'dow
                 {selected === option.id && <CheckIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />}
               </span>
               <span>
-                <span className="block">{option.label}</span>
-                {'description' in option && <span className="mt-0.5 block text-[11px] text-secondary">{option.description}</span>}
+                <span className="block">{t(option.label)}</span>
+                {'description' in option && <span className="mt-0.5 block text-[11px] text-secondary">{t(option.description)}</span>}
               </span>
             </button>
           ))}
@@ -143,7 +145,7 @@ export default function SessionSortButton({ open, onOpenChange, placement = 'dow
             <>
               <div role="separator" className="my-1.5 border-t border-border" />
               <div className="flex flex-wrap items-center justify-between gap-2 px-2 py-1">
-                <span id={anchorLabelId} className="text-[11px] text-secondary">List starts at</span>
+                <span id={anchorLabelId} className="text-[11px] text-secondary">{t('List starts at')}</span>
                 <div role="group" aria-labelledby={anchorLabelId} className="flex border border-border bg-base p-[2px]">
                   {(['top', 'bottom'] as const).map((value, index) => (
                     <button
@@ -162,7 +164,7 @@ export default function SessionSortButton({ open, onOpenChange, placement = 'dow
                       }}
                       className={`h-[26px] px-2 text-[11px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent [@media(pointer:coarse)]:min-h-[44px] [@media(pointer:coarse)]:min-w-[44px] ${anchor === value ? 'bg-hover text-primary shadow-[inset_0_0_0_1px_var(--border)]' : 'text-muted hover:text-primary'}`}
                     >
-                      {value === 'top' ? 'Top' : 'Bottom'}
+                      {value === 'top' ? t('Top') : t('Bottom')}
                     </button>
                   ))}
                 </div>

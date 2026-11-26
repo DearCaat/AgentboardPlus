@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { useSessionStore } from '../stores/sessionStore'
+import { useTranslation } from '../locale'
 
 interface SessionAccess {
   grantId: string | null
@@ -9,6 +10,7 @@ interface SessionAccess {
 const endpoint = '/api/workspace/session-owner'
 
 export default function SessionAccessForm() {
+  const t = useTranslation()
   const sessions = useSessionStore(state => state.sessions)
   const [sessionId, setSessionId] = useState('')
   const [access, setAccess] = useState<SessionAccess>()
@@ -72,12 +74,12 @@ export default function SessionAccessForm() {
   if (!remoteSessions.length) return null
   return (
     <form className="space-y-2 border-t border-border pt-3" onSubmit={save}>
-      <h3 className="text-sm font-semibold">Session access</h3>
+      <h3 className="text-sm font-semibold">{t('Session access')}</h3>
       <label className="block text-sm">
-        Remote tmux session
+        {t('Remote tmux session')}
         <select className="input mt-1 w-full" value={activeId} disabled={saving}
           onChange={event => setSessionId(event.target.value)}>
-          <option value="">Choose a session</option>
+          <option value="">{t('Choose a session')}</option>
           {remoteSessions.map(session => (
             <option key={session.id} value={session.id}>
               {session.host} / {session.tmuxWindow.slice(0, session.tmuxWindow.lastIndexOf(':'))}
@@ -87,15 +89,15 @@ export default function SessionAccessForm() {
       </label>
       {access && (
         <label className="block text-sm">
-          Shared token
+          {t('Shared token')}
           <select className="input mt-1 w-full" value={grantId} disabled={saving}
             onChange={event => setGrantId(event.target.value)}>
-            <option value="">Administrator only</option>
+            <option value="">{t('Administrator only')}</option>
             {access.grants.map(grant => <option key={grant.id} value={grant.id}>{grant.label}</option>)}
           </select>
         </label>
       )}
-      {access && <button type="submit" className="btn" disabled={saving || (grantId || null) === access.grantId}>Save session access</button>}
+      {access && <button type="submit" className="btn" disabled={saving || (grantId || null) === access.grantId}>{t('Save session access')}</button>}
       {feedback && <p className="text-sm text-secondary" role="status">{feedback}</p>}
     </form>
   )

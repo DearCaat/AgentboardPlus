@@ -4,6 +4,7 @@ import type { Session, ServerMessage } from '@shared/types'
 import type { HistoryPage, SavedSession } from '@shared/persistence'
 import { libraryRequest, historyButton } from './api'
 import { createOperationId } from '../../utils/operationId'
+import { useTranslation } from '../../locale'
 
 interface SessionRecoveryProps {
   open: boolean
@@ -26,6 +27,7 @@ export default function SessionRecovery({
   onClose,
   onOpenSession,
 }: SessionRecoveryProps) {
+  const t = useTranslation()
   const [sessions, setSessions] = useState<SavedSession[]>([])
   const [error, setError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
@@ -97,11 +99,11 @@ export default function SessionRecovery({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
-          <h2 className="text-sm font-semibold text-primary">Session recovery</h2>
+          <h2 className="text-sm font-semibold text-primary">{t('Session recovery')}</h2>
           <button
             onClick={onClose}
             className="text-secondary hover:text-primary"
-            aria-label="Close"
+            aria-label={t('Close')}
           >
             ✕
           </button>
@@ -114,7 +116,7 @@ export default function SessionRecovery({
           )}
           {!sessions.length && !error && (
             <p className="p-4 text-center text-[12px] text-secondary">
-              No interrupted sessions.
+              {t('No interrupted sessions.')}
             </p>
           )}
           {sessions.map((saved) => (
@@ -136,7 +138,7 @@ export default function SessionRecovery({
                 disabled={busyId === saved.id}
                 onClick={() => void reopen(saved)}
               >
-                Reopen
+                {t('Reopen')}
               </button>
             </div>
           ))}

@@ -9,6 +9,7 @@ import { ChevronRightIcon, Image01Icon, XCloseIcon } from './icons'
 import { ICON_SIZE } from './controlStyles'
 import { useFocusTrap, useSuspendTerminalInput } from './settings/useDialogFocus'
 import { getFocusable, nextTrapTarget } from './settings/focusTrap'
+import { useTranslation } from '../locale'
 
 export interface MediaLightboxProps {
   media: SessionMedia
@@ -28,6 +29,7 @@ const buttonClass = 'flex min-h-[44px] min-w-[44px] items-center justify-center 
 const isLocal = (media: SessionMedia) => media.url.startsWith('/api/session-media/')
 
 export default function MediaLightbox(props: MediaLightboxProps) {
+  const t = useTranslation()
   const { media, enabled, onClose, canPrevious, canNext, navigating, navigationError, onRetryNavigation, label } = props
   const panel = useRef<HTMLDivElement>(null)
   const close = useRef<HTMLButtonElement>(null)
@@ -79,7 +81,7 @@ export default function MediaLightbox(props: MediaLightboxProps) {
   const dialog = <div className="media-lightbox-backdrop fixed inset-0 z-[80] flex items-center justify-center bg-black/80"
     onClick={event => { event.stopPropagation(); if (event.target === event.currentTarget) onClose() }}
     onPointerDown={event => event.stopPropagation()}>
-    <div ref={panel} data-testid="media-lightbox" role="dialog" aria-modal="true" aria-label="Media preview"
+    <div ref={panel} data-testid="media-lightbox" role="dialog" aria-modal="true" aria-label={t('Media preview')}
       data-suspends-terminal="" tabIndex={-1}
       onKeyDown={event => {
         // The portal remains a React child of the terminal. Do not bubble typing,
@@ -92,26 +94,26 @@ export default function MediaLightbox(props: MediaLightboxProps) {
       }}
       className="media-lightbox-panel flex flex-col overflow-hidden border border-white/15 bg-neutral-950 text-white shadow-2xl outline-none">
       <header className="flex shrink-0 items-center gap-2 border-b border-white/10 px-3">
-        <span className="min-w-0 flex-1 truncate text-sm" title={media.label}>{media.label || 'Image'}</span>
+        <span className="min-w-0 flex-1 truncate text-sm" title={media.label}>{media.label || t('Image')}</span>
         {label && <span className="shrink-0 text-xs text-white/60">{label}</span>}
-        <button ref={close} type="button" className={buttonClass} aria-label="Close image viewer" onClick={onClose}>
+        <button ref={close} type="button" className={buttonClass} aria-label={t('Close image viewer')} onClick={onClose}>
           <XCloseIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} aria-hidden="true" />
         </button>
       </header>
       <ImageView key={media.url} media={media} previewSrc={props.previewSrc} enabled={enabled} />
-      {!enabled && <p role="status" className="px-4 py-2 text-center text-sm text-white/70">Waiting for terminal recovery…</p>}
+      {!enabled && <p role="status" className="px-4 py-2 text-center text-sm text-white/70">{t('Waiting for terminal recovery…')}</p>}
       {navigationError && <div role="alert" className="px-4 py-2 text-center text-sm text-white/70">
         {navigationError}{' '}{onRetryNavigation && <button type="button" className="min-h-[44px] text-accent underline"
-          disabled={!enabled || navigating} onClick={onRetryNavigation}>Retry navigation</button>}
+          disabled={!enabled || navigating} onClick={onRetryNavigation}>{t('Retry navigation')}</button>}
       </div>}
-      <nav aria-label="Image navigation" className="flex shrink-0 items-center justify-between gap-2 border-t border-white/10 p-2">
-        <button type="button" className={buttonClass} aria-label="Previous image" onClick={() => navigate('previous')}
+      <nav aria-label={t('Image navigation')} className="flex shrink-0 items-center justify-between gap-2 border-t border-white/10 p-2">
+        <button type="button" className={buttonClass} aria-label={t('Previous image')} onClick={() => navigate('previous')}
           disabled={!enabled || navigating || !canPrevious}>
-          <ChevronRightIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} className="rotate-180" aria-hidden="true" />Previous
+          <ChevronRightIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} className="rotate-180" aria-hidden="true" />{t('Previous')}
         </button>
-        <span role="status" className="text-xs text-white/60">{navigating ? 'Loading images…' : ''}</span>
-        <button type="button" className={buttonClass} aria-label="Next image" onClick={() => navigate('next')}
-          disabled={!enabled || navigating || !canNext}>Next<ChevronRightIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} aria-hidden="true" /></button>
+        <span role="status" className="text-xs text-white/60">{navigating ? t('Loading images…') : ''}</span>
+        <button type="button" className={buttonClass} aria-label={t('Next image')} onClick={() => navigate('next')}
+          disabled={!enabled || navigating || !canNext}>{t('Next')}<ChevronRightIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} aria-hidden="true" /></button>
       </nav>
     </div>
   </div>
@@ -120,6 +122,7 @@ export default function MediaLightbox(props: MediaLightboxProps) {
 
 type Preview = { status: 'idle' | 'loading' | 'error' } | { status: 'ready'; src: string }
 function ImageView({ media, previewSrc, enabled }: Pick<MediaLightboxProps, 'media' | 'previewSrc' | 'enabled'>) {
+  const t = useTranslation()
   const [preview, setPreview] = useState<Preview>(previewSrc ? { status: 'ready', src: previewSrc } : { status: 'idle' })
   const [full, setFull] = useState<'idle' | 'loading' | 'ready' | 'error'>(enabled ? 'loading' : 'idle')
   const previewRef = useRef(preview)
@@ -163,26 +166,26 @@ function ImageView({ media, previewSrc, enabled }: Pick<MediaLightboxProps, 'med
         {preview.status === 'ready' && full !== 'ready' && <img data-testid="media-lightbox-preview" src={preview.src}
           alt={`${media.label || 'Image'} preview`} className="media-lightbox-image"
           onError={() => { source.current = undefined; setPreview({ status: 'error' }) }} />}
-        {loadingOriginal && <img key={token} data-testid="media-lightbox-original" src={mediaPayloadUrl(media.url)} alt={media.label || 'Image'}
+        {loadingOriginal && <img key={token} data-testid="media-lightbox-original" src={mediaPayloadUrl(media.url)} alt={media.label || t('Image')}
           className={`media-lightbox-image ${full === 'ready' ? '' : 'invisible'}`}
           onLoad={() => { if (visible.current && generation.current === token) setFull('ready') }}
           onError={() => { if (visible.current && generation.current === token) setFull('error') }} />}
         {preview.status !== 'ready' && full !== 'ready' && <div className="col-start-1 row-start-1 flex flex-col items-center justify-center gap-2 text-sm text-white/60">
           <Image01Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} aria-hidden="true" />
-          <span role="status">{full === 'loading' ? 'Loading image…' : preview.status === 'loading' ? 'Loading preview…' : 'Preview unavailable'}</span>
+          <span role="status">{full === 'loading' ? t('Loading image…') : preview.status === 'loading' ? t('Loading preview…') : t('Preview unavailable')}</span>
         </div>}
       </div>
     </div>
     <div className="flex shrink-0 flex-wrap items-center justify-center gap-x-4 gap-y-1 px-3 text-sm">
-      {full === 'loading' && enabled && <span role="status" className="text-white/60">Loading full image…</span>}
-      {full === 'error' && <span role="alert" className="text-white/60">Could not load the full image.</span>}
+      {full === 'loading' && enabled && <span role="status" className="text-white/60">{t('Loading full image…')}</span>}
+      {full === 'error' && <span role="alert" className="text-white/60">{t('Could not load the full image.')}</span>}
       {full === 'error' && <button type="button" className={`${buttonClass} border border-white/20`}
         disabled={!enabled} onClick={() => { generation.current++; setFull('loading') }}>
-        Retry full image
+        {t('Retry full image')}
       </button>}
       <a href={mediaPayloadUrl(media.url)} target="_blank" rel="noreferrer noopener" aria-disabled={!enabled} tabIndex={enabled ? 0 : -1}
         onClick={event => { if (!enabled) event.preventDefault() }}
-        className={`flex min-h-[44px] items-center text-accent underline underline-offset-2 ${enabled ? '' : 'opacity-35'}`}>Open original</a>
+        className={`flex min-h-[44px] items-center text-accent underline underline-offset-2 ${enabled ? '' : 'opacity-35'}`}>{t('Open original')}</a>
     </div>
   </>
 }

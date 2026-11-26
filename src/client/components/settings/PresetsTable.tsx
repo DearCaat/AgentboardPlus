@@ -22,8 +22,10 @@ import { isCompletePreset, patchPreset, validatePresetField, type PresetField } 
 import { PRESET_GRID, PresetRow } from './PresetRow'
 import { CONTROL_BUTTON, HELP_TEXT } from './styles'
 import type { RowControlProps } from './types'
+import { useTranslation } from '../../locale'
 
 export function PresetsTable({ ids }: RowControlProps) {
+  const t = useTranslation()
   const presets = useSettingsStore((state) => state.commandPresets)
   const defaultPresetId = useSettingsStore((state) => state.defaultPresetId)
   const [pending, setPending] = useState<CommandPreset | null>(null)
@@ -106,10 +108,10 @@ export function PresetsTable({ ids }: RowControlProps) {
   return (
     <div className="w-full min-w-0">
       <div aria-hidden="true" className={cn(PRESET_GRID, 'border-b border-border pb-1 text-[11px] uppercase tracking-wide text-muted max-md:hidden')}>
-        <span className="text-center">Default</span>
-        <span>Icon</span>
-        <span>Name</span>
-        <span>Command</span>
+        <span className="text-center">{t('Default')}</span>
+        <span>{t('Icon')}</span>
+        <span>{t('Name')}</span>
+        <span>{t('Command')}</span>
         <span className="w-[32px]" />
       </div>
       <div role="list" aria-labelledby={ids.label} aria-describedby={ids.description} className="divide-y divide-border-subtle">
@@ -135,16 +137,16 @@ export function PresetsTable({ ids }: RowControlProps) {
       </div>
       {pending && (
         <p className={cn(HELP_TEXT, 'pb-2')} role="status">
-          Enter a name and a command to add the preset.
+          {t('Enter a name and a command to add the preset.')}
         </p>
       )}
       <div className="mt-2 flex items-center gap-3">
         <button ref={addRef} type="button" className={CONTROL_BUTTON} onClick={handleAdd} disabled={!canAdd}>
           <PlusIcon width={ICON_SIZE.default} height={ICON_SIZE.default} className="mr-1.5" />
-          Add preset
+          {t('Add preset')}
         </button>
         {presets.length >= MAX_PRESETS && (
-          <span className={HELP_TEXT}>Maximum of {MAX_PRESETS} presets.</span>
+          <span className={HELP_TEXT}>{t('Maximum of')}{' '}{MAX_PRESETS}{' '}{t('presets.')}</span>
         )}
       </div>
     </div>

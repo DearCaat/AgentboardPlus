@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { AgentType, Session } from '@shared/types'
 import { getSessionDisplayName, useSessionOrganizationStore, type WorkspaceView } from '../stores/sessionOrganizationStore'
 import { useSessionStore } from '../stores/sessionStore'
+import { useTranslation } from '../locale'
 
 const endpoint = '/api/workspace/presets'
 const harnesses: ReadonlyArray<[AgentType, string]> = [
@@ -33,6 +34,7 @@ export default function WorkspacePresets({
   sessions: Session[]
   onClose: () => void
 }) {
+  const t = useTranslation()
   const dialog = useRef<HTMLDialogElement>(null)
   const organization = useSessionOrganizationStore(state => state.organization)
   const workspaceId = useSessionOrganizationStore(state => state.workspace.id)
@@ -177,26 +179,26 @@ export default function WorkspacePresets({
       onCancel={event => { event.preventDefault(); if (!busy) onClose() }}
     >
       <div className="flex items-center justify-between gap-2">
-        <h2 id="presets-title" className="font-semibold">Workspace presets</h2>
-        <button type="button" className="btn" disabled={!!busy} onClick={onClose}>Close</button>
+        <h2 id="presets-title" className="font-semibold">{t('Workspace presets')}</h2>
+        <button type="button" className="btn" disabled={!!busy} onClick={onClose}>{t('Close')}</button>
       </div>
       <div className="my-3 flex gap-2">
         <button type="button" className="btn" aria-pressed={mode === 'load'} disabled={!!busy}
-          onClick={showPresets}>Load preset</button>
+          onClick={showPresets}>{t('Load preset')}</button>
         <button type="button" className="btn" aria-pressed={mode === 'save' && !editing} disabled={!!busy}
-          onClick={() => editPreset()}>Save current workspace</button>
+          onClick={() => editPreset()}>{t('Save current workspace')}</button>
       </div>
       {mode === 'save' ? (
         <form className="space-y-3" onSubmit={save}>
           {editing && <p className="text-sm text-secondary">
-            Replace <strong>{editing.name}</strong> ({editing.count} sessions) with the current workspace and the sessions selected below.
+            {t('Replace {name} ({count} sessions) with the current workspace and the sessions selected below.', { name: editing.name, count: editing.count })}
           </p>}
           <label className="block text-sm">
-            Preset name
+            {t('Preset name')}
             <input className="input mt-1 w-full" value={name} onChange={event => setName(event.target.value)} required maxLength={80} />
           </label>
           <fieldset className="space-y-2" disabled={!!busy}>
-            <legend className="mb-2 text-sm font-medium">Sessions to restore</legend>
+            <legend className="mb-2 text-sm font-medium">{t('Sessions to restore')}</legend>
             {selections.map(item => {
               const session = sessions.find(entry => entry.id === item.id)
               if (!session) return null
@@ -208,16 +210,16 @@ export default function WorkspacePresets({
                       updateSelection(item.id, { included: event.target.checked })} />
                     {label}
                   </label>
-                  <p className="break-all text-xs text-secondary">{session.host || 'Local'} · {session.tmuxWindow} · {session.projectPath}</p>
+                  <p className="break-all text-xs text-secondary">{session.host || t('Local')} · {session.tmuxWindow} · {session.projectPath}</p>
                   {item.included && (
                     <div className="flex flex-wrap gap-2">
-                      <select aria-label={'Harness for ' + label} className="input text-sm" value={item.harness}
+                      <select aria-label={t('Harness for {name}', { name: label })} className="input text-sm" value={item.harness}
                         onChange={event => updateSelection(item.id, { harness: event.target.value as TerminalSelection['harness'] })}>
-                        <option value="">Shell</option>
+                        <option value="">{t('Shell')}</option>
                         {harnesses.map(([value, title]) => <option key={value} value={value}>{title}</option>)}
                       </select>
                       {item.harness && (
-                        <input aria-label={'Session ID for ' + label} placeholder="Harness session ID"
+                        <input aria-label={t('Session ID for {name}', { name: label })} placeholder={t('Harness session ID')}
                           className="input min-w-[12rem] flex-1 text-sm" value={item.conversationId} maxLength={128}
                           onChange={event => updateSelection(item.id, { conversationId: event.target.value })} />
                       )}
@@ -227,33 +229,33 @@ export default function WorkspacePresets({
               )
             })}
           </fieldset>
-          <button type="submit" className="btn btn-primary" disabled={!!busy || !name.trim()}>{editing ? 'Update preset' : 'Save'}</button>
+          <button type="submit" className="btn btn-primary" disabled={!!busy || !name.trim()}>{editing ? t('Update preset') : t('Save')}</button>
         </form>
       ) : (
         <ul className="divide-y divide-border">
           {presets.map(preset => (
             <li key={preset.id} className="space-y-2 py-2 text-sm">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="min-w-0 break-words"><strong>{preset.name}</strong><span className="ml-2 text-secondary">{preset.count} sessions</span></span>
+                <span className="min-w-0 break-words"><strong>{preset.name}</strong><span className="ml-2 text-secondary">{t('{count} sessions', { count: preset.count })}</span></span>
                 <div className="flex flex-wrap gap-1">
                   {workspaceId === preset.id && preset.count > 0 && (
                     <button type="button" className="btn" disabled={!!busy}
-                      onClick={() => void openPreset(preset, 'restore')}>Restore missing sessions</button>
+                      onClick={() => void openPreset(preset, 'restore')}>{t('Restore missing sessions')}</button>
                   )}
                   <button type="button" className="btn btn-primary" disabled={!!busy}
-                    onClick={() => void openPreset(preset, 'load')}>Load</button>
-                  <button type="button" className="btn" disabled={!!busy} onClick={() => editPreset(preset)}>Update</button>
+                    onClick={() => void openPreset(preset, 'load')}>{t('Load')}</button>
+                  <button type="button" className="btn" disabled={!!busy} onClick={() => editPreset(preset)}>{t('Update')}</button>
                   <button type="button" className="btn" disabled={!!busy || deleting === preset.id}
-                    onClick={() => { setDeleting(preset.id); setFeedback('') }}>Delete</button>
+                    onClick={() => { setDeleting(preset.id); setFeedback('') }}>{t('Delete')}</button>
                 </div>
               </div>
               {deleting === preset.id && (
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-border p-2">
-                  <p>Delete <strong>{preset.name}</strong> ({preset.count} sessions)?</p>
+                  <p>{t('Delete {name} ({count} sessions)?', { name: preset.name, count: preset.count })}</p>
                   <div className="flex flex-wrap gap-1">
-                    <button type="button" className="btn" disabled={!!busy} onClick={() => setDeleting(undefined)}>Cancel</button>
+                    <button type="button" className="btn" disabled={!!busy} onClick={() => setDeleting(undefined)}>{t('Cancel')}</button>
                     <button type="button" className="btn btn-danger" disabled={!!busy}
-                      onClick={() => void deletePreset(preset)}>Delete preset</button>
+                      onClick={() => void deletePreset(preset)}>{t('Delete preset')}</button>
                   </div>
                 </div>
               )}
@@ -261,11 +263,11 @@ export default function WorkspacePresets({
           ))}
         </ul>
       )}
-      {(busy || feedback) && <p role="status" className="mt-3 text-sm text-secondary">{busy || feedback}</p>}
+      {(busy || feedback) && <p role="status" className="mt-3 text-sm text-secondary">{t(busy || feedback)}</p>}
       {!!results?.some(result => result.error) && (
         <ul className="mt-2 space-y-1 text-sm text-secondary">
           {results.filter(result => result.error).map((result, index) => (
-            <li key={index}>{result.label} · {result.error}</li>
+            <li key={index}>{result.label} · {t(result.error ?? '')}</li>
           ))}
         </ul>
       )}

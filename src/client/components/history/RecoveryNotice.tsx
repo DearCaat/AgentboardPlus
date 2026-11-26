@@ -4,6 +4,7 @@ import type { PersistenceHealth } from '@shared/persistence'
 import type { ServerMessage, SubscribeServerMessage } from '@shared/types'
 import { safeStorage } from '../../utils/storage'
 import { libraryRequest } from './api'
+import { useTranslation } from '../../locale'
 
 // Interruptions are rare (backend crashes, tmux restarts), so a slow
 // background poll keeps the notice current without per-client load.
@@ -38,6 +39,7 @@ export function RecoveryNotice({
   onOpen: () => void
   subscribe?: SubscribeServerMessage
 }) {
+  const t = useTranslation()
   const [health, setHealth] = useState<PersistenceHealth | null>(null)
   const [dismissed, setDismissed] = useState<Dismissed>(readDismissed)
 
@@ -92,12 +94,12 @@ export function RecoveryNotice({
       <button onClick={onOpen} className="flex-1 px-3 py-2 text-left">
         {pending.length
           ? `${pending.length} interrupted session${pending.length === 1 ? '' : 's'} saved. Review and reopen →`
-          : 'Session recovery needs attention →'}
+          : t('Session recovery needs attention →')}
       </button>
       <button
         onClick={dismiss}
         className="px-3 text-approval/70 hover:text-approval"
-        aria-label="Dismiss"
+        aria-label={t('Dismiss')}
       >
         ✕
       </button>

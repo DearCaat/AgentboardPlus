@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import SessionAccessForm from './SessionAccessForm'
+import { useTranslation } from '../locale'
 
 interface Grant {
   id: string
@@ -11,6 +12,7 @@ interface Grant {
 interface GrantList { hosts: string[]; grants: Grant[] }
 
 export default function TokenManager({ onClose }: { onClose: () => void }) {
+  const t = useTranslation()
   const dialog = useRef<HTMLDialogElement>(null)
   const [data, setData] = useState<GrantList>()
   const [label, setLabel] = useState('')
@@ -87,28 +89,28 @@ export default function TokenManager({ onClose }: { onClose: () => void }) {
     >
       <div className="space-y-4 p-4">
         <div className="flex items-center justify-between">
-          <h2 id="tokens-title" className="font-semibold">Access Tokens</h2>
-          <button type="button" className="btn" onClick={onClose} disabled={busy}>Close</button>
+          <h2 id="tokens-title" className="font-semibold">{t('Access Tokens')}</h2>
+          <button type="button" className="btn" onClick={onClose} disabled={busy}>{t('Close')}</button>
         </div>
         {newToken && (
           <div className="space-y-2 rounded border border-border p-3">
             <label className="block text-sm">
-              Copy this token now. It is shown once.
-              <input aria-label="New access token" className="input mt-1 w-full font-mono" readOnly value={newToken} onFocus={(event) => event.target.select()} />
+              {t('Copy this token now. It is shown once.')}
+              <input aria-label={t('New access token')} className="input mt-1 w-full font-mono" readOnly value={newToken} onFocus={(event) => event.target.select()} />
             </label>
             <button type="button" className="btn" onClick={() => {
               void navigator.clipboard.writeText(newToken).then(() => setFeedback('Token copied'),
                 () => setFeedback('Select and copy the token from the field'))
-            }}>Copy token</button>
+            }}>{t('Copy token')}</button>
           </div>
         )}
         <form onSubmit={save} className="space-y-3">
           <label className="block text-sm">
-            Token name
+            {t('Token name')}
             <input className="input mt-1 w-full" value={label} onChange={(event) => setLabel(event.target.value)} required maxLength={80} />
           </label>
           <fieldset className="flex flex-wrap gap-3 text-sm">
-            <legend className="mb-2">Allowed servers</legend>
+            <legend className="mb-2">{t('Allowed servers')}</legend>
             {data?.hosts.map((host) => (
               <label key={host} className="flex items-center gap-1.5">
                 <input type="checkbox" checked={hosts.includes(host)} onChange={(event) => {
@@ -121,13 +123,13 @@ export default function TokenManager({ onClose }: { onClose: () => void }) {
           </fieldset>
           <div className="flex gap-2">
             <button type="submit" className="btn btn-primary" disabled={busy || !label.trim() || !hosts.length}>
-              {editing ? 'Save access' : 'Create token'}
+              {editing ? t('Save access') : t('Create token')}
             </button>
             {editing && <button type="button" className="btn" onClick={() => {
               setEditing(undefined)
               setLabel('')
               setHosts([])
-            }}>Cancel edit</button>}
+            }}>{t('Cancel edit')}</button>}
           </div>
         </form>
         {feedback && <p role="status" className="text-sm text-secondary">{feedback}</p>}
@@ -139,7 +141,7 @@ export default function TokenManager({ onClose }: { onClose: () => void }) {
                   <strong>{grant.label}</strong>
                   <span className="block text-xs text-secondary">{grant.hosts.join(', ')}</span>
                 </span>
-                {grant.revokedAt ? <span className="text-xs text-secondary">Revoked</span> : (
+                {grant.revokedAt ? <span className="text-xs text-secondary">{t('Revoked')}</span> : (
                   <span className="flex gap-1">
                     <button type="button" className="btn text-xs" disabled={busy} onClick={() => {
                       setEditing(grant.id)
@@ -147,8 +149,8 @@ export default function TokenManager({ onClose }: { onClose: () => void }) {
                       setHosts(grant.hosts)
                       setRevoke(undefined)
                       setNewToken('')
-                    }}>Edit access</button>
-                    <button type="button" className="btn text-xs" disabled={busy} onClick={() => setRevoke(grant)}>Revoke</button>
+                    }}>{t('Edit access')}</button>
+                    <button type="button" className="btn text-xs" disabled={busy} onClick={() => setRevoke(grant)}>{t('Revoke')}</button>
                   </span>
                 )}
               </li>
@@ -158,9 +160,9 @@ export default function TokenManager({ onClose }: { onClose: () => void }) {
         <SessionAccessForm />
         {revoke && (
           <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3 text-sm">
-            <p>Revoke {revoke.label} and disconnect its open terminals?</p>
-            <button type="button" className="btn" onClick={() => setRevoke(undefined)} disabled={busy}>Cancel</button>
-            <button type="button" className="btn btn-primary" onClick={() => void revokeToken()} disabled={busy}>Revoke token</button>
+            <p>{t('Revoke {name} and disconnect its open terminals?', { name: revoke.label })}</p>
+            <button type="button" className="btn" onClick={() => setRevoke(undefined)} disabled={busy}>{t('Cancel')}</button>
+            <button type="button" className="btn btn-primary" onClick={() => void revokeToken()} disabled={busy}>{t('Revoke token')}</button>
           </div>
         )}
       </div>

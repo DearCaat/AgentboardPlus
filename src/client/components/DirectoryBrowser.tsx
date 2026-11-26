@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import { FolderIcon, ChevronRightIcon } from './icons'
 import { useDirectoryListing } from '../hooks/useDirectoryListing'
 import { useFocusTrap } from './settings/useDialogFocus'
+import { useTranslation } from '../locale'
 
 interface DirectoryBrowserProps {
   onSelect: (path: string) => void
@@ -12,6 +13,7 @@ interface DirectoryBrowserProps {
 }
 
 export function DirectoryBrowser({ onSelect, onCancel, initialPath }: DirectoryBrowserProps) {
+  const t = useTranslation()
   const [path, setPath] = useState(initialPath || '~')
   const [draft, setDraft] = useState(initialPath || '~')
   const [query, setQuery] = useState('')
@@ -50,20 +52,20 @@ export function DirectoryBrowser({ onSelect, onCancel, initialPath }: DirectoryB
         className="flex h-[100dvh] w-full flex-col border border-border bg-elevated text-primary outline-none sm:h-[min(680px,90dvh)] sm:max-w-xl">
         <div className="shrink-0 space-y-3 border-b border-border p-4">
           <div>
-            <h2 id="directory-title" className="text-[16px] font-semibold text-primary">Choose folder</h2>
-            <p className="mt-1 text-xs text-secondary">Folders on the Agentboard server</p>
+            <h2 id="directory-title" className="text-[16px] font-semibold text-primary">{t('Choose folder')}</h2>
+            <p className="mt-1 text-xs text-secondary">{t('Folders on the Agentboard server')}</p>
           </div>
           <div className="flex gap-2">
-            <input aria-label="Directory path" value={draft} spellCheck={false} autoCapitalize="none" autoCorrect="off"
+            <input aria-label={t('Directory path')} value={draft} spellCheck={false} autoCapitalize="none" autoCorrect="off"
               onChange={event => setDraft(event.target.value)}
               onKeyDown={event => {
                 if (event.key === 'Enter') { event.preventDefault(); navigate(draft.trim() || '~') }
               }} className="input min-w-0 flex-1 font-mono text-[16px] sm:text-sm" />
-            <button type="button" className="btn min-h-[44px] sm:min-h-0" onClick={() => navigate(draft.trim() || '~')}>Go</button>
+            <button type="button" className="btn min-h-[44px] sm:min-h-0" onClick={() => navigate(draft.trim() || '~')}>{t('Go')}</button>
           </div>
-          <nav aria-label="Folder ancestors" className="flex items-center gap-1 overflow-x-auto text-xs text-secondary">
-            <button type="button" className="btn min-h-[44px] shrink-0 sm:min-h-0" onClick={() => navigate('~')}>Home</button>
-            <button type="button" className="btn min-h-[44px] shrink-0 sm:min-h-0" disabled={!listing?.parent} onClick={() => listing?.parent && navigate(listing.parent)}>Up</button>
+          <nav aria-label={t('Folder ancestors')} className="flex items-center gap-1 overflow-x-auto text-xs text-secondary">
+            <button type="button" className="btn min-h-[44px] shrink-0 sm:min-h-0" onClick={() => navigate('~')}>{t('Home')}</button>
+            <button type="button" className="btn min-h-[44px] shrink-0 sm:min-h-0" disabled={!listing?.parent} onClick={() => listing?.parent && navigate(listing.parent)}>{t('Up')}</button>
             {displayPath.startsWith('/') && <button type="button" className="shrink-0 p-2 hover:bg-hover" onClick={() => navigate('/')}>/</button>}
             {parts.map((part, index) => (
               <span key={index} className="flex shrink-0 items-center">
@@ -75,10 +77,10 @@ export function DirectoryBrowser({ onSelect, onCancel, initialPath }: DirectoryB
             ))}
           </nav>
           <div className="flex items-center gap-3">
-            <input aria-label="Filter folders" placeholder="Filter folders…" value={query}
+            <input aria-label={t('Filter folders')} placeholder={t('Filter folders…')} value={query}
               onChange={event => setQuery(event.target.value)} className="input min-w-0 flex-1 text-[16px] sm:text-sm" />
             <label className="flex shrink-0 items-center gap-2 text-xs text-secondary">
-              <input type="checkbox" checked={showHidden} onChange={event => setShowHidden(event.target.checked)} />Show hidden
+              <input type="checkbox" checked={showHidden} onChange={event => setShowHidden(event.target.checked)} />{t('Show hidden')}
             </label>
           </div>
         </div>
@@ -90,13 +92,13 @@ export function DirectoryBrowser({ onSelect, onCancel, initialPath }: DirectoryB
             event.preventDefault()
             buttons[Math.max(0, Math.min(buttons.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))]?.focus()
           }}>
-          {loading ? <p role="status" className="p-3 text-sm text-secondary" data-testid="directory-loading">Loading folders…</p>
+          {loading ? <p role="status" className="p-3 text-sm text-secondary" data-testid="directory-loading">{t('Loading folders…')}</p>
             : error ? <div role="alert" className="p-3 text-sm" data-testid="directory-error">
               <p className="text-danger">{error}</p>
-              <button type="button" className="btn mt-3" onClick={() => setRetry(n => n + 1)}>Retry</button>
+              <button type="button" className="btn mt-3" onClick={() => setRetry(n => n + 1)}>{t('Retry')}</button>
             </div>
             : !listing?.directories.length ? <p className="p-3 text-sm text-secondary" data-testid="directory-empty">
-              {query ? 'No matching folders.' : 'No visible subfolders.'}
+              {query ? t('No matching folders.') : t('No visible subfolders.')}
             </p>
             : listing.directories.map(entry => (
               <button key={entry.path} type="button" onClick={() => navigate(entry.path)}
@@ -107,15 +109,15 @@ export function DirectoryBrowser({ onSelect, onCancel, initialPath }: DirectoryB
                 <ChevronRightIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} className="shrink-0 text-secondary" aria-hidden="true" />
               </button>
             ))}
-          {listing?.truncated && <p className="p-3 text-xs text-secondary">Showing first 200 matches. Filter folders or enter a full path.</p>}
+          {listing?.truncated && <p className="p-3 text-xs text-secondary">{t('Showing first 200 matches. Filter folders or enter a full path.')}</p>}
         </div>
         <div className="shrink-0 border-t border-border p-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           <p className="mb-3 break-all text-xs text-secondary" data-testid="directory-current-path">{displayPath}</p>
           <div className="flex justify-end gap-2">
-            <button type="button" onClick={onCancel} className="btn min-h-[44px] sm:min-h-0">Cancel</button>
+            <button type="button" onClick={onCancel} className="btn min-h-[44px] sm:min-h-0">{t('Cancel')}</button>
             <button type="button" disabled={!canChoose} onClick={() => { if (canChoose) onSelect(listing.path) }}
               className="btn btn-primary min-h-[44px] sm:min-h-0 max-w-[75%] truncate" title={`Use ${displayPath}`} data-testid="directory-choose">
-              {listing ? `Use “${name}”` : 'Use folder'}
+              {listing ? `Use “${name}”` : t('Use folder')}
             </button>
           </div>
         </div>

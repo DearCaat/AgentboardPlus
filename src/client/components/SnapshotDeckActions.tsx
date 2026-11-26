@@ -6,6 +6,7 @@
 
 import { RefreshCcw01Icon, SpinnerIcon, XCloseIcon } from './icons'
 import { ICON_SIZE } from './controlStyles'
+import { useTranslation } from '../locale'
 
 export interface SnapshotActions {
   onDone: () => void
@@ -17,21 +18,22 @@ export interface SnapshotActions {
 const BUTTON_CLASS = 'terminal-key flex h-[44px] min-w-[96px] items-center justify-center gap-1.5 rounded-md border px-4 text-sm font-medium select-none touch-manipulation active:scale-95 transition-transform duration-75 disabled:opacity-50'
 
 export default function SnapshotDeckActions({ onDone, onRefresh, busy }: SnapshotActions) {
+  const t = useTranslation()
   return (
     <div className="flex items-center gap-[6px]" data-testid="snapshot-deck-actions">
-      <button type="button" aria-label="Done selecting text" onClick={onDone}
+      <button type="button" aria-label={t('Done selecting text')} onClick={onDone}
         onMouseDown={(e) => e.preventDefault()}
         className={`${BUTTON_CLASS} border-accent/40 bg-accent/20 text-accent`}>
         <XCloseIcon width={ICON_SIZE.key} height={ICON_SIZE.key} />
-        Done
+        {t('Done')}
       </button>
-      <button type="button" aria-label="Refresh text" onClick={onRefresh} disabled={busy} aria-busy={busy}
+      <button type="button" aria-label={t('Refresh text')} onClick={onRefresh} disabled={busy} aria-busy={busy}
         onMouseDown={(e) => e.preventDefault()}
         className={`${BUTTON_CLASS} border-border bg-surface text-secondary`}>
         {busy
           ? <SpinnerIcon width={ICON_SIZE.key} height={ICON_SIZE.key} className="animate-spin" />
           : <RefreshCcw01Icon width={ICON_SIZE.key} height={ICON_SIZE.key} />}
-        Refresh
+        {t('Refresh')}
       </button>
     </div>
   )

@@ -9,6 +9,7 @@ import { formatRelativeTime } from '../utils/time'
 import { useMenuViewportFit } from '../hooks/useMenuViewportFit'
 import AgentIcon from './AgentIcon'
 import ProjectBadge from './ProjectBadge'
+import { useTranslation } from '../locale'
 
 interface HibernatingSessionItemProps {
   session: AgentSession
@@ -33,6 +34,7 @@ export default function HibernatingSessionItem({
   onRename,
   onMoveToHistory,
 }: HibernatingSessionItemProps) {
+  const t = useTranslation()
   const lastActivity = formatRelativeTime(session.lastActivityAt)
   const directoryLeaf = getPathLeaf(session.projectPath)
   const displayName =
@@ -151,14 +153,14 @@ export default function HibernatingSessionItem({
           <Moon01Icon
             width={ICON_SIZE.pill} height={ICON_SIZE.pill}
             className="shrink-0 text-muted"
-            aria-label="Hibernating"
-            title="Hibernating"
+            aria-label={t('Hibernating')}
+            title={t('Hibernating')}
           />
           {session.lastResumeError && (
             <AlertTriangleIcon
               width={ICON_SIZE.pill} height={ICON_SIZE.pill}
               className="shrink-0 text-amber-500"
-              aria-label="Wake failed"
+              aria-label={t('Wake failed')}
               title={`Last wake failed: ${session.lastResumeError}`}
             />
           )}
@@ -205,7 +207,7 @@ export default function HibernatingSessionItem({
               role="menuitem"
             >
               <PlayIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Wake
+              {t('Wake')}
             </button>
           )}
           {onRename && (
@@ -219,7 +221,7 @@ export default function HibernatingSessionItem({
               role="menuitem"
             >
               <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Rename
+              {t('Rename')}
             </button>
           )}
           {session.logFilePath && (
@@ -234,7 +236,7 @@ export default function HibernatingSessionItem({
               title={session.logFilePath}
             >
               <File06Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Copy Log Path
+              {t('Copy Log Path')}
             </button>
           )}
           {onMoveToHistory && (
@@ -250,7 +252,7 @@ export default function HibernatingSessionItem({
                 role="menuitem"
               >
                 <XCloseIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-                Move to History
+                {t('Move to History')}
               </button>
             </>
           )}

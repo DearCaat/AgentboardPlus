@@ -5,6 +5,7 @@
  * separated by hairline dividers, skipping rows whose visibleWhen fails.
  */
 import { useSettingsStore } from '../../stores/settingsStore'
+import { useTranslation } from '../../locale'
 import { cn } from '../../utils/cn'
 import type { RowIds, RowTag, SettingsRowDef } from './types'
 
@@ -19,12 +20,13 @@ const TAG_TITLE: Record<RowTag, string> = {
 }
 
 export function RowTagBadge({ tag }: { tag: RowTag }) {
+  const t = useTranslation()
   return (
     <span
-      title={TAG_TITLE[tag]}
+      title={t(TAG_TITLE[tag])}
       className="shrink-0 border border-border px-1 py-px text-[10px] uppercase leading-none tracking-wide text-muted"
     >
-      {TAG_LABEL[tag]}
+      {t(TAG_LABEL[tag])}
     </span>
   )
 }
@@ -35,6 +37,7 @@ export function rowIds(rowId: string): RowIds {
 }
 
 export function SettingRow({ row }: { row: SettingsRowDef }) {
+  const t = useTranslation()
   const ids = rowIds(row.id)
   const layout = row.layout ?? 'inline'
   const { Control, Description } = row
@@ -52,12 +55,12 @@ export function SettingRow({ row }: { row: SettingsRowDef }) {
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <label id={ids.label} htmlFor={ids.control} className="text-[14px] leading-snug text-primary">
-            {row.label}
+            {t(row.label)}
           </label>
           {row.tags?.map((tag) => <RowTagBadge key={tag} tag={tag} />)}
         </div>
         <div id={ids.description} className="mt-1 text-[12px] leading-snug text-muted text-pretty">
-          {Description ? <Description /> : row.description}
+          {Description ? <Description /> : t(row.description)}
         </div>
       </div>
       <div className={cn('flex min-w-0 items-center gap-2', layout === 'inline' ? 'shrink-0' : 'max-w-full')}>

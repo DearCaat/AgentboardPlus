@@ -15,6 +15,7 @@ import { Copy01Icon } from './icons'
 import { copyText } from '../utils/copyText'
 import type { ConnectionStatus } from '../stores/sessionStore'
 import { ICON_BUTTON_CLASS, ICON_SIZE } from './controlStyles'
+import { useTranslation } from '../locale'
 
 interface ConnectionIndicatorProps {
   connectionStatus: ConnectionStatus
@@ -42,12 +43,13 @@ export default function ConnectionIndicator({
   tailscaleIp,
   placement = 'down',
 }: ConnectionIndicatorProps) {
+  const t = useTranslation()
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   const popoverId = useId()
   const containerRef = useRef<HTMLDivElement>(null)
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const label = `Connection: ${statusLabel[connectionStatus]}`
+  const label = t('Connection: {status}', { status: t(statusLabel[connectionStatus]) })
   const dot = <span className={`h-2 w-2 shrink-0 rounded-full ${statusDot[connectionStatus]}`} />
 
   useEffect(() => {
@@ -99,7 +101,7 @@ export default function ConnectionIndicator({
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls={open ? popoverId : undefined}
-        title={`${statusLabel[connectionStatus]} - Tailscale ${tailscaleIp}`}
+        title={`${t(statusLabel[connectionStatus])} - Tailscale ${tailscaleIp}`}
         onClick={() => setOpen((value) => !value)}
         className={ICON_BUTTON_CLASS}
       >
@@ -109,21 +111,21 @@ export default function ConnectionIndicator({
         <div
           id={popoverId}
           role="dialog"
-          aria-label="Remote access"
+          aria-label={t('Remote access')}
           className={`absolute left-2 right-2 z-20 ${placement === 'up' ? 'bottom-full mb-1' : 'top-full mt-1'} rounded border border-border bg-surface p-2 text-xs shadow-lg`}
         >
           <div className="flex items-center gap-1.5 px-1 pb-1.5 text-muted">
             {dot}
-            <span>{statusLabel[connectionStatus]}</span>
+            <span>{t(statusLabel[connectionStatus])}</span>
             <span className="ml-auto">Tailscale</span>
           </div>
           <button
             type="button"
             onClick={handleCopy}
             className="flex w-full items-center justify-between gap-2 rounded px-1 py-1 text-left text-secondary hover:bg-hover hover:text-primary"
-            title="Tailscale IP - click to copy remote access URL"
+            title={t('Tailscale IP - click to copy remote access URL')}
           >
-            <span className="min-w-0 truncate font-mono">{copied ? 'Copied!' : tailscaleIp}</span>
+            <span className="min-w-0 truncate font-mono">{copied ? t('Copied!') : tailscaleIp}</span>
             {!copied && <Copy01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} className="shrink-0" />}
           </button>
         </div>

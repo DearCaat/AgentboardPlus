@@ -15,6 +15,7 @@ import { SegmentedControl } from '../controls/SegmentedControl'
 import { SWITCH_TOUCH_TARGET } from '../styles'
 import type { RowControlProps, SettingsRowDef, SettingsState } from '../types'
 import { useServerSetting } from '../useServerSetting'
+import { useTranslation } from '../../../locale'
 
 type BooleanKey = 'showMobileSessionPeek' | 'showProjectName' | 'showLastUserMessage' | 'showSessionIdPrefix'
 type BooleanSetter = 'setShowMobileSessionPeek' | 'setShowProjectName' | 'setShowLastUserMessage' | 'setShowSessionIdPrefix'
@@ -38,14 +39,15 @@ export function storeSwitch(key: BooleanKey, setter: BooleanSetter) {
 }
 
 function SortModeControl({ ids }: RowControlProps) {
+  const t = useTranslation()
   const value = useSettingsStore((state) => state.sessionSortMode)
   const set = useSettingsStore((state) => state.setSessionSortMode)
   return (
     <SegmentedControl<SessionSortMode>
       options={[
-        { value: 'created', label: 'Created' },
-        { value: 'status', label: 'Status' },
-        { value: 'manual', label: 'Manual' },
+        { value: 'created', label: t('Created') },
+        { value: 'status', label: t('Status') },
+        { value: 'manual', label: t('Manual') },
       ]}
       value={value}
       onChange={set}
@@ -56,20 +58,22 @@ function SortModeControl({ ids }: RowControlProps) {
 }
 
 function SortModeDescription() {
+  const t = useTranslation()
   const mode = useSettingsStore((state) => state.sessionSortMode)
-  if (mode === 'status') return <>Permission sessions come first; the rest sort by newest activity.</>
-  if (mode === 'manual') return <>Drag sessions in the sidebar to reorder them.</>
-  return <>Sessions stay in the order they were created.</>
+  if (mode === 'status') return <>{t('Permission sessions come first; the rest sort by newest activity.')}</>
+  if (mode === 'manual') return <>{t('Drag sessions in the sidebar to reorder them.')}</>
+  return <>{t('Sessions stay in the order they were created.')}</>
 }
 
 function SortDirectionControl({ ids }: RowControlProps) {
+  const t = useTranslation()
   const value = useSettingsStore((state) => state.sessionSortDirection)
   const set = useSettingsStore((state) => state.setSessionSortDirection)
   return (
     <SegmentedControl<SessionSortDirection>
       options={[
-        { value: 'desc', label: 'Newest first' },
-        { value: 'asc', label: 'Oldest first' },
+        { value: 'desc', label: t('Newest first') },
+        { value: 'asc', label: t('Oldest first') },
       ]}
       value={value}
       onChange={set}
@@ -80,13 +84,14 @@ function SortDirectionControl({ ids }: RowControlProps) {
 }
 
 function SidebarAnchorControl({ ids }: RowControlProps) {
+  const t = useTranslation()
   const value = useSettingsStore((state) => state.sidebarAnchor)
   const set = useSettingsStore((state) => state.setSidebarAnchor)
   return (
     <SegmentedControl<SidebarAnchor>
       options={[
-        { value: 'top', label: 'Top' },
-        { value: 'bottom', label: 'Bottom' },
+        { value: 'top', label: t('Top') },
+        { value: 'bottom', label: t('Bottom') },
       ]}
       value={value}
       onChange={set}
@@ -97,13 +102,15 @@ function SidebarAnchorControl({ ids }: RowControlProps) {
 }
 
 function SidebarAnchorDescription() {
+  const t = useTranslation()
   const anchor = useSettingsStore((state) => state.sidebarAnchor)
   return anchor === 'bottom'
-    ? <>The sidebar is mirrored: the first session sits at the bottom, next to the prompt.</>
-    : <>The first session sits at the top of the sidebar.</>
+    ? <>{t('The sidebar is mirrored: the first session sits at the bottom, next to the prompt.')}</>
+    : <>{t('The first session sits at the top of the sidebar.')}</>
 }
 
 function HistoryLookbackControl({ ids }: RowControlProps) {
+  const t = useTranslation()
   const { value, loaded, set } = useServerSetting<number>('history-max-age-hours', 'hours', 24)
   return (
     <div className="flex items-start gap-2">
@@ -127,7 +134,7 @@ function HistoryLookbackControl({ ids }: RowControlProps) {
           return null
         }}
       />
-      <span className="flex h-[32px] items-center text-[12px] text-muted max-md:h-[44px]">hours</span>
+      <span className="flex h-[32px] items-center text-[12px] text-muted max-md:h-[44px]">{t('hours')}</span>
     </div>
   )
 }

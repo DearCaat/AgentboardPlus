@@ -25,8 +25,8 @@ export function rowsForPage(
   return rows.filter((row) => row.page === page)
 }
 
-function haystack(row: SettingsRowDef): string {
-  return [row.label, row.description, ...(row.keywords ?? [])].join(' ').toLowerCase()
+function haystack(row: SettingsRowDef, translate: (message: string) => string): string {
+  return [row.label, row.description, translate(row.label), translate(row.description), ...(row.keywords ?? [])].join(' ').toLowerCase()
 }
 
 /**
@@ -35,12 +35,13 @@ function haystack(row: SettingsRowDef): string {
  */
 export function searchRows(
   query: string,
-  rows: readonly SettingsRowDef[] = SETTINGS_ROWS
+  rows: readonly SettingsRowDef[] = SETTINGS_ROWS,
+  translate = (message: string) => message,
 ): SettingsRowDef[] {
   const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
   if (terms.length === 0) return []
   return rows.filter((row) => {
-    const text = haystack(row)
+    const text = haystack(row, translate)
     return terms.every((term) => text.includes(term))
   })
 }

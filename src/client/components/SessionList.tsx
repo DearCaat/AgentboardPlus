@@ -55,6 +55,7 @@ import SessionSortButton from './SessionSortButton'
 import SessionPreviewModal from './SessionPreviewModal'
 import WorkspacePresets from './WorkspacePresets'
 import { HibernatingSection, HistorySection } from './DormantSessionSections'
+import { useTranslation } from '../locale'
 
 const groupDragId = (id: string) => 'group/' + id
 
@@ -155,6 +156,7 @@ export default function SessionList({
   filterBarControls,
   notice,
 }: SessionListProps) {
+  const t = useTranslation()
   const isBottom = anchor === 'bottom'
   const [openListMenu, setOpenListMenu] = useState<'filter' | 'sort' | null>(null)
   useTimestampRefresh()
@@ -889,7 +891,7 @@ export default function SessionList({
     <>
       <div className="flex items-center justify-between px-3 py-2 text-xs font-medium uppercase tracking-wider text-muted">
         {workspaces.length > 1 ? (
-          <select aria-label="Workspace" value={workspaceId} disabled={switchingWorkspace}
+          <select aria-label={t('Workspace')} value={workspaceId} disabled={switchingWorkspace}
             className="input min-w-0 max-w-[45%] truncate text-xs normal-case"
             onChange={event => {
               setSwitchingWorkspace(true)
@@ -899,24 +901,24 @@ export default function SessionList({
             }}>
             {workspaces.map(workspace => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
           </select>
-        ) : <span>Active</span>}
+        ) : <span>{t('Active')}</span>}
         <div className="flex items-center gap-2">
           {organizationAvailable && (
             <button
               type="button"
               onClick={handleCreateGroup}
-              aria-label="Create session group"
-              title="Create session group"
+              aria-label={t('Create session group')}
+              title={t('Create session group')}
               className="flex min-h-[32px] items-center gap-1 rounded px-1.5 text-[11px] normal-case tracking-normal text-secondary hover:bg-hover hover:text-primary max-md:min-h-[36px]"
             >
               <PlusIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Group
+              {t('Group')}
             </button>
           )}
           {organizationAvailable && organizationProfileId && (
             <button type="button" onClick={() => setPresetsOpen(true)}
               className="min-h-8 rounded px-1.5 text-[11px] normal-case tracking-normal text-secondary hover:bg-hover hover:text-primary">
-              Presets
+              {t('Presets')}
             </button>
           )}
           {organizationProfileId && organizationError && (
@@ -925,7 +927,7 @@ export default function SessionList({
               title={organizationError}
               className="max-w-28 truncate text-[10px] normal-case tracking-normal text-danger"
             >
-              Workspace error
+              {t('Workspace error')}
             </span>
           )}
           {hiddenCount > 0 && (
@@ -935,7 +937,7 @@ export default function SessionList({
               aria-pressed={showHidden}
               className="rounded px-1.5 py-0.5 text-[11px] normal-case tracking-normal hover:bg-hover"
             >
-              {showHidden ? 'Hide hidden' : 'Show hidden (' + hiddenCount + ')'}
+              {showHidden ? t('Hide hidden') : 'Show hidden (' + hiddenCount + ')'}
             </button>
           )}
           {filteredSessions.length === 0 && onNewSession && (
@@ -943,10 +945,10 @@ export default function SessionList({
               type="button"
               onClick={onNewSession}
               className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium normal-case tracking-normal text-accent hover:bg-hover"
-              title={`Start a new session (${modDisplay}N)`}
+              title={t('Start a new session ({shortcut})', { shortcut: `${modDisplay}N` })}
             >
               <PlusIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              New session
+              {t('New session')}
             </button>
           )}
           <motion.span
@@ -998,7 +1000,7 @@ export default function SessionList({
                 {ungroupedSessions.length > 0 && (
                   <section data-testid="ungrouped-sessions">
                     <div className="flex items-center justify-between px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-muted">
-                      <span>Ungrouped</span>
+                      <span>{t('Ungrouped')}</span>
                       <span>{ungroupedSessions.length}</span>
                     </div>
                     {renderSessionRows(ungroupedSessions, ungroupedItems)}
@@ -1127,6 +1129,7 @@ function SessionGroupHeader({
   onSetColor,
   onDelete,
 }: SessionGroupHeaderProps) {
+  const t = useTranslation()
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, isDragging, isOver } = useSortable({
     id: groupDragId(group.id),
     data: { groupId: group.id },
@@ -1164,7 +1167,7 @@ function SessionGroupHeader({
   const menuItems: ContextMenuEntry[] = [
     {
       key: 'rename',
-      label: 'Rename group',
+      label: t('Rename group'),
       icon: <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
       onSelect: onStartRename,
     },
@@ -1185,7 +1188,7 @@ function SessionGroupHeader({
     'divider',
     {
       key: 'delete',
-      label: 'Delete group',
+      label: t('Delete group'),
       icon: <XCloseIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
       danger: true,
       onSelect: onDelete,
@@ -1204,7 +1207,7 @@ function SessionGroupHeader({
         {...attributes}
         {...listeners}
         aria-label={`Drag group ${group.name}`}
-        title="Drag to reorder group"
+        title={t('Drag to reorder group')}
         className="touch-none cursor-grab px-1 text-muted hover:text-primary active:cursor-grabbing"
       >
         <span aria-hidden="true">⋮⋮</span>
@@ -1246,7 +1249,7 @@ function SessionGroupHeader({
           }}
           onClick={(event) => event.stopPropagation()}
           className="min-w-0 flex-1 rounded border border-border bg-surface px-1.5 py-1 text-xs font-medium text-primary outline-none focus:border-accent"
-          aria-label="Rename group"
+          aria-label={t('Rename group')}
         />
       ) : (
         <button
@@ -1259,7 +1262,7 @@ function SessionGroupHeader({
           {group.name}
         </button>
       )}
-      <span className="shrink-0 text-[10px] tabular-nums text-muted" aria-label={`${count} sessions`}>
+      <span className="shrink-0 text-[10px] tabular-nums text-muted" aria-label={t('{count} sessions', { count })}>
         {count}
       </span>
       <button
@@ -1568,15 +1571,16 @@ function SessionRow({
   hiddenFromActive,
   onToggleHidden,
 }: SessionRowProps) {
+  const t = useTranslation()
   const shortcutModifier = useSettingsStore((state) => state.shortcutModifier)
   const modDisplay = getModifierDisplay(getEffectiveModifier(shortcutModifier))
   const responseAt = session.lastResponseAt
   const responseTime = responseAt ? formatRelativeTime(responseAt) : ''
   const responseLabel = responseAt && responseTime
-    ? <span title={'Last response · ' + new Date(responseAt).toLocaleString()}>{responseTime}</span>
+    ? <span title={t('Last response · {time}', { time: new Date(responseAt).toLocaleString() })}>{responseTime}</span>
     : <span title={session.remote && session.agentType === 'codex' && !session.agentSessionId
-      ? 'Run /status in Codex, then right-click and choose Read ID from /status.'
-      : 'Last response time unavailable'}>—</span>
+      ? t('Run /status in Codex, then right-click and choose Read ID from /status.')
+      : t('Last response time unavailable')}>—</span>
   const inputRef = useRef<HTMLInputElement>(null)
   const contextMenuRef = useRef<HTMLDivElement>(null)
   const sessionName =
@@ -1761,8 +1765,8 @@ function SessionRow({
           ? `ml-1 flex shrink-0 items-center justify-center rounded-full px-1.5 py-0.5 ${statusPillClass[session.status]} pulse-approval`
           : `ml-1 shrink-0 rounded-full px-1.5 py-0.5 text-right text-xs tabular-nums ${statusPillClass[session.status]}${isPulsingComplete ? ' pulse-complete' : ''}`}
         onAnimationEnd={handlePulseAnimationEnd}
-        statusContent={disconnected ? <span title={hostLabel ? `${hostLabel} is unreachable` : 'Host is unreachable'}>Offline</span> : needsInput
-          ? <HandIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} aria-label="Needs input" />
+        statusContent={disconnected ? <span title={hostLabel ? t('{host} is unreachable', { host: hostLabel }) : t('Host is unreachable')}>{t('Offline')}</span> : needsInput
+          ? <HandIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} aria-label={t('Needs input')} />
           : responseLabel}
       >
         {(counter, status) => (
@@ -1776,7 +1780,7 @@ function SessionRow({
                 <span
                   {...dragHandleListeners}
                   data-testid="drag-handle"
-                  aria-label="Drag to reorder"
+                  aria-label={t('Drag to reorder')}
                   style={{ touchAction: 'none' }}
                   className="-my-1 -ml-1 flex items-center py-1 pl-1 cursor-grab"
                 >
@@ -1812,7 +1816,7 @@ function SessionRow({
                     // the row's dnd-kit PointerSensor on the wrapper.
                     onPointerDown={(e) => e.stopPropagation()}
                     className="min-w-0 flex-1 rounded border border-border bg-surface px-1.5 py-0.5 text-sm font-medium text-primary outline-none focus:border-accent"
-                    aria-label={isEditingTitle ? 'Edit display name' : 'Rename session'}
+                    aria-label={isEditingTitle ? t('Edit display name') : t('Rename session')}
                   />
                 ) : (
                   <span className="session-name min-w-0 flex-1 truncate text-primary">
@@ -1868,7 +1872,7 @@ function SessionRow({
               className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary"
               onClick={event => { event.stopPropagation(); copyText(agentSessionId); setContextMenu(null) }}>
               <Copy01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Copy full session ID
+              {t('Copy full session ID')}
             </button>
           )}
           {session.remote && session.agentType === 'codex' && (
@@ -1880,7 +1884,7 @@ function SessionRow({
                   void conversationId.save({ source: 'codex-status' })
                 }}>
                 <Hash01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-                {conversationId.pending ? 'Reading session ID…' : 'Read ID from /status'}
+                {conversationId.pending ? t('Reading session ID…') : t('Read ID from /status')}
               </button>
               {conversationId.error && (
                 <p role="alert" className="max-w-64 px-3 py-2 text-xs text-danger">{conversationId.error}</p>
@@ -1898,7 +1902,7 @@ function SessionRow({
               role="menuitem"
             >
               <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Rename
+              {t('Rename')}
             </button>
           )}
           {onStartEditTitle && (
@@ -1913,7 +1917,7 @@ function SessionRow({
               role="menuitem"
             >
               <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Edit display name
+              {t('Edit display name')}
             </button>
           )}
           {onMoveToGroup && (assignedGroupId || moveTargets.length > 0) && (
@@ -1930,7 +1934,7 @@ function SessionRow({
                   className="w-full px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary"
                   role="menuitem"
                 >
-                  Move to Ungrouped
+                  {t('Move to Ungrouped')}
                 </button>
               )}
               {moveTargets.map((group) => {
@@ -1952,7 +1956,7 @@ function SessionRow({
                       className="h-2.5 w-2.5 shrink-0 rounded-full"
                       style={{ backgroundColor: color?.value }}
                     />
-                    Move to {group.name}
+                    {t('Move to')}{' '}{group.name}
                   </button>
                 )
               })}
@@ -1969,7 +1973,7 @@ function SessionRow({
               className="w-full px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary"
               role="menuitem"
             >
-              {hiddenFromActive ? 'Show in Active' : 'Hide from Active'}
+              {hiddenFromActive ? t('Show in Active') : t('Hide from Active')}
             </button>
           )}
           {onDuplicate && (
@@ -1981,10 +1985,10 @@ function SessionRow({
               }}
               className="w-full px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary flex items-center gap-2"
               role="menuitem"
-              title="Create a copy in a new tmux window"
+              title={t('Create a copy in a new tmux window')}
             >
               <Copy01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Duplicate
+              {t('Duplicate')}
             </button>
           )}
           {onHibernate && (
@@ -1996,10 +2000,10 @@ function SessionRow({
               }}
               className="w-full px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary flex items-center gap-2"
               role="menuitem"
-              title="Close the live window and keep this session ready to wake"
+              title={t('Close the live window and keep this session ready to wake')}
             >
               <Moon01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Hibernate
+              {t('Hibernate')}
             </button>
           )}
           {session.logFilePath && (
@@ -2016,7 +2020,7 @@ function SessionRow({
               title={session.logFilePath}
             >
               <File06Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Copy Log Path
+              {t('Copy Log Path')}
             </button>
           )}
           {onCloseTmux && (
@@ -2031,7 +2035,7 @@ function SessionRow({
               role="menuitem"
             >
               <XCloseIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Close tmux session
+              {t('Close tmux session')}
             </button>
           )}
           {onKill && (
@@ -2047,7 +2051,7 @@ function SessionRow({
                 role="menuitem"
               >
                 <XCloseIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-                Kill Session
+                {t('Kill Session')}
                 {isSelected && <kbd className="ml-auto pl-3 text-xs font-mono">{modDisplay}X</kbd>}
               </button>
             </>

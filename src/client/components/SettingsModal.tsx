@@ -19,6 +19,7 @@ import { PageView, SearchResults } from './settings/SettingsPane'
 import { SettingsNav, SettingsSearch, tabId } from './settings/SettingsNav'
 import { getPageLabel, type SettingsPageId } from './settings/types'
 import { useFocusTrap, useSuspendTerminalInput } from './settings/useDialogFocus'
+import { useTranslation } from '../locale'
 
 interface SettingsModalProps {
   isOpen: boolean
@@ -36,6 +37,7 @@ const HEADER_BUTTON =
   'flex shrink-0 items-center justify-center text-secondary transition-colors hover:bg-hover hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent'
 
 function SettingsDialog({ onClose }: { onClose: () => void }) {
+  const t = useTranslation()
   const isPhone = useIsMobileLayout()
   const [page, setPage] = useState<SettingsPageId | null>(() => (isPhone ? null : loadLastPage()))
   const [query, setQuery] = useState('')
@@ -88,7 +90,7 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
     <button
       type="button"
       onClick={onClose}
-      aria-label="Close settings"
+      aria-label={t('Close settings')}
       className={cn(HEADER_BUTTON, 'size-[32px] max-md:size-[44px]')}
     >
       <XCloseIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
@@ -117,7 +119,7 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
               ref={backRef}
               type="button"
               onClick={goBack}
-              aria-label="Back to settings"
+              aria-label={t('Back to settings')}
               className={cn(HEADER_BUTTON, 'size-[44px]')}
             >
               <ChevronRightIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} className="rotate-180" />
@@ -126,7 +128,7 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
             <span aria-hidden="true" className="size-[44px] shrink-0" />
           )}
           <h2 id="settings-title" className="min-w-0 flex-1 truncate text-center text-[16px] font-semibold text-primary">
-            {page ? getPageLabel(page) : 'Settings'}
+            {page ? t(getPageLabel(page)) : t('Settings')}
           </h2>
           {closeButton}
         </header>
@@ -184,7 +186,7 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
       >
         <header className="flex h-[48px] shrink-0 items-center justify-between border-b border-border pl-5 pr-2">
           <h2 id="settings-title" className="text-[13px] font-semibold uppercase tracking-wider text-primary">
-            Settings
+            {t('Settings')}
           </h2>
           {closeButton}
         </header>
@@ -201,7 +203,7 @@ function SettingsDialog({ onClose }: { onClose: () => void }) {
           <div
             id={PANEL_ID}
             role={searching ? 'region' : 'tabpanel'}
-            aria-label={searching ? 'Search results' : undefined}
+            aria-label={searching ? t('Search results') : undefined}
             aria-labelledby={searching ? undefined : tabId(currentPage)}
             className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-5"
           >

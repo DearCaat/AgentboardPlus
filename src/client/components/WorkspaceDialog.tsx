@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { Session } from '@shared/types'
+import { useTranslation } from '../locale'
 
 type WorkspaceInfo = { hosts: string[]; canAddRemoteHosts: boolean; localAllowed?: boolean }
 type ImageUploadCheck = 'passed' | 'failed' | 'skipped'
@@ -21,6 +22,7 @@ interface WorkspaceDialogProps {
 export default function WorkspaceDialog({
   initialHost = '', onClose, onAgentSession, onManageTokens, onCreated,
 }: WorkspaceDialogProps) {
+  const t = useTranslation()
   const dialog = useRef<HTMLDialogElement>(null)
   const [mode, setMode] = useState<'terminal' | 'server'>('terminal')
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null)
@@ -89,7 +91,7 @@ export default function WorkspaceDialog({
     >
       <form onSubmit={submit} className="space-y-4 p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 id="workspace-title" className="font-semibold">{mode === 'terminal' ? 'New Terminal' : 'Add Server'}</h2>
+          <h2 id="workspace-title" className="font-semibold">{mode === 'terminal' ? t('New Terminal') : t('Add Server')}</h2>
           <div className="flex gap-1">
             {workspace?.canAddRemoteHosts && (
               <button type="button" className="btn text-xs" disabled={pending} onClick={() => {
@@ -97,51 +99,51 @@ export default function WorkspaceDialog({
                 setServerCheck(null)
                 setMode(mode === 'terminal' ? 'server' : 'terminal')
               }}>
-                {mode === 'terminal' ? 'Add Server' : 'New Terminal'}
+                {mode === 'terminal' ? t('Add Server') : t('New Terminal')}
               </button>
             )}
             {workspace?.localAllowed !== false && (
-              <button type="button" className="btn text-xs" disabled={pending} onClick={onAgentSession}>Agent Session</button>
+              <button type="button" className="btn text-xs" disabled={pending} onClick={onAgentSession}>{t('Agent Session')}</button>
             )}
             {onManageTokens && (
-              <button type="button" className="btn text-xs" disabled={pending} onClick={onManageTokens}>Tokens</button>
+              <button type="button" className="btn text-xs" disabled={pending} onClick={onManageTokens}>{t('Tokens')}</button>
             )}
           </div>
         </div>
         {mode === 'server' ? (
           <label className="block text-sm">
-            SSH alias or hostname
+            {t('SSH alias or hostname')}
             <input value={alias} onChange={(event) => setAlias(event.target.value)} className="input mt-1 w-full" placeholder="compute-01" required />
           </label>
         ) : (
           <>
             <label className="block text-sm">
-              Server
-              <select aria-label="Server" value={host} onChange={(event) => setHost(event.target.value)} className="input mt-1 w-full">
-                {workspace?.localAllowed !== false && <option value="">Local</option>}
+              {t('Server')}
+              <select aria-label={t('Server')} value={host} onChange={(event) => setHost(event.target.value)} className="input mt-1 w-full">
+                {workspace?.localAllowed !== false && <option value="">{t('Local')}</option>}
                 {workspace?.hosts.map((entry) => <option key={entry} value={entry}>{entry}</option>)}
               </select>
             </label>
             <label className="block text-sm">
-              tmux session name
+              {t('tmux session name')}
               <input value={name} onChange={(event) => setName(event.target.value)} className="input mt-1 w-full" placeholder="my-work" maxLength={80} required />
             </label>
             <label className="block text-sm text-secondary">
-              Starting directory (optional)
+              {t('Starting directory (optional)')}
               <input value={directory} onChange={(event) => setDirectory(event.target.value)} className="input mt-1 w-full" placeholder="/path/to/project" />
             </label>
           </>
         )}
         {serverCheck && (
           <p role="status" className="text-sm text-secondary">
-            {serverCheck === 'existing' ? 'Server already added.' : serverCheckMessages[serverCheck]}
+            {t(serverCheck === 'existing' ? 'Server already added.' : serverCheckMessages[serverCheck])}
           </p>
         )}
-        {error && <p role="alert" className="break-words text-sm text-secondary">{error}</p>}
+        {error && <p role="alert" className="break-words text-sm text-secondary">{t(error)}</p>}
         <div className="flex justify-end gap-2">
-          <button type="button" className="btn" onClick={onClose} disabled={pending}>Cancel</button>
+          <button type="button" className="btn" onClick={onClose} disabled={pending}>{t('Cancel')}</button>
           <button type="submit" className="btn btn-primary" disabled={pending || !workspace || (workspace.localAllowed === false && !host)}>
-            {mode === 'server' ? (pending ? 'Checking server…' : 'Add Server') : (pending ? 'Working…' : 'Create Terminal')}
+            {mode === 'server' ? (pending ? t('Checking server…') : t('Add Server')) : (pending ? t('Working…') : t('Create Terminal'))}
           </button>
         </div>
       </form>

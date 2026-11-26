@@ -7,12 +7,14 @@ import { playIdleSound, playPermissionSound, primeAudio } from '../../../utils/s
 import { Switch } from '../../Switch'
 import { CONTROL_BUTTON, SWITCH_TOUCH_TARGET } from '../styles'
 import type { RowControlProps, SettingsRowDef } from '../types'
+import { useTranslation } from '../../../locale'
 
 type SoundKey = 'soundOnPermission' | 'soundOnIdle'
 type SoundSetter = 'setSoundOnPermission' | 'setSoundOnIdle'
 
 function soundControl(key: SoundKey, setter: SoundSetter, play: () => Promise<void> | void, noun: string) {
   return function SoundControl({ ids }: RowControlProps) {
+    const t = useTranslation()
     const checked = useSettingsStore((state) => state[key])
     const set = useSettingsStore((state) => state[setter])
     return (
@@ -23,7 +25,7 @@ function soundControl(key: SoundKey, setter: SoundSetter, play: () => Promise<vo
           aria-label={`Test ${noun}`}
           onClick={() => void play()}
         >
-          Test
+          {t('Test')}
         </button>
         <Switch
           className={SWITCH_TOUCH_TARGET}

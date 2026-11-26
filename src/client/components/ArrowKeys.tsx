@@ -22,6 +22,7 @@ import {
 import { MoveIcon } from './icons'
 import { ICON_SIZE, KEY_ICON_STROKE } from './controlStyles'
 import { useKeyboardShift } from '../hooks/useKeyboardShift'
+import { useTranslation } from '../locale'
 
 interface ArrowKeysProps {
   onSendKey: (key: string) => void
@@ -106,6 +107,7 @@ export default function ArrowKeys({
   isKeyboardVisible,
   sessionKey = null,
 }: ArrowKeysProps) {
+  const t = useTranslation()
   const [isOpen, setIsOpen] = useState(false)
   const [padLeft, setPadLeft] = useState(0)
   const [heldDirection, setHeldDirection] = useState<ArrowDirection | null>(null)
@@ -309,7 +311,7 @@ export default function ArrowKeys({
       <button
         ref={triggerRef}
         type="button"
-        aria-label="Arrow keys"
+        aria-label={t('Arrow keys')}
         aria-haspopup="true"
         aria-expanded={isOpen}
         aria-controls={isOpen ? clusterId : undefined}
@@ -353,7 +355,7 @@ export default function ArrowKeys({
           <div
             id={clusterId}
             role="group"
-            aria-label="Arrow key cluster"
+            aria-label={t('Arrow key cluster')}
             className="absolute z-50 select-none rounded-2xl bg-black/40 backdrop-blur-md border-2 border-white/20"
             style={{
               left: padLeft,

@@ -8,14 +8,16 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { groupByPage, rowsForPage, searchRows } from './registry'
 import { RowList, isRowVisible } from './SettingRow'
 import { getPageLabel, type SettingsPageId } from './types'
+import { useTranslation } from '../../locale'
 
 export function PageView({ page, showTitle }: { page: SettingsPageId; showTitle: boolean }) {
+  const t = useTranslation()
   const rows = useMemo(() => rowsForPage(page), [page])
   return (
     <section aria-labelledby={showTitle ? `settings-page-${page}-title` : undefined}>
       {showTitle && (
         <h3 id={`settings-page-${page}-title`} className="pb-1 text-[18px] font-semibold leading-tight text-primary">
-          {getPageLabel(page)}
+          {t(getPageLabel(page))}
         </h3>
       )}
       <RowList rows={rows} />
@@ -24,7 +26,8 @@ export function PageView({ page, showTitle }: { page: SettingsPageId; showTitle:
 }
 
 export function SearchResults({ query }: { query: string }) {
-  const matches = useMemo(() => searchRows(query), [query])
+  const t = useTranslation()
+  const matches = useMemo(() => searchRows(query, undefined, t), [query, t])
   // Re-evaluated on store changes so a row hidden by its visibleWhen (e.g.
   // sort direction outside Created) doesn't count as a match.
   const anyVisible = useSettingsStore((state) => matches.some((row) => isRowVisible(row, state)))
@@ -33,8 +36,8 @@ export function SearchResults({ query }: { query: string }) {
   if (!anyVisible) {
     return (
       <div role="status" className="flex flex-col items-center gap-1 py-16 text-center">
-        <p className="text-[14px] text-primary">No settings match “{query.trim()}”</p>
-        <p className="text-[12px] text-muted">Try a different word, like “font” or “sound”.</p>
+        <p className="text-[14px] text-primary">{t('No settings match “{query}”', { query: query.trim() })}</p>
+        <p className="text-[12px] text-muted">{t('Try a different word, like “font” or “sound”.')}</p>
       </div>
     )
   }
@@ -42,7 +45,7 @@ export function SearchResults({ query }: { query: string }) {
   return (
     <div className="flex flex-col gap-6">
       {groups.map((group) => (
-        <GroupSection key={group.page} label={group.label} rows={group.rows} />
+        <GroupSection key={group.page} label={t(group.label)} rows={group.rows} />
       ))}
     </div>
   )

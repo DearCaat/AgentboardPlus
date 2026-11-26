@@ -31,6 +31,8 @@ import {
   SearchSmIcon,
 } from './icons'
 import { ICON_SIZE, TOUCH_TARGET_CLASS } from './controlStyles'
+import { useTranslation } from '../locale'
+
 // Full originals load only after an explicit user gesture.
 
 // Explicit pixels avoid the app's 13px root shrinking rem-based thumbnails.
@@ -61,6 +63,7 @@ function MediaChip({
   previewEnabled: boolean
   scrollRoot: RefObject<HTMLDivElement>
 }) {
+  const t = useTranslation()
   const caption = mediaCaption(media)
 
   if (media.kind === 'link') {
@@ -74,7 +77,7 @@ function MediaChip({
         className={MEDIA_FILE_TILE_CLASS}
       >
         <LinkExternal01Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} className="shrink-0" />
-        <span className={MEDIA_TILE_LABEL_CLASS}>{media.label || 'Link'}</span>
+        <span className={MEDIA_TILE_LABEL_CLASS}>{media.label || t('Link')}</span>
       </a>
     )
   }
@@ -97,7 +100,7 @@ function MediaChip({
         } else window.open(mediaPayloadUrl(media.url), '_blank', 'noopener')
       }}
       title={caption || media.kind}
-      aria-label={caption || (isImage ? 'Image' : 'Document')}
+      aria-label={caption || (isImage ? t('Image') : t('Document'))}
       className={MEDIA_FILE_TILE_CLASS}
     >
       {isImage ? (
@@ -106,7 +109,7 @@ function MediaChip({
         <File06Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} className="shrink-0" />
       )}
       <span className={MEDIA_TILE_LABEL_CLASS}>
-        {media.label ?? (isImage ? 'Image' : 'Document')}
+        {media.label ?? (isImage ? t('Image') : t('Document'))}
       </span>
     </button>
   )
@@ -115,6 +118,7 @@ function MediaChip({
 function ImageThumbnail({ media, caption, enabled, root, onOpen }: {
   media: SessionMedia; caption: string; enabled: boolean; root: RefObject<HTMLDivElement>; onOpen: (m: SessionMedia, previewSrc?: string) => void
 }) {
+  const t = useTranslation()
   const { target, preview, fail } = useMediaThumbnail(media.url, enabled, root)
   const label = preview.status === 'error' ? 'No preview' : preview.status === 'loading' ? 'Loading…' : 'Open image'
   return (
@@ -123,7 +127,7 @@ function ImageThumbnail({ media, caption, enabled, root, onOpen }: {
         // Safari does not focus buttons on pointer clicks; retain a concrete opener.
         event.currentTarget.focus({ preventScroll: true })
         onOpen(media, preview.status === 'ready' ? preview.src : undefined)
-      }} title={caption || 'Image'}
+      }} title={caption || t('Image')}
       aria-label={`${caption || 'Image'} · ${preview.status === 'error' ? 'Preview unavailable. ' : ''}Open image`}
       aria-busy={preview.status === 'loading'} className={preview.status === 'ready' ? MEDIA_TILE_CLASS : MEDIA_FILE_TILE_CLASS}>
       {preview.status === 'ready' ? (
@@ -146,6 +150,7 @@ export default function MediaRail({ session, ready = false, onPreview, choosePre
 }
 
 function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0, chooseTab = 'previews' }: RailProps) {
+  const t = useTranslation()
   const [expanded, setExpanded] = useState(false)
   const [attention, setAttention] = useState<'idle' | 'pulsing' | 'unread'>('idle')
   const summary = session.mediaSummary
@@ -244,17 +249,17 @@ function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0
               </button>
             })}
             </div>
-            {tab === 'links' && <button type="button" aria-label="Search links" aria-expanded={searchOpen}
+            {tab === 'links' && <button type="button" aria-label={t('Search links')} aria-expanded={searchOpen}
               onClick={() => setSearchOpen(value => !value)} className="ml-auto flex h-[44px] w-[36px] shrink-0 items-center justify-center rounded text-secondary hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">
               <SearchSmIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
             </button>}
-            <button type="button" aria-label="Collapse media rail" onClick={close}
+            <button type="button" aria-label={t('Collapse media rail')} onClick={close}
               className="ml-auto flex h-[44px] w-[36px] shrink-0 items-center justify-center rounded text-secondary hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">
               <XCloseIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
             </button>
           </div>
           {tab === 'links' && searchOpen && <div className="shrink-0 border-b border-border/60 px-3 py-2">
-            <input ref={searchInput} type="search" aria-label="Find link" placeholder="Find a link…" value={search} maxLength={200}
+            <input ref={searchInput} type="search" aria-label={t('Find link')} placeholder={t('Find a link…')} value={search} maxLength={200}
               onChange={event => setSearch(event.target.value)}
               className="w-full rounded border border-border bg-surface px-2 py-1.5 text-[16px] text-primary placeholder:text-secondary focus:outline-none focus:ring-2 focus:ring-accent md:text-[12px]" />
           </div>}
@@ -269,15 +274,15 @@ function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0
           {tab === 'previews' ? <PreviewList session={session} ready={ready} onSelect={item => { onPreview?.(item); setExpanded(false) }} /> : tab === 'links' ? <SessionLinks onPreview={onPreview ? item => { setExpanded(false); onPreview(item) } : undefined} key={query} session={session} ready={ready} search={query} onRefresh={() => setAttention('idle')} /> : <>
           {pages.changed && (
             <button type="button" onClick={refresh} disabled={!ready || pages.status === 'loading'}
-              className="px-3 py-2 text-xs text-accent" aria-label="Refresh media">Media changed · Refresh</button>
+              className="px-3 py-2 text-xs text-accent" aria-label={t('Refresh media')}>{t('Media changed · Refresh')}</button>
           )}
           {pages.hasEarlier && (
             <button type="button" onClick={() => { if (pages.canLoadEarlier) void pages.loadPrevious(); else refresh() }}
               disabled={!ready || pages.status === 'loading'} className="px-3 py-1 text-xs text-accent">
-              {pages.canLoadEarlier ? 'Newer media' : 'Back to newest media'}
+              {pages.canLoadEarlier ? t('Newer media') : t('Back to newest media')}
             </button>
           )}
-          <div ref={scroll} data-testid="media-scroll" tabIndex={0} role="region" aria-label="Session media, newest first"
+          <div ref={scroll} data-testid="media-scroll" tabIndex={0} role="region" aria-label={t('Session media, newest first')}
             onScroll={(event) => {
               const el = event.currentTarget
               const forward = el.scrollLeft > previousScroll.current
@@ -290,16 +295,16 @@ function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0
               <MediaChip key={`${m.url}:${i}`} media={m} onOpen={lightbox.open} previewEnabled={pages.visible && ready} scrollRoot={scroll} />
             ))}
           </div>
-          {!ready && <p role="status" className="px-3 pb-2 text-xs text-muted">Waiting for terminal recovery…</p>}
+          {!ready && <p role="status" className="px-3 pb-2 text-xs text-muted">{t('Waiting for terminal recovery…')}</p>}
           {!pages.error && <MediaDiscoveryStatus discovery={pages.discovery} kind="media" hasItems={pages.items.length > 0} />}
-          {pages.status === 'loading' && pages.discovery.status === 'ready' && <p role="status" className="px-3 pb-2 text-xs text-muted">Loading media…</p>}
-          {pages.pages.length > 0 && !pages.items.length && pages.discovery.status === 'ready' && <p className="px-3 py-2 text-xs text-secondary">No media in this session yet.</p>}
+          {pages.status === 'loading' && pages.discovery.status === 'ready' && <p role="status" className="px-3 pb-2 text-xs text-muted">{t('Loading media…')}</p>}
+          {pages.pages.length > 0 && !pages.items.length && pages.discovery.status === 'ready' && <p className="px-3 py-2 text-xs text-secondary">{t('No media in this session yet.')}</p>}
           {pages.error && <div role="alert" className="px-3 pb-2 text-xs text-muted">
-            {pages.error} <button type="button" onClick={refresh} disabled={!ready} className="text-accent" aria-label="Refresh media">Refresh</button>
+            {pages.error} <button type="button" onClick={refresh} disabled={!ready} className="text-accent" aria-label={t('Refresh media')}>{t('Refresh')}</button>
           </div>}
           {pages.hasNext && !pages.error && (
             <button type="button" onClick={() => void pages.loadNext()} disabled={!ready || pages.status === 'loading'}
-              className="px-3 pb-2 text-xs text-accent">Load older media</button>
+              className="px-3 pb-2 text-xs text-accent">{t('Load older media')}</button>
           )}
           </>}
         </div>
@@ -318,17 +323,17 @@ function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0
         >
           <span className="inline-flex items-center gap-[6px]">
             <Image01Icon width={ICON_SIZE.pill} height={ICON_SIZE.pill} className="md:h-[16px] md:w-[16px]" />
-            <span className="hidden md:inline">Media</span>
+            <span className="hidden md:inline">{t('Media')}</span>
             <span className="tabular-nums">{pendingEmpty ? '…' : mediaCount ?? '…'}</span>
           </span>
           {!!counts?.links && <span className="inline-flex items-center gap-[6px]">
             <Link01Icon width={ICON_SIZE.pill} height={ICON_SIZE.pill} />
-            <span className="hidden md:inline">Links</span>
+            <span className="hidden md:inline">{t('Links')}</span>
             <span className="tabular-nums">{counts.links}</span>
           </span>}
           {!!counts?.previews && <span className="inline-flex items-center gap-[6px]">
             <BrowserIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} />
-            <span className="hidden md:inline">Previews</span>
+            <span className="hidden md:inline">{t('Previews')}</span>
             <span className="tabular-nums">{counts.previews}</span>
           </span>}
           {attention !== 'idle' && (

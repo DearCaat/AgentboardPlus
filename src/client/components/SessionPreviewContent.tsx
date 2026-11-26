@@ -9,6 +9,7 @@ import type { AgentSession } from '@shared/types'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
+import { useTranslation } from '../locale'
 
 const PREVIEW_FETCH_TIMEOUT_MS = 10_000
 const PREVIEW_LINE_LIMIT = 200
@@ -439,6 +440,7 @@ function entryToneClass(entry: ParsedEntry) {
 }
 
 function ToolEntry({ entry }: { entry: ParsedEntry }) {
+  const t = useTranslation()
   const [expanded, setExpanded] = useState(false)
   const marker = lineMarker(entry.lineNumber, entry.timestamp, entry.exactLineNumber)
   const label = entry.kind === 'tool_call' ? entry.content : 'Result'
@@ -460,7 +462,7 @@ function ToolEntry({ entry }: { entry: ParsedEntry }) {
           </span>
           {label}
         </span>
-        <span className="shrink-0 text-[11px]">{expanded ? 'Hide' : 'Show'}</span>
+        <span className="shrink-0 text-[11px]">{expanded ? t('Hide') : t('Show')}</span>
       </button>
       {expanded && (
         <pre className="max-h-80 overflow-auto border-t border-border px-3 py-2 whitespace-pre-wrap break-words text-xs leading-relaxed text-secondary">
@@ -568,6 +570,7 @@ function TranscriptEntry({ entry, showRole = true }: { entry: ParsedEntry; showR
 }
 
 function StructuredLogEntry({ entry }: { entry: StructuredLogLine }) {
+  const t = useTranslation()
   const [bodyExpanded, setBodyExpanded] = useState(false)
   const isLowProminence = entry.prominence === 'system' || entry.prominence === 'plain'
   const collapseBody = entry.prominence === 'tool' && Boolean(entry.body && entry.body.length > 160)
@@ -588,7 +591,7 @@ function StructuredLogEntry({ entry }: { entry: StructuredLogLine }) {
           className="select-none text-right text-[11px] tabular-nums text-muted"
           title={lineTitle(entry.lineNumber, entry.timestamp, entry.exactLineNumber)}
         >
-          {timestamp ?? (entry.exactLineNumber ? `Line ${entry.lineNumber + 1}` : 'Entry')}
+          {timestamp ?? (entry.exactLineNumber ? `Line ${entry.lineNumber + 1}` : t('Entry'))}
         </div>
         <div className="min-w-0 space-y-2">
           <div className="flex flex-wrap items-center gap-2">
@@ -596,7 +599,7 @@ function StructuredLogEntry({ entry }: { entry: StructuredLogLine }) {
               {entry.source}
             </span>
             <span className="min-w-0 break-words text-xs font-semibold text-primary">
-              {entry.title}
+              {entry.source === 'text' ? t(entry.title) : entry.title}
             </span>
           </div>
           {entry.body && !collapseBody && (
@@ -612,7 +615,7 @@ function StructuredLogEntry({ entry }: { entry: StructuredLogLine }) {
                 aria-expanded={bodyExpanded}
                 onClick={() => setBodyExpanded((value) => !value)}
               >
-                Output
+                {t('Output')}
               </button>
               {bodyExpanded && (
                 <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-words text-xs leading-relaxed text-secondary">
@@ -624,7 +627,7 @@ function StructuredLogEntry({ entry }: { entry: StructuredLogLine }) {
           {entry.details.length > 0 && (
             <details className="group">
               <summary className="cursor-pointer select-none text-[11px] text-muted hover:text-primary">
-                Details
+                {t('Details')}
               </summary>
               <div className="mt-2 space-y-2">
                 {entry.details.map((detail) => (
@@ -674,6 +677,7 @@ export default function SessionPreviewContent({
   className = '',
   onStateChange,
 }: SessionPreviewContentProps) {
+  const t = useTranslation()
   const [loading, setLoading] = useState(true)
   const [loadingEarlier, setLoadingEarlier] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -847,7 +851,7 @@ export default function SessionPreviewContent({
     <div className={`flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-border bg-elevated ${className}`.trim()}>
       <div className="flex flex-col gap-3 border-b border-border px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h3 className="text-sm font-semibold text-primary">Transcript</h3>
+          <h3 className="text-sm font-semibold text-primary">{t('Transcript')}</h3>
           <p className="text-xs text-muted">
             {lineRangeLabel}
           </p>
@@ -863,7 +867,7 @@ export default function SessionPreviewContent({
             }`}
             aria-pressed={viewMode === 'messages'}
           >
-            Messages
+            {t('Messages')}
           </button>
           <button
             type="button"
@@ -875,7 +879,7 @@ export default function SessionPreviewContent({
             }`}
             aria-pressed={viewMode === 'events'}
           >
-            Events
+            {t('Events')}
           </button>
         </div>
       </div>
@@ -886,7 +890,7 @@ export default function SessionPreviewContent({
       >
         {loading && (
           <div className="flex items-center justify-center py-8 text-muted">
-            Loading preview...
+            {t('Loading preview...')}
           </div>
         )}
         {error && (
@@ -898,7 +902,7 @@ export default function SessionPreviewContent({
           <div className="mx-auto flex w-full max-w-4xl flex-col">
             {displayEntries.length === 0 ? (
               <div className="py-8 text-center text-muted">
-                No readable messages found. Try Events.
+                {t('No readable messages found. Try Events.')}
               </div>
             ) : (
               displayEntries.map(({ entry, showRole }) => (
@@ -912,7 +916,7 @@ export default function SessionPreviewContent({
                 onClick={loadEarlier}
                 disabled={loadingEarlier}
               >
-                {loadingEarlier ? 'Loading...' : 'Load earlier'}
+                {loadingEarlier ? t('Loading...') : t('Load earlier')}
               </button>
             )}
           </div>
@@ -934,7 +938,7 @@ export default function SessionPreviewContent({
                 onClick={loadEarlier}
                 disabled={loadingEarlier}
               >
-                {loadingEarlier ? 'Loading...' : 'Load earlier'}
+                {loadingEarlier ? t('Loading...') : t('Load earlier')}
               </button>
             )}
           </div>

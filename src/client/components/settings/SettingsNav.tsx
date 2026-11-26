@@ -10,6 +10,7 @@ import { cn } from '../../utils/cn'
 import { ICON_SIZE } from '../controlStyles'
 import { ChevronRightIcon } from '../icons'
 import { SETTINGS_PAGES, type SettingsPageId } from './types'
+import { useTranslation } from '../../locale'
 
 export function tabId(page: SettingsPageId): string {
   return `settings-tab-${page}`
@@ -33,6 +34,7 @@ interface SettingsNavProps {
 }
 
 export function SettingsNav({ variant, current, onSelect, panelId }: SettingsNavProps) {
+  const t = useTranslation()
   const refs = useRef<Array<HTMLButtonElement | null>>([])
   const focusIndex = Math.max(0, SETTINGS_PAGES.findIndex((page) => page.id === current))
 
@@ -46,7 +48,7 @@ export function SettingsNav({ variant, current, onSelect, panelId }: SettingsNav
 
   if (variant === 'list') {
     return (
-      <nav aria-label="Settings pages">
+      <nav aria-label={t('Settings pages')}>
         <ul className="divide-y divide-border border-y border-border">
           {SETTINGS_PAGES.map((page, index) => (
             <li key={page.id}>
@@ -60,7 +62,7 @@ export function SettingsNav({ variant, current, onSelect, panelId }: SettingsNav
                 onKeyDown={(event) => handleKeyDown(event, index)}
                 className="flex min-h-[52px] w-full items-center justify-between gap-3 px-4 text-left text-[15px] text-primary active:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
               >
-                {page.label}
+                {t(page.label)}
                 <ChevronRightIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} className="text-muted" aria-hidden="true" />
               </button>
             </li>
@@ -71,7 +73,7 @@ export function SettingsNav({ variant, current, onSelect, panelId }: SettingsNav
   }
 
   return (
-    <div role="tablist" aria-orientation="vertical" aria-label="Settings pages" className="flex flex-col gap-px">
+    <div role="tablist" aria-orientation="vertical" aria-label={t('Settings pages')} className="flex flex-col gap-px">
       {SETTINGS_PAGES.map((page, index) => {
         const selected = page.id === current
         return (
@@ -96,7 +98,7 @@ export function SettingsNav({ variant, current, onSelect, panelId }: SettingsNav
                 : 'border-transparent text-secondary hover:text-primary'
             )}
           >
-            {page.label}
+            {t(page.label)}
           </button>
         )
       })}
@@ -115,17 +117,18 @@ export const SettingsSearch = forwardRef<HTMLInputElement, SettingsSearchProps>(
   { value, onChange, className },
   ref
 ) {
+  const t = useTranslation()
   return (
     <div className={className}>
       <label htmlFor="settings-search" className="sr-only">
-        Search settings
+        {t('Search settings')}
       </label>
       <input
         ref={ref}
         id="settings-search"
         type="search"
         value={value}
-        placeholder="Search settings"
+        placeholder={t('Search settings')}
         autoComplete="off"
         spellCheck={false}
         onChange={(event) => onChange(event.target.value)}

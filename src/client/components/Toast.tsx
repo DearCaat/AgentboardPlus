@@ -2,6 +2,7 @@ import { Toast as BaseToast } from '@base-ui/react/toast'
 import { cn } from '../utils/cn'
 import { ICON_SIZE } from './controlStyles'
 import { XCloseIcon } from './icons'
+import { useTranslation } from '../locale'
 
 const DEFAULT_TIMEOUT = 5000
 
@@ -9,6 +10,7 @@ const DEFAULT_TIMEOUT = 5000
 export const toastManager = BaseToast.createToastManager()
 
 function ToastItem({ toast }: { toast: BaseToast.Root.ToastObject }) {
+  const t = useTranslation()
   return (
     <BaseToast.Root
       toast={toast}
@@ -43,7 +45,7 @@ function ToastItem({ toast }: { toast: BaseToast.Root.ToastObject }) {
       </div>
       <BaseToast.Close
         className="shrink-0 text-muted hover:text-primary transition-colors"
-        aria-label="Close"
+        aria-label={t('Close')}
       >
         <XCloseIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
       </BaseToast.Close>

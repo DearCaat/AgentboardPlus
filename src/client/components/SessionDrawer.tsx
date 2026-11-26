@@ -17,6 +17,7 @@ import SessionList from './SessionList'
 import { RecoveryNotice } from './history/RecoveryNotice'
 import { ClockRewindIcon } from './icons'
 import { ICON_SIZE, mobileButtonClass } from './controlStyles'
+import { useTranslation } from '../locale'
 
 interface SessionDrawerProps {
   isOpen: boolean
@@ -63,6 +64,7 @@ export default function SessionDrawer({
   loading,
   error,
 }: SessionDrawerProps) {
+  const t = useTranslation()
   const prefersReducedMotion = useReducedMotion()
   const drawerRef = useRef<HTMLDivElement>(null)
   const previousFocusRef = useRef<HTMLElement | null>(null)
@@ -200,7 +202,7 @@ export default function SessionDrawer({
         style={transitionStyle}
         role="dialog"
         aria-modal={isOpen ? true : undefined}
-        aria-label="Session list"
+        aria-label={t('Session list')}
         tabIndex={-1}
       >
         <SessionList
@@ -243,15 +245,15 @@ export default function SessionDrawer({
             }}
             className="btn btn-primary min-h-[44px] flex-1 py-2 text-sm"
           >
-            New Session
+            {t('New Session')}
           </button>
           {handleOpenHistory && (
             <button
               type="button"
               onClick={handleOpenHistory}
               className={mobileButtonClass('neutral')}
-              title="Session recovery"
-              aria-label="Session recovery"
+              title={t('Session recovery')}
+              aria-label={t('Session recovery')}
             >
               <ClockRewindIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
             </button>

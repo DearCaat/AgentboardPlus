@@ -4,6 +4,7 @@ import { formatRelativeTime } from '../utils/time'
 import { getPathLeaf } from '../utils/sessionLabel'
 import AgentIcon from './AgentIcon'
 import SessionPreviewContent from './SessionPreviewContent'
+import { useTranslation } from '../locale'
 
 interface SessionPreviewModalProps {
   session: AgentSession
@@ -16,6 +17,7 @@ export default function SessionPreviewModal({
   onClose,
   onResume,
 }: SessionPreviewModalProps) {
+  const t = useTranslation()
   const modalRef = useRef<HTMLDivElement>(null)
   const [previewState, setPreviewState] = useState({
     loading: true,
@@ -90,7 +92,7 @@ export default function SessionPreviewModal({
         {/* Footer */}
         <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-3">
           <button type="button" onClick={onClose} className="btn">
-            Cancel
+            {t('Cancel')}
           </button>
           <button
             type="button"
@@ -98,7 +100,7 @@ export default function SessionPreviewModal({
             className="btn btn-primary"
             disabled={previewState.loading}
           >
-            Wake
+            {t('Wake')}
           </button>
         </div>
       </div>

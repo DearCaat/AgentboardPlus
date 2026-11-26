@@ -19,6 +19,7 @@ import {
   type PresetField,
 } from './presetEdits'
 import { CONTROL_BUTTON_SHAPE, CONTROL_HEIGHT, CONTROL_INPUT } from './styles'
+import { useTranslation } from '../../locale'
 
 /** Desktop: one line of five columns. Phone: radio/icon/delete, then name, then command. */
 export const PRESET_GRID =
@@ -50,6 +51,7 @@ export function PresetRow({
   onIconChange,
   onDelete,
 }: PresetRowProps) {
+  const t = useTranslation()
   const [confirming, setConfirming] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
   const base = `settings-preset-${preset.id}`
@@ -85,13 +87,13 @@ export function PresetRow({
           aria-label={`Default preset: ${name}`}
           className="size-4 cursor-pointer accent-accent disabled:cursor-not-allowed"
         />
-        <span aria-hidden="true" className="text-[12px] text-secondary md:hidden">Default</span>
+        <span aria-hidden="true" className="text-[12px] text-secondary md:hidden">{t('Default')}</span>
       </label>
 
       {preset.isBuiltIn ? (
         <div className={cn(CONTROL_HEIGHT, 'flex items-center gap-2 text-muted')}>
           <AgentIcon agentType={preset.agentType} command={preset.command} className="size-4" />
-          <span className="text-[11px]">Built-in</span>
+          <span className="text-[11px]">{t('Built-in')}</span>
         </div>
       ) : (
         <select
@@ -113,7 +115,7 @@ export function PresetRow({
         ref={nameRef}
         id={`${base}-label`}
         value={preset.label}
-        placeholder="Name"
+        placeholder={t('Name')}
         aria-label={`Name of preset ${index + 1}`}
         maxLength={PRESET_LABEL_MAX}
         onCommit={(draft) => onCommitField('label', draft)}
@@ -144,7 +146,7 @@ export function PresetRow({
           onPointerDown={pending ? (event) => event.preventDefault() : undefined}
           onBlur={() => setConfirming(false)}
           aria-label={confirming ? `Confirm delete ${name}` : pending ? `Discard new preset` : `Delete ${name}`}
-          title={confirming ? 'Click again to delete' : undefined}
+          title={confirming ? t('Click again to delete') : undefined}
           className={cn(
             CONTROL_BUTTON_SHAPE,
             'max-md:order-3',
@@ -153,7 +155,7 @@ export function PresetRow({
               : 'w-[32px] border-border bg-surface text-secondary hover:bg-hover hover:text-danger max-md:w-[44px]'
           )}
         >
-          {confirming ? 'Delete?' : <DeleteIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />}
+          {confirming ? t('Delete?') : <DeleteIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />}
         </button>
       )}
     </div>

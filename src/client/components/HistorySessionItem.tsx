@@ -10,6 +10,7 @@ import { useMenuViewportFit } from '../hooks/useMenuViewportFit'
 import AgentIcon from './AgentIcon'
 import ProjectBadge from './ProjectBadge'
 import { PrChips } from './PrChips'
+import { useTranslation } from '../locale'
 
 interface HistorySessionItemProps {
   session: AgentSession
@@ -28,6 +29,7 @@ export default memo(function HistorySessionItem({
   onResume,
   onPreview,
 }: HistorySessionItemProps) {
+  const t = useTranslation()
   const lastActivity = formatRelativeTime(session.lastActivityAt)
   const directoryLeaf = getPathLeaf(session.projectPath)
   const displayName =
@@ -79,7 +81,7 @@ export default memo(function HistorySessionItem({
       className={`session-row group relative cursor-pointer px-3 py-2 hover:bg-hover ${MOBILE_ROW_TARGET_CLASS}`}
       role="button"
       tabIndex={0}
-      title="Click to preview"
+      title={t('Click to preview')}
       onClick={() => onPreview(session)}
       onKeyDown={(e) => {
         // Only the row's own keys open the preview. Keys aimed at nested
@@ -97,8 +99,8 @@ export default memo(function HistorySessionItem({
       <button
         type="button"
         className={`${ROW_ICON_BUTTON_CLASS} absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100`}
-        title="Wake directly"
-        aria-label="Wake directly"
+        title={t('Wake directly')}
+        aria-label={t('Wake directly')}
         onClick={(e) => {
           e.stopPropagation()
           onResume(session.sessionId)
@@ -121,7 +123,7 @@ export default memo(function HistorySessionItem({
             <AlertTriangleIcon
               width={ICON_SIZE.pill} height={ICON_SIZE.pill}
               className="shrink-0 text-amber-500"
-              aria-label="Wake failed"
+              aria-label={t('Wake failed')}
               title={`Last wake failed: ${session.lastResumeError}`}
             />
           )}

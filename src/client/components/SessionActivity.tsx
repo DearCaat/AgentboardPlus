@@ -7,6 +7,7 @@ import type { AgentActivity } from '@shared/activity'
 import { formatRelativeTime } from '../utils/time'
 import { XCloseIcon } from './icons'
 import { ICON_SIZE } from './controlStyles'
+import { useTranslation } from '../locale'
 
 const activityDot: Record<AgentActivity['phase'], string> = {
   model: 'bg-working',
@@ -17,13 +18,14 @@ const activityDot: Record<AgentActivity['phase'], string> = {
 }
 
 function ActivityLine({ name, activity }: { name: string; activity: AgentActivity }) {
+  const t = useTranslation()
   return (
     <li className="flex gap-3 py-3">
       <span aria-hidden className={`mt-[5px] size-[6px] shrink-0 rounded-full ${activityDot[activity.phase]}`} />
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
           <span className="min-w-0 break-words text-[13px] font-medium text-primary [overflow-wrap:anywhere]">{name}</span>
-          {activity.updatedAt && <span title="Last activity signal" className="shrink-0 text-[11px] tabular-nums text-secondary"><span className="sr-only">Last signal </span>{formatRelativeTime(activity.updatedAt)}</span>}
+          {activity.updatedAt && <span title={t('Last activity signal')} className="shrink-0 text-[11px] tabular-nums text-secondary"><span className="sr-only">{t('Last signal')}{' '}</span>{formatRelativeTime(activity.updatedAt)}</span>}
         </div>
         <span className="mt-1 block break-words text-[12px] leading-relaxed text-secondary [overflow-wrap:anywhere]">{activity.label}</span>
       </div>
@@ -40,6 +42,7 @@ interface Props {
 }
 
 export default function SessionActivity({ session, statusClassName, statusContent, onAnimationEnd, children }: Props) {
+  const t = useTranslation()
   const [open, setOpen] = useState(false)
   const counterRef = useRef<HTMLButtonElement>(null)
   const statusRef = useRef<HTMLButtonElement>(null)
@@ -107,35 +110,35 @@ export default function SessionActivity({ session, statusClassName, statusConten
             onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); event.preventDefault(); restoreFocus.current = true; setOpen(false) } }}
           >
             <div className="flex items-center justify-between gap-3">
-              <Popover.Title className="text-sm font-medium">Agent activity</Popover.Title>
-              <Popover.Close aria-label="Close activity" className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-secondary hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent sm:min-h-6 sm:min-w-6">
+              <Popover.Title className="text-sm font-medium">{t('Agent activity')}</Popover.Title>
+              <Popover.Close aria-label={t('Close activity')} className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-secondary hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent sm:min-h-6 sm:min-w-6">
                 <XCloseIcon aria-hidden width={ICON_SIZE.default} height={ICON_SIZE.default} />
               </Popover.Close>
             </div>
-            <Popover.Description className="sr-only">Activity for the main session and its subagents.</Popover.Description>
-            <ul aria-label="Main session" className="mt-1">
+            <Popover.Description className="sr-only">{t('Activity for the main session and its subagents.')}</Popover.Description>
+            <ul aria-label={t('Main session')} className="mt-1">
               <ActivityLine name="Main session" activity={{ ...data.main, phase: session.status === 'permission' ? 'blocked' : data.main.phase, label: summary }} />
             </ul>
             {data.total > 0 && (
-              <section aria-label="Subagents" className="mt-1 border-t border-border pt-3">
+              <section aria-label={t('Subagents')} className="mt-1 border-t border-border pt-3">
                 <div className="flex items-baseline justify-between gap-3">
-                  <h3 className="text-[12px] font-medium">Subagents <span className="ml-1 tabular-nums text-secondary">{data.total}</span></h3>
-                  <span className="text-[11px] tabular-nums text-secondary">{data.running} running</span>
+                  <h3 className="text-[12px] font-medium">{t('Subagents')}{' '}<span className="ml-1 tabular-nums text-secondary">{data.total}</span></h3>
+                  <span className="text-[11px] tabular-nums text-secondary">{data.running}{' '}{t('running')}</span>
                 </div>
                 {(data.blocked > 0 || data.unknown > 0) && (
                   <p className="mt-1 text-[11px] text-secondary">
                     {[data.blocked > 0 ? `${data.blocked} awaiting input` : '', data.unknown > 0 ? `${data.unknown} unknown` : ''].filter(Boolean).join(' · ')}
                   </p>
                 )}
-                <ul aria-label="Subagent activity" className="mt-1">
+                <ul aria-label={t('Subagent activity')} className="mt-1">
                   {data.subagents.map(child => <ActivityLine key={child.id} name={child.name} activity={child.activity} />)}
                 </ul>
                 {data.truncated && <p className="pb-3 text-[12px] leading-relaxed text-secondary">Showing {data.subagents.length} of {data.total} subagents. Uninspected activity is unknown.</p>}
               </section>
             )}
             <details className="mt-1 border-t border-border pt-3 text-[11px] leading-relaxed text-secondary">
-              <summary className="cursor-pointer rounded hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">How activity is detected</summary>
-              <p className="mt-2">From logs. Pending tools may await approval. Silence for 15 minutes means unknown.</p>
+              <summary className="cursor-pointer rounded hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent">{t('How activity is detected')}</summary>
+              <p className="mt-2">{t('From logs. Pending tools may await approval. Silence for 15 minutes means unknown.')}</p>
             </details>
           </Popover.Popup>
         </Popover.Positioner>

@@ -1,11 +1,18 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
+import { useLocale } from './locale'
 import './styles/index.css'
 import './styles/sessionList.css'
 import '@xterm/xterm/css/xterm.css'
 import { isIOSDevice, isIOSPWA } from './utils/device'
 import { registerSW } from 'virtual:pwa-register'
+
+const rootElement = document.documentElement
+if (rootElement) {
+  rootElement.lang = useLocale.getState().locale
+  useLocale.subscribe(({ locale }) => { rootElement.lang = locale })
+}
 
 // Add class for iOS safe area handling
 if (isIOSDevice()) {

@@ -16,6 +16,7 @@ import type { SessionPullRequest } from '../../shared/types'
 import type { PrInfo } from '../../shared/prStatus'
 import { cachedChecks, fetchChecks, getPrInfo, subscribePrInfo, watchPrInfo } from '../lib/prStatus'
 import { formatRelativeTime } from '../utils/time'
+import { useTranslation } from '../locale'
 
 // Pill geometry shared by PrChip anchors and the offscreen measurer spans
 // below — keep these in sync or the single-row fit math drifts.
@@ -319,6 +320,7 @@ function useHoverCard(
 const FlyoutRetainContext = createContext<(() => () => void) | null>(null)
 
 function PrStatusAge({ at, stale }: { at: number; stale?: boolean }) {
+  const t = useTranslation()
   const iso = new Date(at).toJSON() ?? ''
   const [age, setAge] = useState(() => formatRelativeTime(iso))
   useEffect(() => {
@@ -330,7 +332,7 @@ function PrStatusAge({ at, stale }: { at: number; stale?: boolean }) {
   if (!age) return null
   return (
     <div className="mt-0.5 shrink-0 text-[11px] text-muted">
-      {stale ? 'Last confirmed' : 'Checked'} {age === 'now' ? 'just now' : `${age} ago`}
+      {stale ? t('Last confirmed') : t('Checked')} {age === 'now' ? t('just now') : `${age} ago`}
     </div>
   )
 }
@@ -342,6 +344,7 @@ function PrChip({
   pr: SessionPullRequest
   pillClass?: string
 }) {
+  const t = useTranslation()
   const info = useSyncExternalStore(subscribePrInfo, () => getPrInfo(pr.url))
   const checks = useSyncExternalStore(subscribePrInfo, () => cachedChecks(pr.url))
   const anchorRef = useRef<HTMLSpanElement>(null)
@@ -434,7 +437,7 @@ function PrChip({
                 rel="noreferrer"
                 className="mt-1 block shrink-0 text-xs text-primary hover:text-accent"
               >
-                {detail.title ?? '(title unavailable)'}
+                {detail.title ?? t('(title unavailable)')}
               </a>
               <div className="mt-0.5 shrink-0 text-[11px] text-muted">
                 {detail.author ? `by ${detail.author}` : ''}
@@ -444,7 +447,7 @@ function PrChip({
               )}
               {checks?.error && (
                 <div className="mt-0.5 shrink-0 text-[11px] text-muted">
-                  {checks.checks?.length ? 'Showing last known checks' : 'Checks unavailable'}
+                  {checks.checks?.length ? t('Showing last known checks') : t('Checks unavailable')}
                 </div>
               )}
               {checks?.checks && checks.checks.length > 0 && (

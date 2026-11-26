@@ -3,8 +3,10 @@ import { useEffect, useRef, useState } from 'react'
 import { copyTextWithResult } from '../utils/copyTextWithResult'
 import { ICON_SIZE } from './controlStyles'
 import { CheckIcon, Copy01Icon } from './icons'
+import { useTranslation } from '../locale'
 
 export function CopyLinkButton({ url, label }: { url: string; label: string }) {
+  const t = useTranslation()
   const [status, setStatus] = useState<'idle' | 'copying' | 'copied' | 'failed'>('idle')
   const generation = useRef(0)
   const timer = useRef<ReturnType<typeof setTimeout>>()
@@ -14,7 +16,7 @@ export function CopyLinkButton({ url, label }: { url: string; label: string }) {
   }, [url])
   const Icon = status === 'copied' ? CheckIcon : Copy01Icon
   return <span className="relative shrink-0">
-    <button type="button" aria-label={`Copy link for ${label}`} title={status === 'copied' ? 'Copied' : 'Copy link'}
+    <button type="button" aria-label={`Copy link for ${label}`} title={status === 'copied' ? t('Copied') : t('Copy link')}
       aria-busy={status === 'copying'} data-copy-state={status}
       onKeyDown={event => event.stopPropagation()} onKeyUp={event => event.stopPropagation()}
       onClick={event => {
@@ -38,7 +40,7 @@ export function CopyLinkButton({ url, label }: { url: string; label: string }) {
     <span role="status" aria-live="polite" className={status === 'failed'
       ? 'absolute right-0 top-full z-10 w-48 rounded border border-border bg-surface p-2 text-xs text-secondary shadow-sm'
       : 'sr-only'}>
-      {status === 'copied' ? 'Link copied' : status === 'failed' ? 'Could not copy. Touch and hold the link to copy it.' : ''}
+      {status === 'copied' ? t('Link copied') : status === 'failed' ? t('Could not copy. Touch and hold the link to copy it.') : ''}
     </span>
   </span>
 }

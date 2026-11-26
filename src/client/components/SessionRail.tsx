@@ -39,6 +39,7 @@ import {
   XCloseIcon,
 } from './icons'
 import { ICON_SIZE, ROW_ICON_BUTTON_CLASS, iconButtonClass } from './controlStyles'
+import { useTranslation } from '../locale'
 
 const harnessLabels: Record<string, string> = {
   codex: 'Codex', claude: 'Claude Code', 'claude-rp': 'Claude RP', pi: 'Pi',
@@ -139,6 +140,7 @@ export default function SessionRail({
   onCopySelection,
   onDismissSelection,
 }: SessionRailProps) {
+  const t = useTranslation()
   const showProjectName = useSettingsStore((state) => state.showProjectName)
 
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
@@ -248,11 +250,11 @@ export default function SessionRail({
   const menuItems: ContextMenuEntry[] = []
   if (session) {
     menuItems.push(
-      { key: 'rename', label: 'Rename', icon: <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />, onSelect: startRename },
+      { key: 'rename', label: t('Rename'), icon: <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />, onSelect: startRename },
       ...(organizationAvailable
         ? [{
             key: 'display-name',
-            label: 'Edit display name',
+            label: t('Edit display name'),
             icon: <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
             onSelect: startDisplayNameEdit,
           }]
@@ -260,25 +262,25 @@ export default function SessionRail({
       ...(onDuplicate
         ? [{
             key: 'duplicate',
-            label: 'Duplicate',
+            label: t('Duplicate'),
             icon: <Copy01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
-            title: 'Create a copy in a new tmux window',
+            title: t('Create a copy in a new tmux window'),
             onSelect: onDuplicate,
           }]
         : []),
       ...(canHibernate
         ? [{
             key: 'hibernate',
-            label: 'Hibernate',
+            label: t('Hibernate'),
             icon: <Moon01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
-            title: 'Close the live window and keep this session ready to wake',
+            title: t('Close the live window and keep this session ready to wake'),
             onSelect: onHibernate,
           }]
         : []),
       ...(agentSessionId
         ? [{
             key: 'copy-id',
-            label: 'Copy full session ID',
+            label: t('Copy full session ID'),
             icon: <Hash01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
             title: agentSessionId,
             onSelect: () => copyText(agentSessionId),
@@ -303,7 +305,7 @@ export default function SessionRail({
       ...(session.logFilePath
         ? [{
             key: 'copy-log',
-            label: 'Copy Log Path',
+            label: t('Copy Log Path'),
             icon: <File06Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
             title: session.logFilePath,
             onSelect: () => copyText(session.logFilePath!),
@@ -313,7 +315,7 @@ export default function SessionRail({
     if (canControl) {
       menuItems.push('divider', {
         key: 'kill',
-        label: 'Kill Session',
+        label: t('Kill Session'),
         icon: <XCloseIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
         danger: true,
         onSelect: onKill,
@@ -321,19 +323,19 @@ export default function SessionRail({
     }
   } else if (hibernatingSession) {
     menuItems.push(
-      { key: 'wake', label: 'Wake', icon: <PlayIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />, onSelect: onWake },
-      { key: 'rename', label: 'Rename', icon: <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />, onSelect: startRename },
+      { key: 'wake', label: t('Wake'), icon: <PlayIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />, onSelect: onWake },
+      { key: 'rename', label: t('Rename'), icon: <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />, onSelect: startRename },
       ...(organizationAvailable
         ? [{
             key: 'display-name',
-            label: 'Edit display name',
+            label: t('Edit display name'),
             icon: <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
             onSelect: startDisplayNameEdit,
           }]
         : []),
       {
         key: 'copy-id',
-        label: 'Copy Session ID',
+        label: t('Copy Session ID'),
         icon: <Hash01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
         title: hibernatingSession.sessionId,
         onSelect: () => copyText(hibernatingSession.sessionId),
@@ -341,7 +343,7 @@ export default function SessionRail({
       ...(hibernatingSession.logFilePath
         ? [{
             key: 'copy-log',
-            label: 'Copy Log Path',
+            label: t('Copy Log Path'),
             icon: <File06Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
             title: hibernatingSession.logFilePath,
             onSelect: () => copyText(hibernatingSession.logFilePath!),
@@ -351,7 +353,7 @@ export default function SessionRail({
     if (onMoveToHistory) {
       menuItems.push('divider', {
         key: 'move-to-history',
-        label: 'Move to History',
+        label: t('Move to History'),
         icon: <XCloseIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
         onSelect: onMoveToHistory,
       })
@@ -377,13 +379,13 @@ export default function SessionRail({
       onClick={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.stopPropagation()}
       className="w-40 max-w-48 select-text rounded border border-border bg-surface px-1.5 py-0.5 text-sm font-medium text-primary outline-none focus:border-accent"
-      aria-label={renameMode === 'display' ? 'Set display name' : 'Rename session'}
+      aria-label={renameMode === 'display' ? t('Set display name') : t('Rename session')}
     />
   )
 
   const projectBadge = (leaf: string, fullPath: string) =>
     pathCopied ? (
-      <span className={copiedPill}>Copied!</span>
+      <span className={copiedPill}>{t('Copied!')}</span>
     ) : (
       <button
         type="button"
@@ -404,18 +406,18 @@ export default function SessionRail({
       {harnessLabel && <span className="shrink-0 text-xs font-medium text-secondary">{harnessLabel}</span>}
       {agentSessionId ? (
         <button type="button" className="min-w-0 break-all text-left font-mono text-xs text-muted hover:text-primary"
-          title={`${agentSessionId} — click to copy`} aria-label="Copy session ID"
+          title={`${agentSessionId} — click to copy`} aria-label={t('Copy session ID')}
           onClick={() => { copyText(agentSessionId); markIdCopied() }}>
-          {idCopied ? 'Copied!' : agentSessionId}
+          {idCopied ? t('Copied!') : agentSessionId}
         </button>
       ) : canReadCodexStatus ? (
         <button type="button" className="shrink-0 text-xs text-muted hover:text-primary"
           disabled={conversationId.pending} onClick={() => void conversationId.save({ source: 'codex-status' })}>
-          {conversationId.pending ? 'Reading session ID…' : 'Read ID from /status'}
+          {conversationId.pending ? t('Reading session ID…') : t('Read ID from /status')}
         </button>
       ) : session?.remote && harnessLabel && (
         <button type="button" className="shrink-0 text-xs text-muted hover:text-primary" onClick={() => void setRemoteSessionId()}>
-          Set session ID…
+          {t('Set session ID…')}
         </button>
       )}
       {conversationId.error && <span role="alert" className="text-xs text-danger">{conversationId.error}</span>}
@@ -478,7 +480,7 @@ export default function SessionRail({
               )}
               <Divider />
               <span className="shrink-0 rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-400">
-                Hibernating
+                {t('Hibernating')}
               </span>
               {hibernatingContext && (
                 <>
@@ -506,7 +508,7 @@ export default function SessionRail({
           </>
         ) : (
           <span className="text-xs text-muted">
-            {sessionCount} {sessionCount === 1 ? 'session' : 'sessions'}
+            {sessionCount} {sessionCount === 1 ? 'session' : t('sessions')}
           </span>
         )}
       </div>
@@ -516,22 +518,22 @@ export default function SessionRail({
         {selectionReady && session && (
           <span className={`${transientPill} cursor-default`}>
             <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-accent" />
-            Selection ready
+            {t('Selection ready')}
             <button
               type="button"
               onClick={onCopySelection}
               className="flex h-5 items-center gap-1 rounded px-1 font-medium text-accent hover:text-primary"
-              aria-label="Copy selection"
+              aria-label={t('Copy selection')}
             >
               <Copy01Icon width={ICON_SIZE.pill} height={ICON_SIZE.pill} />
-              Copy
+              {t('Copy')}
             </button>
             <button
               type="button"
               onClick={onDismissSelection}
               className={ROW_ICON_BUTTON_CLASS}
-              title="Dismiss"
-              aria-label="Dismiss"
+              title={t('Dismiss')}
+              aria-label={t('Dismiss')}
             >
               <XCloseIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} />
             </button>
@@ -542,24 +544,24 @@ export default function SessionRail({
             type="button"
             onClick={onJumpToBottom}
             className={transientPill}
-            title="Exit tmux copy mode and return to live output"
-            aria-label="Exit copy mode"
+            title={t('Exit tmux copy mode and return to live output')}
+            aria-label={t('Exit copy mode')}
           >
             <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-amber-400" />
-            Copy mode
+            {t('Copy mode')}
             <span aria-hidden className="text-muted">·</span>
-            <span className="font-medium text-amber-400">Exit</span>
+            <span className="font-medium text-amber-400">{t('Exit')}</span>
           </button>
         ) : showJumpToBottom && session ? (
           <button
             type="button"
             onClick={onJumpToBottom}
             className={transientPill}
-            title="Scroll to bottom"
-            aria-label="Scroll to bottom"
+            title={t('Scroll to bottom')}
+            aria-label={t('Scroll to bottom')}
           >
             <ArrowDownIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} />
-            Jump to bottom
+            {t('Jump to bottom')}
           </button>
         ) : null}
         {hasTransients && <Divider />}
@@ -574,15 +576,15 @@ export default function SessionRail({
             onClick={onWake}
             className={`${segmentButton} border border-border bg-surface text-secondary hover:bg-hover hover:text-primary`}
           >
-            Wake
+            {t('Wake')}
           </button>
         )}
         {session && canHibernate && (
           <button
             onClick={onHibernate}
             className={iconButtonClass('neutral')}
-            title="Hibernate session"
-            aria-label="Hibernate session"
+            title={t('Hibernate session')}
+            aria-label={t('Hibernate session')}
           >
             <Moon01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
           </button>
@@ -597,7 +599,7 @@ export default function SessionRail({
             }}
             className={iconButtonClass('neutral')}
             title={`Session actions (Kill: ${modDisplay}X)`}
-            aria-label="Session actions"
+            aria-label={t('Session actions')}
             aria-haspopup="menu"
             aria-expanded={menu !== null}
           >

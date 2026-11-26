@@ -17,6 +17,7 @@ import type { SidebarAnchor } from '../stores/settingsStore'
 import { useSettingsStore } from '../stores/settingsStore'
 import HibernatingSessionItem from './HibernatingSessionItem'
 import HistorySessionItem from './HistorySessionItem'
+import { useTranslation } from '../locale'
 
 const HISTORY_PAGE_SIZE = 20
 
@@ -82,6 +83,7 @@ export function HibernatingSection({
   onMoveToHistory,
   ...prefs
 }: HibernatingSectionProps) {
+  const t = useTranslation()
   const expanded = useSettingsStore((state) => state.hibernatingSessionsExpanded)
   const setExpanded = useSettingsStore((state) => state.setHibernatingSessionsExpanded)
   const rows = useMemo(() => inAnchorOrder(sessions, anchor), [sessions, anchor])
@@ -92,7 +94,7 @@ export function HibernatingSection({
     <div className={sectionBorderClass(anchor)}>
       <SectionToggle
         expanded={expanded}
-        label="Hibernating"
+        label={t('Hibernating')}
         onToggle={() => setExpanded(!expanded)}
       >
         <span className="w-8 text-right text-xs text-muted">{sessions.length}</span>
@@ -137,6 +139,7 @@ export function HistorySection({
   onPreview,
   ...prefs
 }: HistorySectionProps) {
+  const t = useTranslation()
   const expanded = useSettingsStore((state) => state.historySessionsExpanded)
   const setExpanded = useSettingsStore((state) => state.setHistorySessionsExpanded)
   const [limit, setLimit] = useState(HISTORY_PAGE_SIZE)
@@ -167,7 +170,7 @@ export function HistorySection({
     <div className={sectionBorderClass(anchor)}>
       <SectionToggle
         expanded={expanded}
-        label="History"
+        label={t('History')}
         onToggle={() => setExpanded(!expanded)}
       >
         <motion.span

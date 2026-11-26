@@ -28,6 +28,7 @@ import { copyThenAfter, SNAPSHOT_LINE_ATTR } from '../utils/snapshotSelection'
 import { findWrappedRows, type RowJoin } from '../utils/snapshotRejoin'
 import { measureLetterSpacing, measureTerminalGeometry, type TerminalGeometry } from '../utils/terminalGeometry'
 import type { TerminalSnapshotState } from '../hooks/useTerminalSnapshot'
+import { useTranslation } from '../locale'
 
 interface Props {
   state: Exclude<TerminalSnapshotState, { status: 'closed' }>
@@ -44,6 +45,7 @@ interface Props {
 const STOPPED_EVENTS = ['touchstart', 'touchmove', 'touchend', 'touchcancel'] as const
 
 export default function TerminalSnapshotLayer({ state, containerRef, terminalRef, background, foreground, rejoinWrapped, onCopied }: Props) {
+  const t = useTranslation()
   const rootRef = useRef<HTMLDivElement | null>(null)
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const textRef = useRef<HTMLDivElement | null>(null)
@@ -189,8 +191,8 @@ export default function TerminalSnapshotLayer({ state, containerRef, terminalRef
       {state.status !== 'ready' && (
         <div className="absolute inset-0 flex items-center justify-center gap-2 text-sm text-muted">
           {state.status === 'loading'
-            ? <><SpinnerIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} className="animate-spin" /> Capturing text</>
-            : 'Could not capture the pane text'}
+            ? <><SpinnerIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} className="animate-spin" />{' '}{t('Capturing text')}</>
+            : t('Could not capture the pane text')}
         </div>
       )}
     </div>

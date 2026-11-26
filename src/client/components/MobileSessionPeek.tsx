@@ -3,6 +3,7 @@ import { useId } from 'react'
 import type { Session } from '@shared/types'
 import { statusText } from '../utils/sessionStatus'
 import { getSessionDisplayName, useSessionOrganizationStore } from '../stores/sessionOrganizationStore'
+import { useTranslation } from '../locale'
 
 const colors: Record<Session['status'], string> = {
   working: 'bg-working/45',
@@ -19,6 +20,7 @@ interface Props {
 }
 
 export default function MobileSessionPeek({ sessions, selectedId, isOpen, onOpen }: Props) {
+  const t = useTranslation()
   const descriptionId = useId()
   const organizationSessions = useSessionOrganizationStore((state) => state.organization.sessions)
   return (
@@ -26,7 +28,7 @@ export default function MobileSessionPeek({ sessions, selectedId, isOpen, onOpen
       type="button"
       data-testid="session-peek"
       className="absolute inset-y-0 left-0 z-10 flex w-[8px] flex-col gap-1 overflow-hidden bg-elevated py-1 md:hidden focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-[-2px]"
-      aria-label="Open session overview"
+      aria-label={t('Open session overview')}
       aria-expanded={isOpen}
       aria-describedby={descriptionId}
       onClick={onOpen}

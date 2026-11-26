@@ -9,6 +9,7 @@ import { useSettingsStore } from '../stores/settingsStore'
 import { getEffectiveModifier, getModifierDisplay } from '../utils/device'
 import ConnectionIndicator from './ConnectionIndicator'
 import { ICON_BUTTON_CLASS, ICON_SIZE, iconButtonClass } from './controlStyles'
+import { useTranslation } from '../locale'
 
 interface SidebarControlsProps {
   connectionStatus: ConnectionStatus
@@ -30,6 +31,7 @@ export default function SidebarControls({
   tailscaleIp,
   placement = 'down',
 }: SidebarControlsProps) {
+  const t = useTranslation()
   const shortcutModifier = useSettingsStore((state) => state.shortcutModifier)
   const modDisplay = getModifierDisplay(getEffectiveModifier(shortcutModifier))
 
@@ -41,15 +43,15 @@ export default function SidebarControls({
         placement={placement}
       />
       {onManageTokens && (
-        <button type="button" className="btn text-xs" onClick={onManageTokens}>Tokens</button>
+        <button type="button" className="btn text-xs" onClick={onManageTokens}>{t('Tokens')}</button>
       )}
       {onOpenHistory && (
         <button
           type="button"
           onClick={onOpenHistory}
           className={ICON_BUTTON_CLASS}
-          title="Session recovery"
-          aria-label="Session recovery"
+          title={t('Session recovery')}
+          aria-label={t('Session recovery')}
         >
           <ClockRewindIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
         </button>
@@ -58,8 +60,8 @@ export default function SidebarControls({
         type="button"
         onClick={onNewSession}
         className={iconButtonClass('primary')}
-        title={`New session (${modDisplay}N)`}
-        aria-label="New session"
+        title={t('New session ({shortcut})', { shortcut: `${modDisplay}N` })}
+        aria-label={t('New session')}
       >
         <PlusIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
       </button>
@@ -67,8 +69,8 @@ export default function SidebarControls({
         type="button"
         onClick={onOpenSettings}
         className={ICON_BUTTON_CLASS}
-        title={`Settings (${modDisplay},)`}
-        aria-label="Settings"
+        title={t('Settings ({shortcut})', { shortcut: `${modDisplay},` })}
+        aria-label={t('Settings')}
       >
         <Settings02Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
       </button>

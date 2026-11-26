@@ -34,6 +34,7 @@ import { getDisambiguatedProjectNames, getPathLeaf } from '../utils/sessionLabel
 import { ICON_SIZE, TOUCH_TARGET_CLASS, iconButtonClass } from './controlStyles'
 import { FilterFunnel02Icon } from './icons'
 import FilterChecklist from './FilterChecklist'
+import { useTranslation } from '../locale'
 
 /** The search field shows when hosts + projects exceed this many options. */
 export const FILTER_SEARCH_THRESHOLD = 8
@@ -84,6 +85,7 @@ export default function SessionFilterButton({
   open: controlledOpen,
   onOpenChange,
 }: SessionFilterButtonProps) {
+  const t = useTranslation()
   const [localOpen, setOpenState] = useState(false)
   const open = controlledOpen ?? localOpen
   const [query, setQuery] = useState('')
@@ -207,14 +209,14 @@ export default function SessionFilterButton({
             type="button"
             data-testid="hidden-attention-dot"
             className="absolute -bottom-1 -right-1 h-2 w-2 rounded-full bg-approval pulse-approval ring-2 ring-elevated"
-            title="Hidden sessions need attention"
-            aria-label="Clear project filters"
+            title={t('Hidden sessions need attention')}
+            aria-label={t('Clear project filters')}
             onClick={(event) => {
               event.stopPropagation()
               onSelectProjects([])
             }}
           >
-            <span className="sr-only">Clear project filters</span>
+            <span className="sr-only">{t('Clear project filters')}</span>
           </button>
         )}
       </span>
@@ -222,7 +224,7 @@ export default function SessionFilterButton({
         <div
           id={menuId}
           role="menu"
-          aria-label="Filter sessions"
+          aria-label={t('Filter sessions')}
           className={`absolute left-2 right-2 z-20 ${
             placement === 'up' ? 'bottom-full mb-1' : 'top-full mt-1'
           } flex max-h-[min(26rem,calc(100dvh-7rem))] flex-col overflow-hidden rounded border border-border bg-surface p-1.5 text-xs shadow-lg`}
@@ -233,7 +235,7 @@ export default function SessionFilterButton({
             className="flex h-[26px] shrink-0 items-center justify-between gap-2 [@media(pointer:coarse)]:h-[44px]"
           >
             <span className="truncate pl-2 text-[11px] font-medium text-secondary">
-              Filter
+              {t('Filter')}
             </span>
             {isActive && (
               <button
@@ -246,7 +248,7 @@ export default function SessionFilterButton({
                 // Full row height: 26px on desktop, 44x44 on coarse pointers.
                 className="h-full shrink-0 rounded px-2 text-accent hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent [@media(pointer:coarse)]:min-w-[44px]"
               >
-                Clear
+                {t('Clear')}
               </button>
             )}
           </div>
@@ -255,8 +257,8 @@ export default function SessionFilterButton({
               <input
                 ref={searchRef}
                 type="search"
-                aria-label="Search filters"
-                placeholder="Search"
+                aria-label={t('Search filters')}
+                placeholder={t('Search')}
                 autoComplete="off"
                 autoCorrect="off"
                 autoCapitalize="off"
@@ -273,7 +275,7 @@ export default function SessionFilterButton({
           <div data-testid="filter-options" className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             {renderHosts && (
               <FilterChecklist
-                heading="Hosts"
+                heading={t('Hosts')}
                 emptyLabel="No hosts"
                 options={hosts}
                 visibleOptions={visibleHosts}
@@ -292,7 +294,7 @@ export default function SessionFilterButton({
             )}
             {renderProjects && (
               <FilterChecklist
-                heading="Projects"
+                heading={t('Projects')}
                 emptyLabel="No projects"
                 options={projects}
                 visibleOptions={visibleProjects}
@@ -304,7 +306,7 @@ export default function SessionFilterButton({
             )}
             {!renderHosts && !renderProjects && (
               <div data-testid="filter-no-matches" className="px-2 py-1.5 text-muted">
-                No matches
+                {t('No matches')}
               </div>
             )}
           </div>

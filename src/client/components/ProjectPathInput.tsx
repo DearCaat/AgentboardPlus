@@ -4,6 +4,7 @@ import { forwardRef, useEffect, useId, useRef, useState } from 'react'
 import { useSettingsStore } from '../stores/settingsStore'
 import { readDirectory, useDirectoryListing } from '../hooks/useDirectoryListing'
 import { FolderIcon } from './icons'
+import { useTranslation } from '../locale'
 
 export const ProjectPathInput = forwardRef<HTMLInputElement, {
   value: string
@@ -12,6 +13,7 @@ export const ProjectPathInput = forwardRef<HTMLInputElement, {
   remote: boolean
   onBrowse: () => void
 }>(function ProjectPathInput({ value, onChange, placeholder, remote, onBrowse }, ref) {
+  const t = useTranslation()
   const recentPaths = useSettingsStore(s => s.recentPaths)
   const [open, setOpen] = useState(false)
   const [edited, setEdited] = useState(false)
@@ -71,7 +73,7 @@ export const ProjectPathInput = forwardRef<HTMLInputElement, {
     <div onBlur={event => {
       if (!event.currentTarget.contains(event.relatedTarget)) { setOpen(false); cancelChoice() }
     }}>
-      <label htmlFor={id} className="mb-1.5 block text-xs text-secondary">Project path</label>
+      <label htmlFor={id} className="mb-1.5 block text-xs text-secondary">{t('Project path')}</label>
       <div className="flex gap-2">
         <input ref={ref} id={id} value={value} placeholder={placeholder} spellCheck={false} autoCapitalize="none" autoCorrect="off"
           role={remote ? undefined : 'combobox'} aria-autocomplete={remote ? undefined : 'list'}
@@ -95,11 +97,11 @@ export const ProjectPathInput = forwardRef<HTMLInputElement, {
               onChange(suggestions[active] + '/'); setActive(-1)
             }
           }} className="input min-w-0 flex-1 text-[16px] sm:text-sm" />
-        {!remote && <button type="button" className="btn min-h-[44px] sm:min-h-0" onClick={() => { setOpen(false); cancelChoice(); onBrowse() }}>Browse</button>}
+        {!remote && <button type="button" className="btn min-h-[44px] sm:min-h-0" onClick={() => { setOpen(false); cancelChoice(); onBrowse() }}>{t('Browse')}</button>}
       </div>
       {visible && <div className="mt-2 border border-border bg-surface">
-        <p className="px-3 py-2 text-xs text-secondary">{completing ? 'Matching folders' : 'Recent projects'}</p>
-        <div ref={listRef} id={`${id}-options`} role="listbox" aria-label={completing ? 'Matching folders' : 'Recent projects'} className="max-h-48 overflow-y-auto">
+        <p className="px-3 py-2 text-xs text-secondary">{completing ? t('Matching folders') : t('Recent projects')}</p>
+        <div ref={listRef} id={`${id}-options`} role="listbox" aria-label={completing ? t('Matching folders') : t('Recent projects')} className="max-h-48 overflow-y-auto">
           {suggestions.map((path, index) => <div key={path} id={`${id}-${index}`} role="option" aria-selected={active === index}
             onMouseDown={event => event.preventDefault()} onClick={() => void choose(path)}
             className={`flex min-h-[44px] cursor-pointer items-center gap-3 px-3 py-2 hover:bg-hover ${active === index ? 'bg-hover' : ''}`}>
@@ -110,10 +112,10 @@ export const ProjectPathInput = forwardRef<HTMLInputElement, {
         </div>
         <div role="status" className="px-3 pb-2 text-xs text-secondary">
           {error || listingError ? <span className="text-danger">{error || listingError}</span>
-            : choosing ? 'Checking folder…' : loading ? 'Loading folders…'
-              : !suggestions.length ? (completing ? 'No matching folders. Enter a full path or browse.' : 'No recent matches. Enter a path or browse.')
-                : completing ? 'Enter to choose · Tab to browse into a match' : 'Choose a project or enter a path'}
-          {listing?.truncated && <p>First 200 matches shown. Keep typing to narrow the list.</p>}
+            : choosing ? t('Checking folder…') : loading ? t('Loading folders…')
+              : !suggestions.length ? (completing ? t('No matching folders. Enter a full path or browse.') : t('No recent matches. Enter a path or browse.'))
+                : completing ? t('Enter to choose · Tab to browse into a match') : t('Choose a project or enter a path')}
+          {listing?.truncated && <p>{t('First 200 matches shown. Keep typing to narrow the list.')}</p>}
         </div>
       </div>}
     </div>

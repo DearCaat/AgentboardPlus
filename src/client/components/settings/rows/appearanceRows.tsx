@@ -15,19 +15,21 @@ import { SegmentedControl } from '../controls/SegmentedControl'
 import { Switch } from '../../Switch'
 import { CONTROL_INPUT, SWITCH_TOUCH_TARGET } from '../styles'
 import type { RowControlProps, SettingsRowDef } from '../types'
+import { useLocale, useTranslation, type Locale } from '../../../locale'
 
 export const FONT_SIZE_MIN = 6
 export const FONT_SIZE_MAX = 24
 
 function ThemeControl({ ids }: RowControlProps) {
+  const t = useTranslation()
   const theme = useThemeStore((state) => state.theme)
   const setTheme = useThemeStore((state) => state.setTheme)
   return (
     <SegmentedControl<Theme>
       options={[
-        { value: 'light', label: 'Light' },
-        { value: 'dark', label: 'Dark' },
-        { value: 'system', label: 'System' },
+        { value: 'light', label: t('Light') },
+        { value: 'dark', label: t('Dark') },
+        { value: 'system', label: t('System') },
       ]}
       value={theme}
       onChange={setTheme}
@@ -38,6 +40,7 @@ function ThemeControl({ ids }: RowControlProps) {
 }
 
 function FontFamilyControl({ ids }: RowControlProps) {
+  const t = useTranslation()
   const value = useSettingsStore((state) => state.fontOption)
   const set = useSettingsStore((state) => state.setFontOption)
   return (
@@ -50,7 +53,7 @@ function FontFamilyControl({ ids }: RowControlProps) {
     >
       {FONT_OPTIONS.map((option) => (
         <option key={option.id} value={option.id}>
-          {option.label}
+          {t(option.label)}
         </option>
       ))}
     </select>
@@ -79,6 +82,7 @@ function CustomFontFamilyControl({ ids }: RowControlProps) {
 }
 
 function FontSizeControl({ ids }: RowControlProps) {
+  const t = useTranslation()
   const value = useSettingsStore((state) => state.fontSize)
   const set = useSettingsStore((state) => state.setFontSize)
   return (
@@ -87,7 +91,7 @@ function FontSizeControl({ ids }: RowControlProps) {
       min={FONT_SIZE_MIN}
       max={FONT_SIZE_MAX}
       onChange={set}
-      noun="font size"
+      noun={t('font size')}
       labelledBy={ids.label}
       describedBy={ids.description}
     />
@@ -138,7 +142,33 @@ function CompactMobileControls({ ids }: RowControlProps) {
     onCheckedChange={set} ariaLabelledBy={ids.label} ariaDescribedBy={ids.description} />
 }
 
+function LanguageControl({ ids }: RowControlProps) {
+  const locale = useLocale(state => state.locale)
+  const setLocale = useLocale(state => state.setLocale)
+  return (
+    <select
+      id={ids.control}
+      value={locale}
+      aria-describedby={ids.description}
+      onChange={event => setLocale(event.target.value as Locale)}
+      className={CONTROL_INPUT}
+    >
+      <option value="en" lang="en">English</option>
+      <option value="zh-CN" lang="zh-CN">简体中文</option>
+    </select>
+  )
+}
+
 export const appearanceRows: SettingsRowDef[] = [
+  {
+    id: 'language',
+    page: 'appearance',
+    label: 'Language',
+    description: 'Language for the interface on this browser.',
+    keywords: ['locale', 'translation', 'English', 'Chinese', '简体中文', '语言'],
+    tags: ['device'],
+    Control: LanguageControl,
+  },
   {
     id: 'theme',
     page: 'appearance',

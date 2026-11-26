@@ -52,6 +52,7 @@ import {
 } from './icons'
 import '../styles/compactMobileControls.css'
 import { ICON_SIZE, TOUCH_TARGET_CLASS, mobileButtonClass } from './controlStyles'
+import { useTranslation } from '../locale'
 
 interface TerminalProps {
   session: Session | null
@@ -119,6 +120,7 @@ export default function Terminal({
   loading = false,
   error = null,
 }: TerminalProps) {
+  const t = useTranslation()
   const resetNativeInputRef = useRef<((afterPaste?: boolean) => void) | undefined>(undefined)
   const [pasteStatus, setPasteStatus] = useState<'idle' | 'sending' | 'unconfirmed'>('idle')
   const nextPasteId = useRef(0)
@@ -1324,7 +1326,7 @@ export default function Terminal({
           <button
             onClick={() => setIsDrawerOpen(true)}
             className={mobileButtonClass('neutral')}
-            aria-label="Open session menu"
+            aria-label={t('Open session menu')}
             aria-expanded={isDrawerOpen}
           >
             <Menu01Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
@@ -1356,12 +1358,12 @@ export default function Terminal({
                 {hibernatingDisplayName}
               </span>
               <span className="text-[10px] font-medium text-blue-400">
-                Hibernating
+                {t('Hibernating')}
               </span>
             </div>
           ) : (
             <span className="text-sm font-medium text-primary">
-              Sessions
+              {t('Sessions')}
             </span>
           )}
         </div>
@@ -1372,8 +1374,8 @@ export default function Terminal({
           <button
             onClick={onNewSession}
             className={mobileButtonClass('primary')}
-            title={`New session (${modDisplay}N)`}
-            aria-label="New session"
+            title={t('New session ({shortcut})', { shortcut: `${modDisplay}N` })}
+            aria-label={t('New session')}
           >
             <PlusIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
           </button>
@@ -1385,7 +1387,7 @@ export default function Terminal({
               onClick={() => setShowEndConfirm(true)}
               className={mobileButtonClass('danger')}
               title={`Kill session (${modDisplay}X)`}
-              aria-label="Kill session"
+              aria-label={t('Kill session')}
             >
               <XCloseIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
             </button>
@@ -1394,8 +1396,8 @@ export default function Terminal({
             <button
               onClick={handleHibernateSession}
               className={`${mobileButtonClass('neutral', 'hidden')} min-[360px]:flex`}
-              title="Hibernate session"
-              aria-label="Hibernate session"
+              title={t('Hibernate session')}
+              aria-label={t('Hibernate session')}
             >
               <Moon01Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
             </button>
@@ -1405,7 +1407,7 @@ export default function Terminal({
               onClick={() => onResumeSession(hibernatingSession.sessionId)}
               className="mobile-header-wake btn btn-primary h-[44px] px-3 text-xs"
             >
-              Wake
+              {t('Wake')}
             </button>
           )}
 
@@ -1415,8 +1417,8 @@ export default function Terminal({
               <button
                 onClick={() => setShowMoreMenu(!showMoreMenu)}
                 className={mobileButtonClass('neutral')}
-                title="More options"
-                aria-label="More options"
+                title={t('More options')}
+                aria-label={t('More options')}
               >
                 <DotsVerticalIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
               </button>
@@ -1429,7 +1431,7 @@ export default function Terminal({
                       className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary"
                     >
                       <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-                      Rename
+                      {t('Rename')}
                     </button>
                   )}
                   {canHibernate && (
@@ -1438,7 +1440,7 @@ export default function Terminal({
                       className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary"
                     >
                       <Moon01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-                      Hibernate
+                      {t('Hibernate')}
                     </button>
                   )}
                   <button
@@ -1449,7 +1451,7 @@ export default function Terminal({
                     className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary"
                   >
                     <Settings02Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-                    Settings
+                    {t('Settings')}
                   </button>
                 </div>
               )}
@@ -1492,9 +1494,9 @@ export default function Terminal({
             className="absolute top-2 left-2 z-50 flex items-center gap-1.5 rounded-lg bg-black/60 px-2.5 py-1.5 text-xs text-white/90 shadow-lg backdrop-blur-md"
           >
             <SpinnerIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} className={isSwitching || connectionStatus !== 'connected' ? 'animate-spin' : ''} />
-            {connectionStatus === 'connected' ? (isSwitching ? 'Restoring terminal' : 'Terminal unavailable') :
-              connectionStatus === 'disconnected' ? 'Disconnected' : 'Reconnecting'}
-            <span className="text-white/70">· Input paused</span>
+            {connectionStatus === 'connected' ? (isSwitching ? t('Restoring terminal') : t('Terminal unavailable')) :
+              connectionStatus === 'disconnected' ? t('Disconnected') : t('Reconnecting')}
+            <span className="text-white/70">{t('· Input paused')}</span>
           </div>
         )}
         {recoveryDraft.pending && session && !isReadOnly && (
@@ -1507,24 +1509,24 @@ export default function Terminal({
         {pendingClipboardOffer && session && (
           <div className={`absolute ${showScrollButton && !isSelectingText ? 'bottom-20' : 'bottom-8'} left-1/2 z-30 flex max-w-[calc(100%-2rem)] -translate-x-1/2 items-center gap-2 rounded-lg border border-border bg-elevated/95 px-2 py-2 shadow-lg backdrop-blur-sm md:hidden`}>
             <span className="max-w-[12rem] truncate text-xs text-secondary md:max-w-[18rem]">
-              Selection ready
+              {t('Selection ready')}
             </span>
             <button
               type="button"
               onClick={copyPendingClipboardOffer}
               className={`relative flex h-8 shrink-0 items-center justify-center gap-1.5 rounded bg-accent px-2.5 text-xs font-medium text-white hover:bg-accent/90 active:scale-95 transition-all ${TOUCH_TARGET_CLASS}`}
-              title="Copy selection"
-              aria-label="Copy selection"
+              title={t('Copy selection')}
+              aria-label={t('Copy selection')}
             >
               <Copy01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
-              Copy
+              {t('Copy')}
             </button>
             <button
               type="button"
               onClick={dismissPendingClipboardOffer}
               className={`relative flex h-8 w-8 shrink-0 items-center justify-center rounded border border-border text-secondary hover:bg-hover hover:text-primary active:scale-95 transition-all ${TOUCH_TARGET_CLASS}`}
-              title="Dismiss"
-              aria-label="Dismiss"
+              title={t('Dismiss')}
+              aria-label={t('Dismiss')}
             >
               <XCloseIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
             </button>
@@ -1532,12 +1534,12 @@ export default function Terminal({
         )}
         {!session && (
           <div className="absolute inset-0 flex items-center justify-center text-sm text-muted">
-            {hibernatingSession ? null : 'Select a session to view terminal'}
+            {hibernatingSession ? null : t('Select a session to view terminal')}
           </div>
         )}
         {session && isReadOnly && (
           <div className="absolute inset-0 flex items-center justify-center text-center text-sm text-muted">
-            Remote session (read-only). Use SSH to attach on the host.
+            {t('Remote session (read-only). Use SSH to attach on the host.')}
           </div>
         )}
         {hibernatingSession && (
@@ -1551,7 +1553,7 @@ export default function Terminal({
                         {hibernatingDisplayName}
                       </h2>
                       <span className="rounded-full bg-blue-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-400">
-                        Hibernating
+                        {t('Hibernating')}
                       </span>
                       {hibernatingProjectName && (
                         <span className="text-muted">
@@ -1559,7 +1561,7 @@ export default function Terminal({
                         </span>
                       )}
                       <span className="text-muted">
-                        Last active {hibernatingLastActivity}
+                        {t('Last active')}{' '}{hibernatingLastActivity}
                       </span>
                     </div>
                     {hibernatingSession.lastResumeError && (
@@ -1568,7 +1570,7 @@ export default function Terminal({
                         title={`Last wake failed: ${hibernatingSession.lastResumeError}`}
                       >
                         <AlertTriangleIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} />
-                        Last wake failed
+                        {t('Last wake failed')}
                       </div>
                     )}
                     {hibernatingSession.lastUserMessage && (
@@ -1583,7 +1585,7 @@ export default function Terminal({
                       onClick={() => onResumeSession(hibernatingSession.sessionId)}
                       className="btn btn-primary hidden md:inline-flex"
                     >
-                      Wake
+                      {t('Wake')}
                     </button>
                     {onMoveToHistory && (
                       <button
@@ -1591,7 +1593,7 @@ export default function Terminal({
                         onClick={() => onMoveToHistory(hibernatingSession.sessionId)}
                         className="btn btn-secondary"
                       >
-                        Move to History
+                        {t('Move to History')}
                       </button>
                     )}
                   </div>
@@ -1610,14 +1612,14 @@ export default function Terminal({
             onClick={scrollToBottom}
             className={`absolute bottom-14 left-1/2 z-20 flex h-10 items-center justify-center rounded-full border border-amber-400/35 bg-amber-500/20 text-amber-100 shadow-lg backdrop-blur-sm transition-all hover:bg-amber-500/30 active:scale-95 md:hidden ${TOUCH_TARGET_CLASS}`}
             style={{ transform: 'translateX(-50%)' }}
-            title="Exit tmux copy mode and return to live output"
-            aria-label="Exit copy mode"
+            title={t('Exit tmux copy mode and return to live output')}
+            aria-label={t('Exit copy mode')}
           >
             <span className="px-3 text-[11px] font-semibold uppercase tracking-wide">
-              Copy mode
+              {t('Copy mode')}
             </span>
             <span className="self-stretch border-l border-amber-400/25" aria-hidden="true" />
-            <span className="px-3 text-sm font-medium">Exit</span>
+            <span className="px-3 text-sm font-medium">{t('Exit')}</span>
           </button>
         ) : showScrollButton && session && !isSelectingText ? (
           <button
@@ -1625,11 +1627,11 @@ export default function Terminal({
             onClick={scrollToBottom}
             className={`absolute bottom-8 left-1/2 z-20 flex h-10 px-4 items-center justify-center gap-1.5 rounded-full bg-blue-600/90 text-white shadow-lg hover:bg-blue-600 active:scale-95 transition-all md:hidden ${TOUCH_TARGET_CLASS}`}
             style={{ transform: 'translateX(-50%)' }}
-            title="Scroll to bottom"
-            aria-label="Scroll to bottom"
+            title={t('Scroll to bottom')}
+            aria-label={t('Scroll to bottom')}
           >
             <ArrowDownIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
-            <span className="text-sm font-medium">Jump to bottom</span>
+            <span className="text-sm font-medium">{t('Jump to bottom')}</span>
           </button>
         ) : null}
 
@@ -1641,11 +1643,11 @@ export default function Terminal({
       {pasteStatus !== 'idle' && (
         <div className="flex items-center justify-between gap-3 border-t border-border bg-elevated px-3 py-2 text-sm text-primary">
           {pasteStatus === 'sending' ? (
-            <span role="status">Pasting…</span>
+            <span role="status">{t('Pasting…')}</span>
           ) : (
             <>
-              <span role="alert">Paste delivery could not be confirmed. Check the terminal before trying again.</span>
-              <button type="button" className="min-h-8 px-2 text-secondary" onClick={() => finishPaste('idle')}>Dismiss</button>
+              <span role="alert">{t('Paste delivery could not be confirmed. Check the terminal before trying again.')}</span>
+              <button type="button" className="min-h-8 px-2 text-secondary" onClick={() => finishPaste('idle')}>{t('Dismiss')}</button>
             </>
           )}
         </div>
@@ -1745,7 +1747,7 @@ export default function Terminal({
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <div className="mx-4 w-full max-w-sm rounded-lg border border-border bg-elevated p-4 shadow-xl">
             <h3 className="text-base font-medium text-primary mb-2 text-balance">
-              Kill Session
+              {t('Kill Session')}
             </h3>
             <p className="text-sm text-secondary mb-4 text-pretty">
               Kill "{sessionDisplayName}"? The process will be terminated. Conversation history is preserved in logs.
@@ -1755,14 +1757,14 @@ export default function Terminal({
                 onClick={() => setShowEndConfirm(false)}
                 className="btn py-1.5 px-3 text-sm"
               >
-                Cancel
+                {t('Cancel')}
               </button>
               <button
                 ref={endSessionButtonRef}
                 onClick={handleEndSession}
                 className="btn btn-danger py-1.5 px-3 text-sm"
               >
-                Kill Session
+                {t('Kill Session')}
               </button>
             </div>
           </div>

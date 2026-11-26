@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Session } from '@shared/types'
+import { useTranslation } from '../locale'
 
 interface CloseTarget {
   name: string
@@ -9,6 +10,7 @@ interface CloseTarget {
 }
 
 export default function CloseTmuxDialog({ session, onClose }: { session: Session; onClose: () => void }) {
+  const t = useTranslation()
   const dialog = useRef<HTMLDialogElement>(null)
   const [target, setTarget] = useState<CloseTarget>()
   const [error, setError] = useState('')
@@ -61,23 +63,23 @@ export default function CloseTmuxDialog({ session, onClose }: { session: Session
       onCancel={(event) => { event.preventDefault(); if (!closing) onClose() }}
     >
       <div className="space-y-4 p-4">
-        <h2 id="close-tmux-title" className="font-semibold">Close tmux session</h2>
+        <h2 id="close-tmux-title" className="font-semibold">{t('Close tmux session')}</h2>
         {target && (
           <>
             <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 break-all text-sm">
-              <dt className="text-secondary">Server</dt><dd>{target.host}</dd>
-              <dt className="text-secondary">Session</dt><dd>{target.name}</dd>
-              <dt className="text-secondary">Windows</dt><dd>{target.windows}</dd>
+              <dt className="text-secondary">{t('Server')}</dt><dd>{target.host}</dd>
+              <dt className="text-secondary">{t('Session')}</dt><dd>{target.name}</dd>
+              <dt className="text-secondary">{t('Windows')}</dt><dd>{target.windows}</dd>
             </dl>
-            <p className="text-sm text-secondary">Programs in this session’s unshared windows will stop.</p>
+            <p className="text-sm text-secondary">{t('Programs in this session’s unshared windows will stop.')}</p>
           </>
         )}
-        {!target && !error && <p role="status" className="text-sm text-secondary">Inspecting tmux session…</p>}
+        {!target && !error && <p role="status" className="text-sm text-secondary">{t('Inspecting tmux session…')}</p>}
         {error && <p role="alert" className="text-sm text-secondary">{error}</p>}
         <div className="flex justify-end gap-2">
-          <button type="button" className="btn" onClick={onClose} disabled={closing}>Cancel</button>
+          <button type="button" className="btn" onClick={onClose} disabled={closing}>{t('Cancel')}</button>
           <button type="button" className="btn btn-danger" onClick={() => void confirm()} disabled={!target || closing}>
-            {closing ? 'Closing…' : 'Close session'}
+            {closing ? t('Closing…') : t('Close session')}
           </button>
         </div>
       </div>

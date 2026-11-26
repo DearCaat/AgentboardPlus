@@ -18,6 +18,7 @@ import PasteStatus from './PasteStatus'
 import { useBrowserPaste } from '../hooks/useBrowserPaste'
 import { useKeyboardShift } from '../hooks/useKeyboardShift'
 import SnapshotDeckActions, { type SnapshotActions } from './SnapshotDeckActions'
+import { useTranslation } from '../locale'
 
 interface SessionInfo {
   id: string
@@ -139,6 +140,7 @@ export default function TerminalControls({
   onSelectText,
   snapshotActions,
 }: TerminalControlsProps) {
+  const t = useTranslation()
   const browserPaste = useBrowserPaste({ sessionId: currentSessionId, disabled, fileUploadsAllowed, remoteImageSessionId, agentType,
     onPasteText: onPasteText ?? onSendKey, onPasteImage: onPasteImage ?? onSendKey, onRefocus })
   const [ctrlActive, setCtrlActive] = useState(false)
@@ -337,7 +339,7 @@ export default function TerminalControls({
         {/* Paste button */}
         <button
           type="button"
-          aria-label="Paste"
+          aria-label={t('Paste')}
           className={`
             terminal-key
             flex items-center justify-center
@@ -360,7 +362,7 @@ export default function TerminalControls({
         {onSelectText && (
           <button
             type="button"
-            aria-label="Select text"
+            aria-label={t('Select text')}
             className="terminal-key flex items-center justify-center size-[44px] p-0 border rounded-md active:bg-hover active:scale-95 transition-transform duration-75 select-none touch-manipulation bg-surface border-border text-secondary"
             onMouseDown={(e) => e.preventDefault()}
             onTouchEnd={handleTouchAction(onSelectText, false)}
