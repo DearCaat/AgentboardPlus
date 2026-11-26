@@ -116,6 +116,65 @@ test.skipIf(process.platform !== 'linux' || !Bun.which('python3'))(
   },
 )
 
+test.skipIf(process.platform !== 'linux' || !Bun.which('python3'))(
+  'discovers Antigravity session ID and lastResponseAt from presence lock and transcript',
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), 'agentboard-agy-probe-'))
+    const presenceDir = join(home, 'presence')
+    const id = 'de7c68aa-f628-4882-bfb0-9e21a821c5fa'
+    const reply = '2026-11-25T19:40:20Z'
+    mkdirSync(presenceDir, { recursive: true })
+    const transcriptDir = join(home, 'brain', id, '.system_generated', 'logs')
+    mkdirSync(transcriptDir, { recursive: true })
+    writeFileSync(join(transcriptDir, 'transcript.jsonl'), [
+      { step_index: 1, source: 'USER_EXPLICIT', type: 'USER_INPUT', created_at: '2026-11-25T19:39:00Z', content: 'hi' },
+      { step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', created_at: reply, content: 'Visible assistant reply' },
+      { step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', created_at: '2026-11-25T19:41:00Z', tool_calls: [{ name: 'run_command' }] },
+      { step_index: 4, source: 'MODEL', type: 'PLANNER_RESPONSE', created_at: '2026-11-25T19:42:00Z', synthetic_reason: 'auto', content: 'synthetic' },
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n')
+    const lockFile = join(presenceDir, id + '.lock')
+    writeFileSync(lockFile, '')
+    const executable = join(home, 'agy')
+    symlinkSync(Bun.which('python3')!, executable)
+    const proc = Bun.spawn([
+      executable, '-c',
+      'import os, sys, time; fd = os.open(sys.argv[1], os.O_RDWR); time.sleep(30)',
+      lockFile,
+    ], {
+      stdout: 'ignore',
+      stderr: 'ignore',
+      env: { ...process.env, AGENTBOARD_ANTIGRAVITY_HOME: home },
+    })
+    try {
+      const pane = '100:@5:' + proc.pid
+      // Wait briefly for child process to open the lock file
+      const deadline = Date.now() + 2000
+      while (Date.now() < deadline) {
+        const cmd = "tmux() { printf '%s\\n' '" + pane + "'; }; " +
+          remoteHarnessProbeCommand('agy-test', [pane])
+        const probe = Bun.spawnSync(['sh', '-c', cmd], { stdout: 'pipe', stderr: 'pipe' })
+        expect(probe.exitCode).toBe(0)
+        const line = probe.stdout.toString().split('\n')[1]
+        if (line) {
+          const parsed = JSON.parse(line)
+          if (parsed[pane]?.sessionId === id) {
+            expect(parsed).toEqual({
+              [pane]: { agentType: 'antigravity', sessionId: id, lastResponseAt: reply },
+            })
+            return
+          }
+        }
+        await Bun.sleep(50)
+      }
+      throw new Error('Timed out waiting for Antigravity remote probe to observe presence lock')
+    } finally {
+      proc.kill()
+      await proc.exited
+      rmSync(home, { recursive: true, force: true })
+    }
+  },
+)
+
 describe('parseTmuxWindows', () => {
   const defaultPrefix = 'agentboard'
   const noPrefixes: string[] = []
@@ -139,6 +198,40 @@ describe('parseTmuxWindows', () => {
     expect(session.agentSessionId).toBe(id)
     expect(session.lastResponseAt).toBe(lastResponseAt)
     expect(session.lastActivity).toBe('2024-02-01T00:00:00.000Z')
+  })
+
+  test('parses Antigravity --conversation flags and applies remote Antigravity metadata', () => {
+    const id1 = '0f041e8e-64eb-46ab-a33f-fc96bb27ae33'
+    const id2 = 'bb598a9c-e78a-4348-914a-153e8b658ff9'
+    const paneKeys = new Map<string, string>()
+    const output = [
+      windowLine(['dataset', '0', '@1', 'agy', '/work', '1706745600', '1706745000', `agy --dangerously-skip-permissions --conversation=${id1}`]) + joinTmuxFields(['', 'agy', '5001']),
+      windowLine(['agy', '0', '@2', 'zsh', '/work', '1706745600', '1706745000', 'zsh']) + joinTmuxFields(['', 'agy', '5002']),
+      windowLine(['wrapped', '0', '@3', 'zsh', '/work', '1706745600', '1706745000', 'zsh']) + joinTmuxFields(['', 'zsh', '5003']),
+    ].join('\n')
+    const sessions = parseTmuxWindows('remote-host', output, defaultPrefix, noPrefixes, paneKeys)
+    expect(sessions[0].agentType).toBe('antigravity')
+    expect(sessions[0].agentSessionId).toBe(id1)
+    expect(paneKeys.get(sessions[0].id)).toBe('1954:@1:5001')
+    expect(sessions[1].agentType).toBe('antigravity')
+    expect(sessions[1].agentSessionId).toBeUndefined()
+    expect(paneKeys.get(sessions[1].id)).toBe('1954:@2:5002')
+    expect(sessions[2].agentType).toBeUndefined()
+    expect(paneKeys.get(sessions[2].id)).toBe('1954:@3:5003')
+
+    const ts1 = '2026-11-26T06:56:36Z'
+    const ts2 = '2026-11-26T06:48:37Z'
+    applyRemoteHarnessMetadata(sessions, paneKeys, JSON.stringify({
+      '1954:@1:5001': { agentType: 'antigravity', sessionId: id1, lastResponseAt: ts1 },
+      '1954:@2:5002': { agentType: 'antigravity', sessionId: id2, lastResponseAt: ts2 },
+      '1954:@3:5003': { agentType: 'antigravity', sessionId: null, lastResponseAt: null },
+    }))
+    expect(sessions[0].agentSessionId).toBe(id1)
+    expect(sessions[0].lastResponseAt).toBe(ts1)
+    expect(sessions[1].agentSessionId).toBe(id2)
+    expect(sessions[1].lastResponseAt).toBe(ts2)
+    expect(sessions[2].agentType).toBe('antigravity')
+    expect(sessions[2].agentSessionId).toBeUndefined()
   })
 
   test('parses valid tmux output with multiple windows', () => {

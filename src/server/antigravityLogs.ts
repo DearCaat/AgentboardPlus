@@ -87,7 +87,14 @@ export function antigravityProjectPath(sessionId: string): string | null {
   if (row) {
     try {
       const uris = JSON.parse(row.workspace_uris)
-      return Array.isArray(uris) && uris.length === 1 ? fileURLToPath(uris[0]) : null
+      if (Array.isArray(uris)) {
+        for (const uri of uris) {
+          if (typeof uri === 'string' && uri.startsWith('file://')) {
+            return fileURLToPath(uri)
+          }
+        }
+      }
+      return null
     } catch { return null }
   }
   // The cache maps each workspace to its latest ID. Older conversations may be absent.

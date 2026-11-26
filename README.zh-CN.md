@@ -4,7 +4,7 @@
 
 AgentboardPlus 是一个浏览器面板，用于管理本机和远程 SSH 主机上运行 Codex、Claude Code 等编程代理的 tmux 会话。
 
-**当前上游基线** [Agentboard v0.48.1](https://github.com/gbasin/agentboard/releases/tag/v0.48.1)。[上游 README 原文](https://github.com/gbasin/agentboard/blob/v0.48.1/README.md) · [上游发布记录](https://github.com/gbasin/agentboard/releases)
+**当前上游基线** [Agentboard v0.48.2](https://github.com/gbasin/agentboard/releases/tag/v0.48.2)。[上游 README 原文](https://github.com/gbasin/agentboard/blob/v0.48.2/README.md) · [上游发布记录](https://github.com/gbasin/agentboard/releases)
 
 ## 相比上游增加的功能
 

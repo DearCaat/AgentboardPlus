@@ -361,6 +361,7 @@ async function captureRemotePaneStatus(
   sshOptions: string[],
   timeoutMs: number,
   codexIds: Record<string, string>,
+  agyIds: Record<string, string> = {},
 ): Promise<void> {
   const separator = crypto.randomUUID()
   let cmd = buildBatchCaptureCommand(sessions, separator)
@@ -370,7 +371,7 @@ async function captureRemotePaneStatus(
     const key = paneKeys.get(session.id)
     return key && (session.agentType !== 'codex' || codexIds[key]) ? [key] : []
   })
-  if (probeKeys.length) cmd += ' ' + remoteHarnessProbeCommand(probeMarker, probeKeys, codexIds)
+  if (probeKeys.length) cmd += ' ' + remoteHarnessProbeCommand(probeMarker, probeKeys, codexIds, agyIds)
 
   const args = ['ssh', ...sshOptions, host, cmd]
   const proc = Bun.spawn(args, { stdout: 'pipe', stderr: 'pipe', env: { ...process.env } })
@@ -486,23 +487,30 @@ async function pollHost(
   // Capture pane content and enrich with inferred status
   if (sessions.length > 0) {
     const codexIds: Record<string, string> = {}
+    const agyIds: Record<string, string> = {}
     const previousById = new Map(previousSessions.map(session => [session.id, session]))
     for (const session of sessions) {
-      if (session.agentType !== 'codex') continue
       const pane = paneKeys.get(session.id)
-      const previous = previousById.get(session.id)
-      const observed = previous?.remoteTmuxIdentity === session.remoteTmuxIdentity &&
-        previous?.createdAt === session.createdAt && previous?.codexIdentityPane === pane
-        ? previous.codexFooterSessionId : undefined
-      session.codexIdentityPane = pane
-      session.codexFooterSessionId = observed
-      const id = observed ?? boundCodexId?.(session)
-      if (pane && id && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) {
-        session.agentSessionId = id
-        codexIds[pane] = id
+      if (session.agentType === 'codex') {
+        const previous = previousById.get(session.id)
+        const observed = previous?.remoteTmuxIdentity === session.remoteTmuxIdentity &&
+          previous?.createdAt === session.createdAt && previous?.codexIdentityPane === pane
+          ? previous.codexFooterSessionId : undefined
+        session.codexIdentityPane = pane
+        session.codexFooterSessionId = observed
+        const id = observed ?? boundCodexId?.(session)
+        if (pane && id && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) {
+          session.agentSessionId = id
+          codexIds[pane] = id
+        }
+      } else if (session.agentType === 'antigravity') {
+        const id = session.agentSessionId ?? boundCodexId?.(session)
+        if (pane && id && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) {
+          agyIds[pane] = id
+        }
       }
     }
-    await captureRemotePaneStatus(sessions, paneKeys, host, sshOptions, timeoutMs, codexIds)
+    await captureRemotePaneStatus(sessions, paneKeys, host, sshOptions, timeoutMs, codexIds, agyIds)
   }
 
   return {
@@ -571,10 +579,12 @@ function parseTmuxWindows(
     const launchedAgentType = inferAgentType(normalizedCommand)
     const agentType = liveAgentType ?? launchedAgentType
     const agentSessionId = agentType && agentType === launchedAgentType
-      ? normalizedCommand.match(/^(?:exec\s+)?(?:[^\s]*\/)?(?:codex\s+resume|claude\s+--resume)\s+['"]?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:['"]|\s|$)/i)?.[1]
+      ? (agentType === 'antigravity'
+          ? normalizedCommand.match(/(?:^|\s)--conversation(?:\s+|=)['"]?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:['"]|\s|$)/i)?.[1]
+          : normalizedCommand.match(/^(?:exec\s+)?(?:[^\s]*\/)?(?:codex\s+resume|claude\s+--resume)\s+['"]?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:['"]|\s|$)/i)?.[1])
       : undefined
     const id = buildRemoteSessionId(host, sessionName, windowIndex, windowId)
-    if (paneKeys && (!agentType || agentType === 'claude' || agentType === 'claude-rp' || agentType === 'codex') &&
+    if (paneKeys && (!agentType || agentType === 'claude' || agentType === 'claude-rp' || agentType === 'codex' || agentType === 'antigravity') &&
         /^[0-9]+:@[0-9]+:[0-9]+$/.test(`${serverPid}:${windowId}:${panePid}`)) {
       paneKeys.set(id, `${serverPid}:${windowId}:${panePid}`)
     }

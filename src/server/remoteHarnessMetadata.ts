@@ -17,6 +17,7 @@ from pathlib import Path
 # The terminal catalog still works if optional identity collection times out.
 signal.alarm(2)
 uuid = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
+uuid_lock = re.compile(r"^([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.lock$", re.I)
 pane_key = re.compile(r"[0-9]+:@[0-9]+:[0-9]+")
 linux = sys.platform.startswith("linux")
 machine_id = ""
@@ -67,6 +68,13 @@ def response_from_transcript(path, session_id):
         for line in reversed(lines):
             try:
                 entry = json.loads(line)
+                if (entry.get("type") == "PLANNER_RESPONSE" and entry.get("source") == "MODEL"
+                    and entry.get("synthetic_reason") is None
+                    and isinstance(entry.get("content"), str) and entry["content"].strip()):
+                    timestamp = entry.get("created_at")
+                    if isinstance(timestamp, str) and datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")).tzinfo:
+                        return timestamp
+                    continue
                 if entry.get("type") == "response_item":
                     message = entry["payload"]
                     if (message.get("type") != "message" or message.get("role") != "assistant"
@@ -119,6 +127,112 @@ def codex_response(pid, session_id):
     except (OSError, TypeError, ValueError, sqlite3.Error):
         pass
     return None
+
+def antigravity_home(pid):
+    home = (os.environ.get("AGENTBOARD_ANTIGRAVITY_HOME")
+            or os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
+            or str(Path.home() / ".gemini" / "antigravity-cli"))
+    if linux:
+        try:
+            proc = Path("/proc") / str(pid)
+            with (proc / "environ").open("rb") as stream:
+                agy_vars = (b"AGENTBOARD_ANTIGRAVITY_HOME=", b"ANTIGRAVITY_APP_DATA_DIR=")
+                values = dict(item.split(b"=", 1) for item in stream.read(1024 * 1024).split(b"\0")
+                              if item.startswith(agy_vars))
+            configured = values.get(b"AGENTBOARD_ANTIGRAVITY_HOME") or values.get(b"ANTIGRAVITY_APP_DATA_DIR")
+            if configured:
+                home = os.fsdecode(configured)
+                if not Path(home).is_absolute():
+                    home = str(Path(os.readlink(proc / "cwd")) / home)
+        except OSError:
+            pass
+    return home
+
+def agy_root(pane_pid, snapshot):
+    rows, children = snapshot
+    pending = [pane_pid]
+    roots = []
+    while pending:
+        pid = pending.pop()
+        row = rows.get(pid)
+        if not row:
+            continue
+        if row[2] == "agy":
+            roots.append(pid)
+        else:
+            pending.extend(children.get(pid, ()))
+    return roots[0] if len(roots) == 1 else None
+
+def agy_locks(pid_homes):
+    found = defaultdict(set)
+    if not pid_homes:
+        return found
+    presence_dirs = {pid: os.path.realpath(os.path.join(home, "presence"))
+                     for pid, home in pid_homes.items()}
+    if linux:
+        for pid, presence_dir in presence_dirs.items():
+            fd_dir = Path("/proc") / str(pid) / "fd"
+            fdinfo_dir = Path("/proc") / str(pid) / "fdinfo"
+            try:
+                entries = list(fd_dir.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    target = os.readlink(entry)
+                    match = uuid_lock.match(os.path.basename(target))
+                    if not match or os.path.realpath(os.path.dirname(target)) != presence_dir:
+                        continue
+                    flags = 0
+                    for line in (fdinfo_dir / entry.name).read_text().splitlines():
+                        if line.startswith("flags:"):
+                            flags = int(line.split()[1], 8)
+                            break
+                    if (flags & 3) not in (1, 2):
+                        continue
+                    if stat.S_ISREG(os.stat(target).st_mode):
+                        found[pid].add(match.group(1))
+                except (OSError, ValueError):
+                    continue
+        return found
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", "-p", ",".join(str(p) for p in sorted(pid_homes)), "-F0pftan"],
+            capture_output=True, text=True, errors="replace", timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return found
+    cur_pid = 0
+    cur = {}
+    def flush():
+        if cur_pid in presence_dirs and cur.get("t") == "REG" and cur.get("a") in ("w", "u"):
+            target = cur.get("n", "")
+            match = uuid_lock.match(os.path.basename(target))
+            if match and os.path.realpath(os.path.dirname(target)) == presence_dirs[cur_pid]:
+                found[cur_pid].add(match.group(1))
+    for raw in proc.stdout.split("\0"):
+        field = raw.lstrip("\n")
+        if not field:
+            continue
+        key, value = field[0], field[1:]
+        if key == "p":
+            flush()
+            cur = {}
+            try:
+                cur_pid = int(value)
+            except ValueError:
+                cur_pid = 0
+        elif key == "f":
+            flush()
+            cur = {}
+        elif key in ("a", "t", "n"):
+            cur[key] = value
+    flush()
+    return found
+
+def agy_response(home, session_id):
+    path = Path(home) / "brain" / session_id / ".system_generated" / "logs" / "transcript.jsonl"
+    return response_from_transcript(path, session_id)
 
 def process_registry(pid, started):
     config = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
@@ -187,15 +301,24 @@ if not panes:
 before = processes()
 records = {}
 selected = {}
+selected_agy = {}
 for pane in panes:
     pane_pid = int(pane.rsplit(":", 1)[1])
     root = claude_root(pane_pid, before, records)
     if root:
         selected[pane] = (pane_pid, *root)
+        continue
+    agy_pid = agy_root(pane_pid, before)
+    if agy_pid:
+        selected_agy[pane] = (pane_pid, agy_pid, antigravity_home(agy_pid))
 codex_panes = json.loads(sys.argv[2])
-if not selected and not codex_panes:
+agy_panes = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {}
+if not selected and not codex_panes and not selected_agy:
     sys.exit()
+agy_pid_homes = {pid: home for _, pid, home in selected_agy.values()}
+agy_locks_before = agy_locks(agy_pid_homes)
 after = processes()
+agy_locks_after = agy_locks(agy_pid_homes)
 final_records = {}
 identities = {}
 for pane, (pane_pid, pid, session_id, config, cwd) in selected.items():
@@ -240,14 +363,55 @@ for pane, session_id in codex_panes.items():
             pending.extend(before[1].get(pid, ()))
     if len(roots) == 1:
         result[pane] = {"sessionId": session_id, "lastResponseAt": codex_response(roots[0], session_id)}
+agy_identities = {}
+for pane, (pane_pid, pid, home) in selected_agy.items():
+    if (before[0][pane_pid] == after[0].get(pane_pid)
+        and before[0][pid] == after[0].get(pid)
+        and agy_root(pane_pid, after) == pid):
+        first_locks = agy_locks_before.get(pid, set())
+        second_locks = agy_locks_after.get(pid, set())
+        session_id = None
+        if len(first_locks) == 1 and first_locks == second_locks:
+            session_id = next(iter(first_locks))
+        elif not first_locks and not second_locks:
+            hint = agy_panes.get(pane)
+            if isinstance(hint, str) and uuid.fullmatch(hint):
+                session_id = hint
+        response = agy_response(home, session_id) if session_id else None
+        agy_identities[pane] = {"pid": pid, "sessionId": session_id, "lastResponseAt": response}
+agy_owners = defaultdict(set)
+for item in agy_identities.values():
+    if item["sessionId"]:
+        agy_owners[item["sessionId"]].add(item["pid"])
+for pane, item in agy_identities.items():
+    if item["sessionId"] and len(agy_owners[item["sessionId"]]) > 1:
+        item["sessionId"] = None
+        item["lastResponseAt"] = None
+    result[pane] = {
+        "agentType": "antigravity",
+        "sessionId": item["sessionId"],
+        "lastResponseAt": item["lastResponseAt"],
+    }
 print(json.dumps(result))
 `
 
+const remoteHarnessTypes = new Set<NonNullable<Session['agentType']>>([
+  'claude',
+  'claude-rp',
+  'codex',
+  'antigravity',
+])
+
 /** Run the optional read-only probe after the existing batched captures. */
-export function remoteHarnessProbeCommand(marker: string, paneKeys: Iterable<string>, codexIds: Record<string, string> = {}): string {
+export function remoteHarnessProbeCommand(
+  marker: string,
+  paneKeys: Iterable<string>,
+  codexIds: Record<string, string> = {},
+  agyIds: Record<string, string> = {},
+): string {
   const keys = shellQuote(JSON.stringify([...new Set(paneKeys)]))
   return `if command -v python3 >/dev/null 2>&1; then printf '%s\\n' ${shellQuote(marker)}; ` +
-    `tmux -u list-windows -a -F '#{pid}:#{window_id}:#{pane_pid}' | python3 -c ${shellQuote(harnessProbe)} ${keys} ${shellQuote(JSON.stringify(codexIds))} 2>/dev/null || true; fi`
+    `tmux -u list-windows -a -F '#{pid}:#{window_id}:#{pane_pid}' | python3 -c ${shellQuote(harnessProbe)} ${keys} ${shellQuote(JSON.stringify(codexIds))} ${shellQuote(JSON.stringify(agyIds))} 2>/dev/null || true; fi`
 }
 
 export function applyRemoteHarnessMetadata(sessions: Session[], paneKeys: Map<string, string>, payload: string): void {
@@ -261,16 +425,27 @@ export function applyRemoteHarnessMetadata(sessions: Session[], paneKeys: Map<st
   for (const session of sessions) {
     const pane = paneKeys.get(session.id)
     if (!pane || !Object.hasOwn(identities, pane) ||
-        (session.agentType && !['claude', 'claude-rp', 'codex'].includes(session.agentType))) continue
+        (session.agentType && !remoteHarnessTypes.has(session.agentType))) continue
     const entry = identities[pane]
     if (entry !== null && typeof entry !== 'object') continue
-    const { sessionId, lastResponseAt } = (entry ?? {}) as { sessionId?: unknown; lastResponseAt?: unknown }
-    session.agentType ??= 'claude'
+    const { agentType, sessionId, lastResponseAt } = (entry ?? {}) as {
+      agentType?: unknown
+      sessionId?: unknown
+      lastResponseAt?: unknown
+    }
+    const detectedType = typeof agentType === 'string' && remoteHarnessTypes.has(agentType as NonNullable<Session['agentType']>)
+      ? agentType as NonNullable<Session['agentType']>
+      : undefined
+    if (detectedType && session.agentType && session.agentType !== detectedType) continue
+    session.agentType ??= detectedType ?? 'claude'
     if (session.agentType === 'codex' && session.agentSessionId !== sessionId) continue
     if (typeof sessionId !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionId)) continue
+    const changed = session.agentSessionId !== sessionId
     session.agentSessionId = sessionId
     if (typeof lastResponseAt === 'string' && Number.isFinite(Date.parse(lastResponseAt))) {
       session.lastResponseAt = lastResponseAt
+    } else if (changed) {
+      session.lastResponseAt = undefined
     }
   }
 }

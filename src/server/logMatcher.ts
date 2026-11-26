@@ -2006,14 +2006,15 @@ export function extractLastUserMessageFromLog(
 
 /** Read the latest user-facing reply, independent of prompts, tools and log metadata. */
 export function extractLastResponseTimestamp(logPath: string, harness: string | null): string | undefined {
-  if (harness !== 'codex' && harness !== 'claude' && harness !== 'claude-rp') return
+  if (harness !== 'codex' && harness !== 'claude' && harness !== 'claude-rp' && harness !== 'antigravity') return
   for (const line of iterateLogLinesBackward(logPath, { maxScanBytes: 2 * 1024 * 1024 })) {
     try {
       const entry = JSON.parse(line)
+      const timestamp = harness === 'antigravity' ? entry?.created_at : entry?.timestamp
       if (entry?.isSidechain || (harness === 'codex' && (entry?.type !== 'response_item' || entry?.payload?.phase === 'commentary')) ||
-          typeof entry?.timestamp !== 'string' || !Number.isFinite(Date.parse(entry.timestamp))) continue
+          typeof timestamp !== 'string' || !Number.isFinite(Date.parse(timestamp))) continue
       if (normalizeAgentLogEntry(entry).some(event =>
-        event.kind === 'message' && event.role === 'assistant' && event.text.trim())) return entry.timestamp
+        event.kind === 'message' && event.role === 'assistant' && event.text.trim())) return timestamp
     } catch {
       // Incomplete and malformed entries provide no response timestamp.
     }

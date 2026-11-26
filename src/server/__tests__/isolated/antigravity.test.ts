@@ -10,6 +10,7 @@ import { antigravityDescendants, antigravityProjectPath, isAntigravityAuxiliaryF
 import { materializeMedia, materializeMediaSync } from '../../antigravityMedia'
 import { scanMediaFile } from '../../mediaIndexScan'
 import { extractSessionMedia } from '../../mediaExtractor'
+import { extractLastResponseTimestamp } from '../../logMatcher'
 
 const root = fs.mkdtempSync(path.join(tmpdir(), 'agy-fixture-'))
 process.env.AGENTBOARD_ANTIGRAVITY_HOME = root
@@ -68,4 +69,30 @@ test('only explicitly user-facing text artifacts become documents', () => {
       Content: JSON.stringify('# report'), Path: JSON.stringify('/workspace/report.md') } }] })
   expect(extractSessionMedia(record(false))).toEqual([])
   expect(extractSessionMedia(record(true))[0]).toMatchObject({ kind: 'document', bytes: 8, label: 'report.md' })
+})
+
+test('extractLastResponseTimestamp reads Antigravity MODEL PLANNER_RESPONSE created_at and skips tool-only/synthetic steps', () => {
+  const source = log(randomUUID())
+  fs.mkdirSync(path.dirname(source), { recursive: true })
+  const replyAt = '2026-11-26T06:40:17Z'
+  fs.writeFileSync(source, [
+    { step_index: 1, source: 'USER_EXPLICIT', type: 'USER_INPUT', created_at: '2026-11-26T06:39:00Z', content: 'hello' },
+    { step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', created_at: replyAt, content: 'Here is the answer.' },
+    { step_index: 3, source: 'MODEL', type: 'PLANNER_RESPONSE', created_at: '2026-11-26T06:41:00Z', tool_calls: [{ name: 'read_file' }] },
+    { step_index: 4, source: 'MODEL', type: 'PLANNER_RESPONSE', created_at: '2026-11-26T06:42:00Z', synthetic_reason: 'auto', content: 'ignored' },
+  ].map(entry => JSON.stringify(entry)).join('\n') + '\n')
+  expect(extractLastResponseTimestamp(source, 'antigravity')).toBe(replyAt)
+})
+
+test('antigravityProjectPath returns first file workspace URI when multiple workspaces exist', () => {
+  const db = new Database(path.join(root, 'conversation_summaries.db'))
+  try {
+    const id = randomUUID()
+    const ws1 = path.join(root, 'ws-one')
+    const ws2 = path.join(root, 'ws-two')
+    db.query('INSERT INTO conversation_summaries VALUES(?, ?, ?, ?)').run(
+      id, JSON.stringify([pathToFileURL(ws1).href, pathToFileURL(ws2).href]), '', ''
+    )
+    expect(antigravityProjectPath(id)).toBe(ws1)
+  } finally { db.close() }
 })

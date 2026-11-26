@@ -4,7 +4,7 @@
 
 AgentboardPlus is a browser dashboard for managing tmux sessions running coding agents such as Codex and Claude Code across local and SSH hosts.
 
-**Upstream baseline** [Agentboard v0.48.1](https://github.com/gbasin/agentboard/releases/tag/v0.48.1). [Original upstream README](https://github.com/gbasin/agentboard/blob/v0.48.1/README.md) · [Upstream releases](https://github.com/gbasin/agentboard/releases)
+**Upstream baseline** [Agentboard v0.48.2](https://github.com/gbasin/agentboard/releases/tag/v0.48.2). [Original upstream README](https://github.com/gbasin/agentboard/blob/v0.48.2/README.md) · [Upstream releases](https://github.com/gbasin/agentboard/releases)
 
 ## What AgentboardPlus adds
 
