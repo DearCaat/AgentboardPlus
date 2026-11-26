@@ -1,0 +1,813 @@
+import { afterEach, describe, expect, test } from 'bun:test'
+import { SshTerminalProxy } from '../terminal/SshTerminalProxy'
+
+function createSshHarness(options?: {
+  ttyAvailable?: boolean
+  spawnPipeOverride?: (args: string[]) => {
+    exitCode: number
+    stdout: string
+    stderr: string
+    wait?: Promise<void>
+  }
+}) {
+  const { ttyAvailable = true, spawnPipeOverride } = options ?? {}
+  const spawnCalls: Array<{
+    args: string[]
+    mode: 'terminal' | 'pipe'
+    stdin?: string
+  }> = []
+  const terminalWrites: Array<string | Uint8Array> = []
+  let killed = false
+  let terminalClosed = false
+  let exitResolver: ((code: number) => void) | null = null
+
+  // spawnSync is no longer used by SshTerminalProxy for SSH commands,
+  // but the base class still has it available. Keep a no-op mock.
+  const spawnSync = (
+    _args: string[],
+    _opts?: Parameters<typeof Bun.spawnSync>[1]
+  ) => {
+    return {
+      exitCode: 0,
+      stdout: Buffer.from(''),
+      stderr: Buffer.from(''),
+    } as ReturnType<typeof Bun.spawnSync>
+  }
+
+  const spawn = (
+    args: string[],
+    spawnOpts: Parameters<typeof Bun.spawn>[1]
+  ) => {
+    const isTerminalMode =
+      spawnOpts && typeof spawnOpts === 'object' && 'terminal' in spawnOpts
+
+    const stdinOpt = (spawnOpts as { stdin?: Buffer } | undefined)?.stdin
+    spawnCalls.push({
+      args,
+      mode: isTerminalMode ? 'terminal' : 'pipe',
+      ...(stdinOpt !== undefined ? { stdin: stdinOpt.toString() } : {}),
+    })
+
+    if (isTerminalMode) {
+      // Terminal mode — used by doStartCore for SSH attach
+      return {
+        terminal: {
+          write: (data: string | BufferSource) => {
+            if (typeof data === 'string') {
+              terminalWrites.push(data)
+              return
+            }
+            const view =
+              data instanceof ArrayBuffer
+                ? new Uint8Array(data)
+                : new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+            terminalWrites.push(view.slice())
+          },
+          resize: () => {},
+          close: () => {
+            terminalClosed = true
+          },
+        },
+        exited: new Promise<number>((resolve) => {
+          exitResolver = resolve
+        }),
+        kill: () => {
+          killed = true
+        },
+      } as unknown as ReturnType<typeof Bun.spawn>
+    }
+
+    // Pipe mode — used by runTmuxAsync for command-channel SSH calls
+    let result: { exitCode: number; stdout: string; stderr: string; wait?: Promise<void> } = { exitCode: 0, stdout: '', stderr: '' }
+
+    if (spawnPipeOverride) {
+      result = spawnPipeOverride(args)
+    } else {
+      const cmd = args.join(' ')
+      if (cmd.includes('#{pane_id}')) {
+        result = { exitCode: 0, stdout: '/dev/pts/other\t%99\n/dev/pts/42\t%42\n', stderr: '' }
+      } else if (cmd.includes('list-clients') && ttyAvailable) {
+        result = { exitCode: 0, stdout: '/dev/pts/42\n', stderr: '' }
+      }
+    }
+
+    return {
+      exited: result.wait ? result.wait.then(() => result.exitCode) : Promise.resolve(result.exitCode),
+      stdout: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(result.stdout))
+          controller.close()
+        },
+      }),
+      stderr: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(result.stderr))
+          controller.close()
+        },
+      }),
+      kill: () => {
+        killed = true
+      },
+    } as unknown as ReturnType<typeof Bun.spawn>
+  }
+
+  return {
+    spawn,
+    spawnSync,
+    spawnCalls,
+    terminalWrites,
+    wasKilled: () => killed,
+    wasTerminalClosed: () => terminalClosed,
+    resolveExit: (code = 0) => exitResolver?.(code),
+  }
+}
+
+/** Flush the fire-and-forget async paste chain (each await = one microtask hop). */
+async function flushAsync(rounds = 6) {
+  for (let i = 0; i < rounds; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+}
+
+describe('SshTerminalProxy', () => {
+  let savedTimeout: number
+
+  afterEach(() => {
+    if (savedTimeout !== undefined) {
+      SshTerminalProxy.STARTUP_TIMEOUT_MS = savedTimeout
+    }
+  })
+
+  test('start succeeds when TTY is discovered', async () => {
+    const harness = createSshHarness({ ttyAvailable: true })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-1',
+      sessionName: 'test-proxy-session',
+      baseSession: 'agentboard',
+      host: 'remote-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await proxy.start()
+
+    expect(proxy.isReady()).toBe(true)
+    expect(proxy.getClientTty()).toBe('/dev/pts/42')
+    expect(proxy.getMode()).toBe('ssh')
+
+    // Verify new-session was called via SSH (pipe mode)
+    const newSessionCall = harness.spawnCalls.find(
+      (c) =>
+        c.mode === 'pipe' &&
+        c.args.some((a) => a.includes('new-session'))
+    )
+    expect(newSessionCall).toBeDefined()
+
+    // Verify attach was spawned (terminal mode)
+    const attachCalls = harness.spawnCalls.filter((c) => c.mode === 'terminal')
+    expect(attachCalls.length).toBe(1)
+    const attachArgs = attachCalls[0].args
+    expect(attachArgs).toContain('ssh')
+    expect(attachArgs).toContain('-tt')
+    expect(attachArgs).toContain('remote-host')
+    expect(attachArgs.at(-1)).toContain('tmux -u')
+
+    proxy.write('áéíñü-你好-🚀')
+    expect(harness.terminalWrites).toEqual([
+      new TextEncoder().encode('áéíñü-你好-🚀'),
+    ])
+
+    await proxy.dispose()
+  })
+
+  test('doStart rejects with ERR_START_TIMEOUT when SSH hangs', async () => {
+    savedTimeout = SshTerminalProxy.STARTUP_TIMEOUT_MS
+    SshTerminalProxy.STARTUP_TIMEOUT_MS = 200
+
+    const harness = createSshHarness({ ttyAvailable: false })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-timeout',
+      sessionName: 'test-timeout-session',
+      baseSession: 'agentboard',
+      host: 'unreachable-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await expect(proxy.start()).rejects.toMatchObject({
+      code: 'ERR_START_TIMEOUT',
+      retryable: true,
+    })
+
+    expect(harness.wasKilled()).toBe(true)
+    expect(proxy.isReady()).toBe(false)
+  })
+
+  test('startup timeout kills the spawned SSH process', async () => {
+    savedTimeout = SshTerminalProxy.STARTUP_TIMEOUT_MS
+    SshTerminalProxy.STARTUP_TIMEOUT_MS = 150
+
+    const harness = createSshHarness({ ttyAvailable: false })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-kill',
+      sessionName: 'test-kill-session',
+      baseSession: 'agentboard',
+      host: 'slow-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    try {
+      await proxy.start()
+    } catch {
+      // Expected
+    }
+
+    expect(harness.wasKilled()).toBe(true)
+    expect(harness.wasTerminalClosed()).toBe(true)
+  })
+
+  test('startup timeout stops TTY polling and cleans up promptly', async () => {
+    // Before the fix, the superseded attempt kept polling list-clients for
+    // the full 4s discovery window and only then ran dispose() — its
+    // terminal_session_cleanup log landed in whatever test file was running
+    // ~4s later (it broke syncSpawnTiming's log capture in CI).
+    savedTimeout = SshTerminalProxy.STARTUP_TIMEOUT_MS
+    SshTerminalProxy.STARTUP_TIMEOUT_MS = 120
+
+    const harness = createSshHarness({ ttyAvailable: false })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-stop-poll',
+      sessionName: 'test-stop-poll-session',
+      baseSession: 'agentboard',
+      host: 'slow-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+    const pipeCalls = (needle: string) =>
+      harness.spawnCalls.filter(
+        (c) => c.mode === 'pipe' && c.args.join(' ').includes(needle)
+      ).length
+
+    await expect(proxy.start()).rejects.toMatchObject({ code: 'ERR_START_TIMEOUT' })
+    // At most the backoff wait already in flight elapses (<= 200ms at this
+    // point in the 50/100/200 schedule); then the attempt notices it is stale.
+    await new Promise((r) => setTimeout(r, 300))
+    const pollsAfterSettle = pipeCalls('list-clients')
+    expect(pipeCalls('kill-session')).toBe(1)
+
+    await new Promise((r) => setTimeout(r, 500))
+    expect(pipeCalls('list-clients')).toBe(pollsAfterSettle)
+    expect(pipeCalls('kill-session')).toBe(1)
+  })
+
+  test('startup timeout does not allow a late READY transition if TTY appears after timeout', async () => {
+    savedTimeout = SshTerminalProxy.STARTUP_TIMEOUT_MS
+    SshTerminalProxy.STARTUP_TIMEOUT_MS = 20
+
+    let listClientsCalls = 0
+    const harness = createSshHarness({
+      ttyAvailable: false,
+      spawnPipeOverride: (args) => {
+        const cmd = args.join(' ')
+        if (cmd.includes('list-clients') && !cmd.includes('#{pane_id}')) {
+          listClientsCalls += 1
+          // Simulate a slow TTY discovery: empty first, then present.
+          if (listClientsCalls >= 2) {
+            return { exitCode: 0, stdout: '/dev/pts/42\n', stderr: '' }
+          }
+          return { exitCode: 0, stdout: '', stderr: '' }
+        }
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    })
+
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-late-tty',
+      sessionName: 'test-late-tty-session',
+      baseSession: 'agentboard',
+      host: 'slow-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await expect(proxy.start()).rejects.toMatchObject({
+      code: 'ERR_START_TIMEOUT',
+      retryable: true,
+    })
+
+    // If the core path isn't cancelled, it could still discover a TTY and flip to READY.
+    await new Promise((r) => setTimeout(r, 150))
+    expect(proxy.isReady()).toBe(false)
+    expect(proxy.getClientTty()).toBeNull()
+  })
+
+  test('runTmuxAsync routes commands through SSH with pipe mode', async () => {
+    const harness = createSshHarness({ ttyAvailable: true })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-2',
+      sessionName: 'test-pipe-verify',
+      baseSession: 'agentboard',
+      host: 'remote-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await proxy.start()
+
+    // All pipe-mode calls should be SSH commands
+    const pipeCalls = harness.spawnCalls.filter((c) => c.mode === 'pipe')
+    expect(pipeCalls.length).toBeGreaterThan(0)
+    for (const call of pipeCalls) {
+      expect(call.args[0]).toBe('ssh')
+    }
+
+    await proxy.dispose()
+  })
+
+  test('dispose kills process and cleans up remote session', async () => {
+    const harness = createSshHarness({ ttyAvailable: true })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-dispose',
+      sessionName: 'test-dispose-session',
+      baseSession: 'agentboard',
+      host: 'remote-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await proxy.start()
+    expect(proxy.isReady()).toBe(true)
+
+    await proxy.dispose()
+
+    expect(harness.wasKilled()).toBe(true)
+    expect(proxy.isReady()).toBe(false)
+    expect(proxy.getClientTty()).toBeNull()
+
+    // Verify kill-session was called (pipe mode)
+    const killCall = harness.spawnCalls.find(
+      (c) => c.mode === 'pipe' && c.args.some((a) => a.includes('kill-session'))
+    )
+    expect(killCall).toBeDefined()
+  })
+
+  test('start is idempotent when already started', async () => {
+    const harness = createSshHarness({ ttyAvailable: true })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-idem',
+      sessionName: 'test-idem-session',
+      baseSession: 'agentboard',
+      host: 'remote-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await proxy.start()
+    const callCountAfterFirst = harness.spawnCalls.filter(
+      (c) => c.mode === 'terminal'
+    ).length
+
+    // Second start should not spawn again
+    await proxy.start()
+    const callCountAfterSecond = harness.spawnCalls.filter(
+      (c) => c.mode === 'terminal'
+    ).length
+    expect(callCountAfterSecond).toBe(callCountAfterFirst)
+
+    await proxy.dispose()
+  })
+
+  test('doStart rejects with ERR_SESSION_CREATE_FAILED on SSH failure', async () => {
+    const harness = createSshHarness({
+      spawnPipeOverride: () => ({
+        exitCode: 255,
+        stdout: '',
+        stderr: 'ssh: connect to host bad-host: Connection refused',
+      }),
+    })
+
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-fail',
+      sessionName: 'test-fail-session',
+      baseSession: 'agentboard',
+      host: 'bad-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await expect(proxy.start()).rejects.toMatchObject({
+      code: 'ERR_SESSION_CREATE_FAILED',
+    })
+  })
+
+  for (const end of ['dispose', 'process-exit']) {
+    test(`${end} during TTY discovery cannot publish late readiness`, async () => {
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const harness = createSshHarness({ spawnPipeOverride: args => ({ exitCode: 0, stdout: args.at(-1)!.includes('list-clients') ? '/dev/pts/42' : '', stderr: '', ...(args.at(-1)!.includes('list-clients') ? { wait: gate } : {}) }) })
+      const proxy = new SshTerminalProxy({ connectionId: 'startup-end', sessionName: 'bootstrap', baseSession: '', host: 'host', onData: () => {}, spawn: harness.spawn })
+      const starting = proxy.start()
+      await flushAsync()
+      if (end === 'dispose') await proxy.dispose()
+      else harness.resolveExit()
+      await flushAsync()
+      release()
+      await starting
+      expect(proxy.isReady()).toBe(false)
+      expect(proxy.getClientTty()).toBeNull()
+      await proxy.dispose()
+    })
+  }
+
+  test('dispose during an in-flight switch cannot restore readiness or invoke callback', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const harness = createSshHarness({ spawnPipeOverride: args => ({ exitCode: 0, stdout: args.at(-1)!.includes('list-clients') ? '/dev/pts/42' : '', stderr: '', ...(args.at(-1)!.includes('switch-client') ? { wait: gate } : {}) }) })
+    const proxy = new SshTerminalProxy({ connectionId: 'switch-end', sessionName: 'bootstrap', baseSession: '', host: 'host', onData: () => {}, spawn: harness.spawn })
+    await proxy.start()
+    let ready = false
+    const switching = proxy.switchTo('original:@1', () => { ready = true })
+    await flushAsync()
+    await proxy.dispose()
+    release()
+    expect(await switching).toBe(false)
+    expect(ready).toBe(false)
+    expect(proxy.isReady()).toBe(false)
+  })
+
+  test('paste recipient lookup precedes later switches, delivery stays pinned after switch', async () => {
+    let resolveLookup!: () => void
+    let resolveUpload!: () => void
+    let resolveSwitch!: () => void
+    const lookup = new Promise<void>(resolve => { resolveLookup = resolve })
+    const upload = new Promise<void>(resolve => { resolveUpload = resolve })
+    const switching = new Promise<void>(resolve => { resolveSwitch = resolve })
+    const harness = createSshHarness({ spawnPipeOverride: args => {
+      const cmd = args.at(-1)!
+      if (cmd.includes('list-clients') && !cmd.includes('#{pane_id}')) return { exitCode: 0, stdout: '/dev/pts/42', stderr: '' }
+      if (cmd.includes('#{pane_id}')) return { exitCode: 0, stdout: '/dev/pts/other\t%99\n/dev/pts/42\t%23', stderr: '', wait: lookup }
+      if (cmd.includes('load-buffer')) return { exitCode: 0, stdout: '', stderr: '', wait: upload }
+      if (cmd.includes('switch-client') && cmd.includes('later')) return { exitCode: 0, stdout: '', stderr: '', wait: switching }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    } })
+    const proxy = new SshTerminalProxy({ connectionId: 'ordering', sessionName: 'bootstrap', baseSession: '', host: 'host', onData: () => {}, spawn: harness.spawn })
+    await proxy.start()
+    await proxy.switchTo('original:@1')
+    proxy.paste('accepted')
+    const next = proxy.switchTo('later:@2')
+    await flushAsync()
+    expect(harness.spawnCalls.some(c => c.args.at(-1)?.includes('later'))).toBe(false)
+    proxy.paste('while-switch-waits-for-lookup')
+    await flushAsync()
+    expect(harness.spawnCalls.filter(c => c.args.at(-1)?.includes('#{pane_id}'))).toHaveLength(1)
+    resolveLookup()
+    await flushAsync()
+    expect(harness.spawnCalls.some(c => c.args.at(-1)?.includes('later'))).toBe(true)
+    const lookups = harness.spawnCalls.filter(c => c.args.at(-1)?.includes('#{pane_id}')).length
+    proxy.paste('during-switch')
+    await flushAsync()
+    expect(harness.spawnCalls.filter(c => c.args.at(-1)?.includes('#{pane_id}'))).toHaveLength(lookups)
+    resolveSwitch()
+    await next
+    resolveUpload()
+    await flushAsync()
+    const pastes = harness.spawnCalls.filter(c => c.args.at(-1)?.includes('paste-buffer'))
+    expect(pastes).toHaveLength(1)
+    expect(pastes[0].args.at(-1)).toContain("'%23'")
+    await proxy.dispose()
+  })
+
+  test('a failed second paste lookup cannot release a switch past an earlier pending lookup', async () => {
+    let releaseFirst!: () => void
+    const firstLookup = new Promise<void>(resolve => { releaseFirst = resolve })
+    let lookupCount = 0
+    const harness = createSshHarness({ spawnPipeOverride: args => {
+      const cmd = args.at(-1)!
+      if (cmd.includes('#{pane_id}')) {
+        lookupCount += 1
+        return lookupCount === 1
+          ? { exitCode: 0, stdout: '/dev/pts/42\t%23', stderr: '', wait: firstLookup }
+          : { exitCode: 1, stdout: '', stderr: 'second lookup failed' }
+      }
+      return { exitCode: 0, stdout: cmd.includes('list-clients') ? '/dev/pts/42' : '', stderr: '' }
+    } })
+    const proxy = new SshTerminalProxy({ connectionId: 'overlapping-paste', sessionName: 'bootstrap', baseSession: '', host: 'host', onData: () => {}, spawn: harness.spawn })
+    await proxy.start()
+    await proxy.switchTo('original:@1')
+    proxy.paste('first accepted')
+    proxy.paste('second fails')
+    const switching = proxy.switchTo('later:@2')
+    try {
+      await flushAsync()
+      expect(lookupCount).toBe(2)
+      expect(harness.spawnCalls.some(call => call.args.at(-1)?.includes('later'))).toBe(false)
+      expect(harness.spawnCalls.some(call => call.args.at(-1)?.includes('load-buffer'))).toBe(false)
+      releaseFirst()
+      expect(await switching).toBe(true)
+      await flushAsync()
+      const uploads = harness.spawnCalls.filter(call => call.args.at(-1)?.includes('load-buffer'))
+      expect(uploads.map(call => call.stdin)).toEqual(['first accepted'])
+      const pastes = harness.spawnCalls.filter(call => call.args.at(-1)?.includes('paste-buffer'))
+      expect(pastes).toHaveLength(1)
+      expect(pastes[0].args.at(-1)).toContain("'%23'")
+    } finally {
+      releaseFirst()
+      await switching.catch(() => {})
+      await flushAsync()
+      await proxy.dispose()
+    }
+  })
+
+  for (const pane of ['', 'unrelated-session', '%1\t%2', 'lookup-error', 'missing-client']) {
+    test(`invalid recipient lookup ${JSON.stringify(pane)} drops paste without staging`, async () => {
+      const harness = createSshHarness({ spawnPipeOverride: args => {
+        const cmd = args.at(-1)!
+        if (cmd.includes('#{pane_id}')) {
+          return {
+            exitCode: pane === 'lookup-error' ? 1 : 0,
+            stdout: pane === 'missing-client' ? '/dev/pts/other\t%99' : `/dev/pts/other\t%99\n/dev/pts/42\t${pane}`,
+            stderr: '',
+          }
+        }
+        return { exitCode: 0, stdout: cmd.includes('list-clients') ? '/dev/pts/42' : '', stderr: '' }
+      } })
+      const proxy = new SshTerminalProxy({ connectionId: 'invalid', sessionName: 'bootstrap', baseSession: '', host: 'host', onData: () => {}, spawn: harness.spawn })
+      proxy.paste('before-start')
+      await proxy.start()
+      proxy.paste('before-selection')
+      await proxy.switchTo('original:@1')
+      proxy.paste('invalid-target')
+      await flushAsync()
+      expect(harness.spawnCalls.some(c => c.args.at(-1)?.includes('load-buffer'))).toBe(false)
+      expect(harness.terminalWrites).toEqual([])
+      await proxy.dispose()
+    })
+  }
+
+  test('paste stages via load-buffer stdin and replays with paste-buffer', async () => {
+    const harness = createSshHarness({ ttyAvailable: true })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-paste',
+      sessionName: 'test-paste-session',
+      baseSession: 'agentboard',
+      host: 'remote-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await proxy.start()
+    await proxy.switchTo('real-session:@7')
+    proxy.paste('line1\r\nline2\nline3')
+    await flushAsync()
+
+    // Payload rides ssh stdin into remote `tmux load-buffer -` (no argv limit),
+    // CRLF normalized to LF, staged in a unique per-paste buffer.
+    const loadCall = harness.spawnCalls.find(
+      (c) => c.mode === 'pipe' && c.args.some((a) => a.includes('load-buffer'))
+    )
+    expect(loadCall).toBeDefined()
+    const loadCmd = loadCall!.args[loadCall!.args.length - 1]
+    expect(loadCmd).toContain('agentboard-paste-conn-paste-1')
+    expect(loadCall!.stdin).toBe('line1\nline2\nline3')
+
+    // Replayed with -d -p against the remote session's active pane.
+    const pasteCall = harness.spawnCalls.find(
+      (c) => c.mode === 'pipe' && c.args.some((a) => a.includes('paste-buffer'))
+    )
+    expect(pasteCall).toBeDefined()
+    const pasteCmd = pasteCall!.args[pasteCall!.args.length - 1]
+    expect(pasteCmd).toContain('-d')
+    expect(pasteCmd).toContain('-p')
+    expect(pasteCmd).toContain('agentboard-paste-conn-paste-1')
+    expect(pasteCmd).toContain("'%42'")
+    expect(pasteCmd).not.toContain('test-paste-session')
+
+    // Paste must never reach the raw interactive pty (auto-submit risk).
+    expect(harness.terminalWrites).toEqual([])
+
+    await proxy.dispose()
+  })
+
+  test('paste load-buffer failure drops the paste without a raw pty write', async () => {
+    const harness = createSshHarness({
+      spawnPipeOverride: (args) => {
+        const cmd = args.join(' ')
+        if (cmd.includes('list-clients') && !cmd.includes('#{pane_id}')) {
+          return { exitCode: 0, stdout: '/dev/pts/42\n', stderr: '' }
+        }
+        if (cmd.includes('#{pane_id}')) return { exitCode: 0, stdout: '/dev/pts/other\t%99\n/dev/pts/42\t%42\n', stderr: '' }
+        if (cmd.includes('load-buffer')) {
+          return { exitCode: 1, stdout: '', stderr: 'tmux gone' }
+        }
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-paste-fail',
+      sessionName: 'test-paste-fail',
+      baseSession: 'agentboard',
+      host: 'remote-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await proxy.start()
+    await proxy.switchTo('real-session:@7')
+    expect(await proxy.paste('a\nb')).toBe(false)
+
+    // The failed command contains both operations. There is no separate retry
+    // and no fallback into the pty, which could submit multi-line content.
+    const pasteCommands = harness.spawnCalls.filter(
+      (call) => call.mode === 'pipe' && call.args.at(-1)?.includes('paste-buffer')
+    )
+    expect(pasteCommands).toHaveLength(1)
+    expect(pasteCommands[0].args.at(-1)).toContain('load-buffer')
+    expect(harness.terminalWrites).toEqual([])
+
+    await proxy.dispose()
+  })
+
+  test('paste-buffer failure cleans up the staged buffer', async () => {
+    const harness = createSshHarness({
+      spawnPipeOverride: (args) => {
+        const cmd = args.join(' ')
+        if (cmd.includes('list-clients') && !cmd.includes('#{pane_id}')) {
+          return { exitCode: 0, stdout: '/dev/pts/42\n', stderr: '' }
+        }
+        if (cmd.includes('#{pane_id}')) return { exitCode: 0, stdout: '/dev/pts/other\t%99\n/dev/pts/42\t%42\n', stderr: '' }
+        if (cmd.includes('paste-buffer')) {
+          return { exitCode: 1, stdout: '', stderr: 'no such target' }
+        }
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    })
+    const proxy = new SshTerminalProxy({
+      connectionId: 'conn-paste-clean',
+      sessionName: 'test-paste-clean',
+      baseSession: 'agentboard',
+      host: 'remote-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+
+    await proxy.start()
+    await proxy.switchTo('real-session:@7')
+    proxy.paste('a\nb')
+    await flushAsync()
+
+    expect(
+      harness.spawnCalls.some(
+        (c) => c.mode === 'pipe' && c.args.some((a) => a.includes('delete-buffer'))
+      )
+    ).toBe(true)
+    expect(harness.terminalWrites).toEqual([])
+
+    await proxy.dispose()
+  })
+})
+
+describe('SshTerminalProxy sync terminal feature', () => {
+  function versionAnswers(opts: {
+    createVersion?: string
+    createDuplicate?: boolean
+    probeVersion?: string
+    probeFails?: boolean
+  }) {
+    return (args: string[]) => {
+      const cmd = args[args.length - 1] ?? ''
+      if (cmd.includes('new-session') && cmd.includes('#{version}')) {
+        return opts.createDuplicate
+          ? { exitCode: 1, stdout: '', stderr: 'duplicate session: s' }
+          : { exitCode: 0, stdout: `${opts.createVersion ?? '3.4'}\n`, stderr: '' }
+      }
+      if (cmd.includes('display-message') && cmd.includes('#{version}')) {
+        return opts.probeFails
+          ? { exitCode: 1, stdout: '', stderr: 'probe failed' }
+          : { exitCode: 0, stdout: `tmux ${opts.probeVersion ?? '3.4'}\n`, stderr: '' }
+      }
+      if (cmd.includes('list-clients') && !cmd.includes('#{pane_id}')) {
+        return { exitCode: 0, stdout: '/dev/pts/42\n', stderr: '' }
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+  }
+
+  async function startAndGetAttachCmd(harness: ReturnType<typeof createSshHarness>, sizing = false) {
+    const proxy = new SshTerminalProxy({
+      initialSizeParticipation: !sizing,
+      connectionId: 'conn-sync',
+      sessionName: 'test-sync-session',
+      baseSession: 'agentboard',
+      host: 'remote-host',
+      onData: () => {},
+      spawn: harness.spawn,
+      spawnSync: harness.spawnSync,
+    })
+    await proxy.start()
+    if (sizing) { await proxy.setSizeParticipation(true); await proxy.setSizeParticipation(false) }
+    const attachCalls = harness.spawnCalls.filter((c) => c.mode === 'terminal')
+    expect(attachCalls.length).toBe(1)
+    const attachCmd = attachCalls[0].args[attachCalls[0].args.length - 1]
+    await proxy.dispose()
+    return attachCmd
+  }
+
+  test('adds -T sync using the version returned by session create (no extra probe)', async () => {
+    const harness = createSshHarness({
+      spawnPipeOverride: versionAnswers({ createVersion: '3.4' }),
+    })
+    const attachCmd = await startAndGetAttachCmd(harness)
+    expect(attachCmd).toContain('tmux -u -T sync new-session -A')
+    // The create round-trip supplied the version; no separate -V probe.
+    const probeCalls = harness.spawnCalls.filter(
+      (c) => c.mode === 'pipe' && (c.args[c.args.length - 1] ?? '').includes('display-message')
+    )
+    expect(probeCalls.length).toBe(0)
+  })
+
+  test('omits -T sync when the remote tmux predates client feature flags', async () => {
+    const harness = createSshHarness({
+      spawnPipeOverride: versionAnswers({ createVersion: '3.1c' }),
+    })
+    const attachCmd = await startAndGetAttachCmd(harness)
+    expect(attachCmd).toContain('tmux -u new-session -A')
+    expect(attachCmd).not.toContain('-T sync')
+  })
+
+  test('falls back to a running-server version probe when create hits a duplicate session', async () => {
+    const harness = createSshHarness({
+      spawnPipeOverride: versionAnswers({ createDuplicate: true, probeVersion: '3.4' }),
+    })
+    const attachCmd = await startAndGetAttachCmd(harness)
+    expect(attachCmd).toContain('tmux -u -T sync new-session -A')
+  })
+
+  test('duplicate-session fallback keeps old remote servers free of size flags', async () => {
+    const harness = createSshHarness({ spawnPipeOverride: versionAnswers({ createDuplicate: true, probeVersion: '3.1c' }) })
+    const command = await startAndGetAttachCmd(harness, true)
+    expect(command).not.toContain('-f ignore-size')
+    expect(harness.spawnCalls.some(c => c.args.at(-1)?.includes('refresh-client') && c.args.at(-1)?.includes('-f'))).toBe(false)
+    expect(harness.spawnCalls.some(c => c.args.at(-1)?.includes('display-message'))).toBe(true)
+    expect(harness.spawnCalls.some(c => c.args.at(-1) === 'tmux -V')).toBe(false)
+  })
+
+  test('degrades to a plain attach when the fallback probe fails', async () => {
+    const harness = createSshHarness({
+      spawnPipeOverride: versionAnswers({ createDuplicate: true, probeFails: true }),
+    })
+    const attachCmd = await startAndGetAttachCmd(harness)
+    expect(attachCmd).toContain('tmux -u new-session -A')
+    expect(attachCmd).not.toContain('-T sync')
+  })
+
+  for (const [version, supported] of [['3.1c', false], ['3.2', true], ['', false]] as const) {
+    test(`remote background sizing respects ${version || 'unknown version'} with sync disabled`, async () => {
+      const saved = process.env.AGENTBOARD_TMUX_SYNC
+      process.env.AGENTBOARD_TMUX_SYNC = '0'
+      try {
+        const harness = createSshHarness({ spawnPipeOverride: versionAnswers({ createVersion: version }) })
+        const command = await startAndGetAttachCmd(harness, true)
+        expect(command.includes('-T sync')).toBe(false)
+        expect(command.includes('-f ignore-size')).toBe(supported)
+        const sizing = harness.spawnCalls.filter(c => c.mode === 'pipe' && c.args.at(-1)?.includes('refresh-client') && c.args.at(-1)?.includes('-f'))
+        expect(sizing).toHaveLength(supported ? 2 : 0)
+        expect(harness.spawnCalls.some(c => c.args.at(-1)?.includes('display-message'))).toBe(false)
+      } finally {
+        if (saved === undefined) delete process.env.AGENTBOARD_TMUX_SYNC
+        else process.env.AGENTBOARD_TMUX_SYNC = saved
+      }
+    })
+  }
+
+  test('AGENTBOARD_TMUX_SYNC=0 disables the sync feature', async () => {
+    const saved = process.env.AGENTBOARD_TMUX_SYNC
+    process.env.AGENTBOARD_TMUX_SYNC = '0'
+    try {
+      const harness = createSshHarness({
+        spawnPipeOverride: versionAnswers({ createVersion: '3.4' }),
+      })
+      const attachCmd = await startAndGetAttachCmd(harness)
+      expect(attachCmd).toContain('tmux -u new-session -A')
+      expect(attachCmd).not.toContain('-T sync')
+    } finally {
+      if (saved === undefined) {
+        delete process.env.AGENTBOARD_TMUX_SYNC
+      } else {
+        process.env.AGENTBOARD_TMUX_SYNC = saved
+      }
+    }
+  })
+})

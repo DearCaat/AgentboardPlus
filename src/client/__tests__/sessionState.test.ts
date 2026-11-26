@@ -1,0 +1,354 @@
+import { beforeEach, describe, expect, test } from 'bun:test'
+import type { AgentSession, Session } from '@shared/types'
+import { useSessionStore } from '../stores/sessionStore'
+import { useSettingsStore } from '../stores/settingsStore'
+import { sortSessions } from '../utils/sessions'
+
+const baseSession: Session = {
+  id: 'session-1',
+  name: 'alpha',
+  tmuxWindow: 'agentboard:1',
+  projectPath: '/Users/example/project',
+  status: 'waiting',
+  lastActivity: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+  createdAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+  source: 'managed',
+}
+
+function makeSession(overrides: Partial<Session> = {}): Session {
+  return { ...baseSession, ...overrides }
+}
+
+function makeAgentSession(overrides: Partial<AgentSession> = {}): AgentSession {
+  return {
+    sessionId: 'agent-1',
+    logFilePath: '/tmp/agent-1.jsonl',
+    projectPath: '/tmp/project',
+    agentType: 'claude',
+    displayName: 'agent-1',
+    createdAt: '2024-01-01T00:00:00.000Z',
+    lastActivityAt: '2024-01-01T00:00:00.000Z',
+    isActive: false,
+    isHibernating: false,
+    ...overrides,
+  }
+}
+
+beforeEach(() => {
+  useSessionStore.setState({
+    sessions: [],
+    agentSessions: { active: [], hibernating: [], history: [] },
+    agentSessionsEpoch: -1,
+    selectedSessionId: null,
+    selectedHibernatingSessionId: null,
+    hasLoaded: false,
+    connectionStatus: 'connecting',
+    connectionError: null,
+  })
+  useSettingsStore.setState({
+    sessionSortMode: 'created',
+    sessionSortDirection: 'desc',
+    showProjectName: true,
+    showLastUserMessage: true,
+    showSessionIdPrefix: false,
+    hostFilters: [],
+  })
+})
+
+describe('sortSessions', () => {
+  test('pins permission first, then sorts by last activity when mode is status', () => {
+    const sessions = [
+      makeSession({
+        id: 'working',
+        status: 'working',
+        lastActivity: new Date('2024-01-02T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'waiting-newer',
+        status: 'waiting',
+        lastActivity: new Date('2024-01-03T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'waiting-older',
+        status: 'waiting',
+        lastActivity: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'unknown',
+        status: 'unknown',
+        lastActivity: new Date('2024-01-04T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'permission-stale',
+        status: 'permission',
+        lastActivity: new Date('2023-12-01T00:00:00.000Z').toISOString(),
+      }),
+    ]
+
+    const sorted = sortSessions(sessions, { mode: 'status', direction: 'desc' })
+    expect(sorted.map((session) => session.id)).toEqual([
+      'permission-stale',
+      'unknown',
+      'waiting-newer',
+      'working',
+      'waiting-older',
+    ])
+  })
+
+  test('orders multiple permission sessions by activity and ignores direction', () => {
+    const sessions = [
+      makeSession({
+        id: 'permission-older',
+        status: 'permission',
+        lastActivity: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'working',
+        status: 'working',
+        lastActivity: new Date('2024-01-03T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'permission-newer',
+        status: 'permission',
+        lastActivity: new Date('2024-01-02T00:00:00.000Z').toISOString(),
+      }),
+    ]
+
+    const expected = ['permission-newer', 'permission-older', 'working']
+    for (const direction of ['asc', 'desc'] as const) {
+      const sorted = sortSessions(sessions, { mode: 'status', direction })
+      expect(sorted.map((session) => session.id)).toEqual(expected)
+    }
+  })
+
+  test('orders by createdAt descending when mode is created with desc', () => {
+    const sessions = [
+      makeSession({
+        id: 'oldest',
+        createdAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'middle',
+        createdAt: new Date('2024-01-02T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'newest',
+        createdAt: new Date('2024-01-03T00:00:00.000Z').toISOString(),
+      }),
+    ]
+
+    const sorted = sortSessions(sessions, { mode: 'created', direction: 'desc' })
+    expect(sorted.map((session) => session.id)).toEqual([
+      'newest',
+      'middle',
+      'oldest',
+    ])
+  })
+
+  test('orders by createdAt ascending when mode is created with asc', () => {
+    const sessions = [
+      makeSession({
+        id: 'newest',
+        createdAt: new Date('2024-01-03T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'oldest',
+        createdAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'middle',
+        createdAt: new Date('2024-01-02T00:00:00.000Z').toISOString(),
+      }),
+    ]
+
+    const sorted = sortSessions(sessions, { mode: 'created', direction: 'asc' })
+    expect(sorted.map((session) => session.id)).toEqual([
+      'oldest',
+      'middle',
+      'newest',
+    ])
+  })
+})
+
+describe('useSessionStore', () => {
+  test('auto-selects a session when current selection is missing', () => {
+    useSessionStore.setState({ selectedSessionId: 'missing' })
+
+    // With default 'created' + 'desc' mode, newest session is selected first
+    const sessions = [
+      makeSession({
+        id: 'older',
+        status: 'waiting',
+        createdAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+      }),
+      makeSession({
+        id: 'newer',
+        status: 'working',
+        createdAt: new Date('2024-01-02T00:00:00.000Z').toISOString(),
+      }),
+    ]
+
+    useSessionStore.getState().setSessions(sessions)
+
+    // Default sort is by createdAt desc, so 'newer' should be selected
+    expect(useSessionStore.getState().selectedSessionId).toBe('newer')
+    expect(useSessionStore.getState().hasLoaded).toBe(true)
+  })
+
+  test('preserves selection when session still exists', () => {
+    const sessions = [
+      makeSession({ id: 'keep', status: 'working' }),
+      makeSession({ id: 'other', status: 'waiting' }),
+    ]
+    useSessionStore.setState({ selectedSessionId: 'keep' })
+
+    useSessionStore.getState().setSessions(sessions)
+
+    expect(useSessionStore.getState().selectedSessionId).toBe('keep')
+  })
+
+  test('updates a session in place', () => {
+    const sessions = [
+      makeSession({ id: 'first', status: 'waiting' }),
+      makeSession({ id: 'second', status: 'working' }),
+    ]
+    useSessionStore.setState({ sessions })
+
+    useSessionStore
+      .getState()
+      .updateSession({ ...sessions[0], status: 'unknown' })
+
+    const updated = useSessionStore
+      .getState()
+      .sessions.find((session) => session.id === 'first')
+    expect(updated?.status).toBe('unknown')
+  })
+
+  test('setSessions keeps null selection when none chosen', () => {
+    useSessionStore.setState({ selectedSessionId: null })
+    useSessionStore.getState().setSessions([makeSession({ id: 'only' })])
+
+    const state = useSessionStore.getState()
+    expect(state.selectedSessionId).toBeNull()
+    expect(state.hasLoaded).toBe(true)
+  })
+
+  test('setSelectedSessionId updates selection', () => {
+    useSessionStore.getState().setSelectedSessionId('session-1')
+    expect(useSessionStore.getState().selectedSessionId).toBe('session-1')
+  })
+
+  test('setAgentSessions stores hibernating sessions and clears stale hibernating selection', () => {
+    useSessionStore.setState({ selectedHibernatingSessionId: 'hibernating-1' })
+
+    useSessionStore.getState().setAgentSessions(
+      [makeAgentSession({ sessionId: 'active-1', isActive: true })],
+      [makeAgentSession({ sessionId: 'hibernating-1', isHibernating: true })],
+      [makeAgentSession({ sessionId: 'history-1' })]
+    )
+
+    let state = useSessionStore.getState()
+    expect(state.agentSessions.hibernating.map((session) => session.sessionId)).toEqual([
+      'hibernating-1',
+    ])
+    expect(state.selectedHibernatingSessionId).toBe('hibernating-1')
+
+    useSessionStore.getState().setAgentSessions(
+      [makeAgentSession({ sessionId: 'active-1', isActive: true })],
+      [],
+      [makeAgentSession({ sessionId: 'history-1' })]
+    )
+
+    state = useSessionStore.getState()
+    expect(state.agentSessions.hibernating).toEqual([])
+    expect(state.selectedHibernatingSessionId).toBeNull()
+  })
+
+  test('setActiveAgentSessions updates active sessions without clearing hibernating selection', () => {
+    useSessionStore.setState({
+      selectedHibernatingSessionId: 'hibernating-1',
+      agentSessionsEpoch: 0,
+      agentSessions: {
+        active: [makeAgentSession({ sessionId: 'active-old', isActive: true })],
+        hibernating: [],
+        history: [makeAgentSession({ sessionId: 'history-1' })],
+      },
+    })
+
+    useSessionStore.getState().setActiveAgentSessions([
+      makeAgentSession({ sessionId: 'active-new', isActive: true }),
+    ])
+
+    const state = useSessionStore.getState()
+    expect(state.selectedHibernatingSessionId).toBe('hibernating-1')
+    expect(state.agentSessions.active.map((session) => session.sessionId)).toEqual([
+      'active-new',
+    ])
+    expect(state.agentSessions.history.map((session) => session.sessionId)).toEqual([
+      'history-1',
+    ])
+  })
+
+  test('persist merge ignores legacy stored agent session shape', () => {
+    const merge = useSessionStore.persist.getOptions().merge
+    if (!merge) {
+      throw new Error('Expected persist merge to be configured')
+    }
+
+    const merged = merge(
+      {
+        sessions: [makeSession({ id: 'legacy-session' })],
+        agentSessions: { active: [], history: [] },
+        selectedSessionId: 'legacy-live',
+        selectedHibernatingSessionId: 'legacy-hibernating',
+      },
+      useSessionStore.getState()
+    )
+
+    expect(merged.sessions).toEqual([])
+    expect(merged.agentSessions).toEqual({ active: [], hibernating: [], history: [] })
+    expect(merged.selectedSessionId).toBe('legacy-live')
+    expect(merged.selectedHibernatingSessionId).toBe('legacy-hibernating')
+  })
+
+  test('setSessions applies lastActivity-only updates', () => {
+    const first = makeSession({
+      id: 'same-id',
+      status: 'waiting',
+      lastActivity: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+    })
+    const second = {
+      ...first,
+      lastActivity: new Date('2024-01-01T00:00:30.000Z').toISOString(),
+    }
+
+    useSessionStore.getState().setSessions([first])
+    useSessionStore.getState().setSessions([second])
+
+    expect(useSessionStore.getState().sessions[0]?.lastActivity).toBe(
+      second.lastActivity
+    )
+  })
+
+  test('setConnectionStatus and error update state', () => {
+    useSessionStore.getState().setConnectionStatus('connected')
+    useSessionStore.getState().setConnectionError('boom')
+
+    const state = useSessionStore.getState()
+    expect(state.connectionStatus).toBe('connected')
+    expect(state.connectionError).toBe('boom')
+  })
+
+  test('updateSession ignores missing session ids', () => {
+    const sessions = [
+      makeSession({ id: 'first', status: 'waiting' }),
+    ]
+    useSessionStore.setState({ sessions })
+
+    useSessionStore
+      .getState()
+      .updateSession({ ...sessions[0], id: 'missing', status: 'unknown' })
+
+    expect(useSessionStore.getState().sessions).toEqual(sessions)
+  })
+})

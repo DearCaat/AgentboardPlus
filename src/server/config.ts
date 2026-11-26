@@ -1,0 +1,280 @@
+import os from 'node:os'
+import path from 'node:path'
+import { parseAllowedOrigins } from './requestOrigin'
+
+const terminalModeRaw = process.env.TERMINAL_MODE
+const terminalMode =
+  terminalModeRaw === 'pty' ||
+  terminalModeRaw === 'pipe-pane' ||
+  terminalModeRaw === 'auto'
+    ? terminalModeRaw
+    : 'pty'
+
+const homeDir = process.env.HOME || process.env.USERPROFILE || ''
+
+const logPollIntervalMsRaw = Number(process.env.AGENTBOARD_LOG_POLL_MS)
+const logPollIntervalMs = Number.isFinite(logPollIntervalMsRaw)
+  ? logPollIntervalMsRaw
+  : 5000
+const logPollMaxRaw = Number(process.env.AGENTBOARD_LOG_POLL_MAX)
+const logPollMax = Number.isFinite(logPollMaxRaw) ? logPollMaxRaw : 25
+const rgThreadsRaw = Number(process.env.AGENTBOARD_RG_THREADS)
+const rgThreads = Number.isFinite(rgThreadsRaw) && rgThreadsRaw > 0
+  ? Math.floor(rgThreadsRaw)
+  : 1
+const logMatchWorkerRaw = process.env.AGENTBOARD_LOG_MATCH_WORKER
+const logMatchWorker =
+  !(logMatchWorkerRaw === 'false' || logMatchWorkerRaw === '0')
+const logMatchProfile =
+  process.env.AGENTBOARD_LOG_MATCH_PROFILE === 'true' ||
+  process.env.AGENTBOARD_LOG_MATCH_PROFILE === '1'
+const logWatchModeRaw = process.env.AGENTBOARD_LOG_WATCH_MODE
+const logWatchMode: 'watch' | 'poll' =
+  logWatchModeRaw === 'poll' ? 'poll' : 'watch'
+
+const enterRefreshDelayMsRaw = Number(process.env.AGENTBOARD_ENTER_REFRESH_MS)
+const enterRefreshDelayMs = Number.isFinite(enterRefreshDelayMsRaw)
+  ? enterRefreshDelayMsRaw
+  : 1000
+
+const workingGracePeriodMsRaw = Number(process.env.AGENTBOARD_WORKING_GRACE_MS)
+const workingGracePeriodMs = Number.isFinite(workingGracePeriodMsRaw)
+  ? workingGracePeriodMsRaw
+  : 4000
+
+// Max age for History sessions shown in UI (hours).
+// The env var name is kept stable across the Inactive -> History rename.
+const inactiveSessionMaxAgeHoursRaw = Number(process.env.AGENTBOARD_INACTIVE_MAX_AGE_HOURS)
+const historySessionMaxAgeHours = Number.isFinite(inactiveSessionMaxAgeHoursRaw)
+  ? inactiveSessionMaxAgeHoursRaw
+  : 24
+
+// Exclude sessions from certain project directories (comma-separated paths)
+// Sessions with projectPath starting with any of these will be filtered out
+// Example: AGENTBOARD_EXCLUDE_PROJECTS="/,/tmp" to exclude root and /tmp sessions
+const excludeProjects = (process.env.AGENTBOARD_EXCLUDE_PROJECTS || '')
+  .split(',')
+  .map((p) => p.trim())
+  .filter(Boolean)
+
+// Default patterns for sessions that should skip window matching when orphaned.
+// These sessions are still tracked in the DB but won't trigger expensive
+// ripgrep scans trying to match them to tmux windows.
+// Special markers:
+//   <codex-exec> - Codex sessions started via `codex exec` (headless)
+// Path patterns support trailing * for prefix matching.
+const defaultSkipMatchingPatterns = [
+  '<codex-exec>',
+  '/private/tmp/*',
+  '/private/var/folders/*',
+  '/var/folders/*',
+  '/tmp/*',
+]
+
+// Allow override via env var (comma-separated). If set (even empty), replaces defaults.
+// Set to empty string to disable skip matching entirely.
+const skipMatchingPatternsRaw = process.env.AGENTBOARD_SKIP_MATCHING_PATTERNS
+const skipMatchingPatterns = skipMatchingPatternsRaw !== undefined
+  ? skipMatchingPatternsRaw.split(',').map((p) => p.trim()).filter(Boolean)
+  : defaultSkipMatchingPatterns
+
+// Logging config
+const logLevelRaw = process.env.LOG_LEVEL?.toLowerCase()
+const logLevel = ['debug', 'info', 'warn', 'error'].includes(logLevelRaw || '')
+  ? (logLevelRaw as 'debug' | 'info' | 'warn' | 'error')
+  : 'info'
+const defaultDataDir =
+  process.env.AGENTBOARD_DATA_DIR?.trim() || path.join(homeDir, '.agentboard')
+const defaultLogFile = path.join(defaultDataDir, 'agentboard.log')
+const logFile = process.env.LOG_FILE ?? defaultLogFile
+const tmuxServerPidFile =
+  process.env.AGENTBOARD_TMUX_PID_FILE ||
+  path.join(defaultDataDir, 'tmux-server.pid')
+
+const claudeConfigDir =
+  process.env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude')
+const codexHomeDir =
+  process.env.CODEX_HOME || path.join(homeDir, '.codex')
+
+const hostLabel = process.env.AGENTBOARD_HOST?.trim() || os.hostname()
+
+// RFC 1123 hostname validation
+// Each label: 1-63 chars, alphanumeric + hyphen, no leading/trailing hyphen
+const HOSTNAME_REGEX = /^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])(\.([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]))*$/
+
+export function isValidHostname(hostname: string): boolean {
+  return hostname.length > 0 && hostname.length <= 253 && HOSTNAME_REGEX.test(hostname)
+}
+
+const remoteHosts = (process.env.AGENTBOARD_REMOTE_HOSTS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter((value) => {
+    if (!value) return false
+    if (!isValidHostname(value)) {
+      console.warn(`[agentboard] Invalid hostname in AGENTBOARD_REMOTE_HOSTS: "${value}"`)
+      return false
+    }
+    return true
+  })
+
+const remotePollMsRaw = Number(process.env.AGENTBOARD_REMOTE_POLL_MS)
+const remotePollMs = Number.isFinite(remotePollMsRaw) ? remotePollMsRaw : 2000
+
+const remoteTimeoutMsRaw = Number(process.env.AGENTBOARD_REMOTE_TIMEOUT_MS)
+const remoteTimeoutMs = Number.isFinite(remoteTimeoutMsRaw) ? remoteTimeoutMsRaw : 4000
+
+const remoteStaleMsRaw = Number(process.env.AGENTBOARD_REMOTE_STALE_MS)
+const remoteStaleMs = Number.isFinite(remoteStaleMsRaw)
+  ? remoteStaleMsRaw
+  : Math.max(remotePollMs * 3, 15000)
+
+const remoteSshOpts = process.env.AGENTBOARD_REMOTE_SSH_OPTS || ''
+const remoteAllowControl = process.env.AGENTBOARD_REMOTE_ALLOW_CONTROL === 'true'
+// Allow attaching to (viewing/interacting with) remote terminals.
+// Defaults to true when remoteAllowControl is enabled; can be set independently.
+const remoteAllowAttachRaw = process.env.AGENTBOARD_REMOTE_ALLOW_ATTACH
+const remoteAllowAttach = remoteAllowAttachRaw !== undefined
+  ? remoteAllowAttachRaw === 'true'
+  : remoteAllowControl
+
+const tmuxTimeoutMsRaw = Number(process.env.AGENTBOARD_TMUX_TIMEOUT_MS)
+const tmuxTimeoutMs = Number.isFinite(tmuxTimeoutMsRaw) && tmuxTimeoutMsRaw > 0
+  ? Math.floor(tmuxTimeoutMsRaw)
+  : 3000
+const tmuxMutationTimeoutMsRaw = Number(process.env.AGENTBOARD_TMUX_MUTATION_TIMEOUT_MS)
+const tmuxMutationTimeoutMs = Number.isFinite(tmuxMutationTimeoutMsRaw) && tmuxMutationTimeoutMsRaw > 0
+  ? Math.max(Math.floor(tmuxMutationTimeoutMsRaw), tmuxTimeoutMs)
+  : Math.max(tmuxTimeoutMs * 5, 15000)
+
+// Dedup window for rapid re-attaches to the same session+target. Kept
+// env-tunable so integration tests can widen it instead of racing a
+// wall-clock window against event-loop scheduling.
+const attachDedupMsRaw = Number(process.env.AGENTBOARD_ATTACH_DEDUP_MS)
+const attachDedupMs =
+  Number.isFinite(attachDedupMsRaw) && attachDedupMsRaw > 0
+    ? Math.floor(attachDedupMsRaw)
+    : 500
+
+// Bind address for the server. HOSTNAME doubles as the machine name in many
+// environments — containers and some CI images auto-export it — so a value
+// that merely echoes os.hostname() is treated as ambient and the localhost
+// default is kept instead of silently binding away from 127.0.0.1.
+function resolveBindHostname(): string {
+  const raw = process.env.HOSTNAME
+  if (!raw) return '127.0.0.1'
+  if (raw === os.hostname()) {
+    console.warn(
+      `[agentboard] Ignoring HOSTNAME="${raw}" — it matches the machine hostname, ` +
+        'so it was likely auto-exported by the environment. ' +
+        'Binding 127.0.0.1; set HOSTNAME=0.0.0.0 to listen on all interfaces.',
+    )
+    return '127.0.0.1'
+  }
+  return raw
+}
+
+const pasteImageMaxBytesRaw = Number(process.env.AGENTBOARD_PASTE_IMAGE_MAX_BYTES)
+const pasteImageMaxBytes = Number.isFinite(pasteImageMaxBytesRaw) && pasteImageMaxBytesRaw > 0
+  ? Math.floor(pasteImageMaxBytesRaw)
+  : 40 * 1024 * 1024
+
+// Stall watchdog: a worker samples this process mid-event-loop-stall so the
+// blocked stack is captured while it happens (event_loop_lag only sees the
+// stall after it ends). Uses macOS `sample` — off on other platforms and
+// under `bun test` (NODE_ENV=test), unless AGENTBOARD_STALL_WATCHDOG=1 forces
+// it on.
+const stallWatchdogRaw = process.env.AGENTBOARD_STALL_WATCHDOG
+const stallWatchdogEnabled =
+  stallWatchdogRaw === '1' || stallWatchdogRaw === 'true'
+    ? true
+    : stallWatchdogRaw !== '0' &&
+      stallWatchdogRaw !== 'false' &&
+      process.platform === 'darwin' &&
+      process.env.NODE_ENV !== 'test'
+const stallWatchdogThresholdMsRaw = Number(process.env.AGENTBOARD_STALL_WATCHDOG_MS)
+// The floor sits above the heartbeat cadence: a threshold under ~1s would
+// fire on ordinary timer jitter, not stalls.
+const stallWatchdogThresholdMs =
+  Number.isFinite(stallWatchdogThresholdMsRaw) && stallWatchdogThresholdMsRaw >= 1000
+    ? Math.floor(stallWatchdogThresholdMsRaw)
+    : 2000
+
+export const config = {
+  port: Number(process.env.PORT) || 4040,
+  hostname: resolveBindHostname(),
+  hostLabel,
+  tmuxSession: process.env.TMUX_SESSION || 'agentboard',
+  refreshIntervalMs: Number(process.env.REFRESH_INTERVAL_MS) || 2000,
+  discoverPrefixes: (process.env.DISCOVER_PREFIXES || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
+  pruneWsSessions: process.env.PRUNE_WS_SESSIONS !== 'false',
+  // Prefer tmux window names over session names when displaying externally-discovered
+  // sessions. Off by default, since window names often auto-rename to the running
+  // process under tmux `automatic-rename on`. Enable when each window has a stable,
+  // user-chosen name (e.g. one window per project in a shared session).
+  preferWindowName: process.env.AGENTBOARD_PREFER_WINDOW_NAME === 'true',
+  // Preserve ANSI terminal colors by default. The persisted server setting can
+  // override this at startup, including ambient NO_COLOR inherited by Agentboard.
+  terminalColorsEnabled: true,
+  // Launch agentboard-created windows with Claude Code fullscreen ("no-flicker")
+  // rendering enabled, so its mouse features (click-to-expand, click-to-position
+  // cursor, wheel scroll) work in the browser terminal. Set
+  // AGENTBOARD_CLAUDE_NO_FLICKER=0 (or =false) to disable.
+  claudeNoFlicker:
+    process.env.AGENTBOARD_CLAUDE_NO_FLICKER !== '0' &&
+    process.env.AGENTBOARD_CLAUDE_NO_FLICKER !== 'false',
+  terminalMode,
+  terminalMonitorTargets: process.env.TERMINAL_MONITOR_TARGETS !== 'false',
+  // Allow killing external (discovered) sessions from UI. Off by default:
+  // discovered sessions are read-only unless opted in.
+  allowKillExternal: process.env.ALLOW_KILL_EXTERNAL === 'true',
+  // TLS config - set both to enable HTTPS
+  tlsCert: process.env.TLS_CERT || '',
+  tlsKey: process.env.TLS_KEY || '',
+  // Extra browser origins allowed to open /ws and send /api mutations, for
+  // reverse proxies that rewrite Host. Same-origin requests need no entry.
+  allowedOrigins: parseAllowedOrigins(process.env.AGENTBOARD_ALLOWED_ORIGINS),
+  logPollIntervalMs,
+  // Opt-in observation only: never changes matching or session ownership.
+  ownershipObserver: process.env.AGENTBOARD_OWNERSHIP_OBSERVER === 'true',
+  ownershipMatching: process.platform === 'darwin' && process.env.AGENTBOARD_OWNERSHIP_MATCHING !== 'false',
+  logPollMax,
+  rgThreads,
+  logMatchWorker,
+  logMatchProfile,
+  logWatchMode,
+  claudeConfigDir,
+  codexHomeDir,
+  claudeResumeCmd: process.env.CLAUDE_RESUME_CMD || 'claude --resume {sessionId}',
+  codexResumeCmd: process.env.CODEX_RESUME_CMD || 'codex resume {sessionId}',
+  piResumeCmd: process.env.PI_RESUME_CMD || 'pi --session {logFilePath}',
+  devinResumeCmd: process.env.DEVIN_RESUME_CMD || 'devin --resume {sessionId}',
+  antigravityResumeCmd: process.env.ANTIGRAVITY_RESUME_CMD || 'agy --conversation {sessionId}',
+  grokResumeCmd: process.env.GROK_RESUME_CMD || 'grok --resume {sessionId}',
+  ompResumeCmd: process.env.OMP_RESUME_CMD || 'omp --resume {logFilePath}',
+  enterRefreshDelayMs,
+  workingGracePeriodMs,
+  historySessionMaxAgeHours,
+  excludeProjects,
+  skipMatchingPatterns,
+  logLevel,
+  logFile,
+  dataDir: defaultDataDir,
+  tmuxServerPidFile,
+  remoteHosts,
+  remotePollMs,
+  remoteTimeoutMs,
+  remoteStaleMs,
+  remoteSshOpts,
+  remoteAllowControl,
+  remoteAllowAttach,
+  tmuxTimeoutMs,
+  tmuxMutationTimeoutMs,
+  attachDedupMs,
+  pasteImageMaxBytes,
+  stallWatchdogEnabled,
+  stallWatchdogThresholdMs,
+}

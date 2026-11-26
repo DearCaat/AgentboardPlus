@@ -1,0 +1,96 @@
+import { describe, expect, test, mock } from 'bun:test'
+import TestRenderer from 'react-test-renderer'
+
+const iconStub =
+  (testId: string) =>
+  ({ className }: { className?: string }) => (
+    <svg data-testid={testId} className={className} />
+  )
+
+// AgentIcon takes its fallback glyph from the shared icons module.
+mock.module('../components/icons', () => ({
+  TerminalIcon: iconStub('terminal-icon'),
+}))
+
+const { default: AgentIcon } = await import('../components/AgentIcon')
+
+describe('AgentIcon', () => {
+  test('renders Anthropic icon for claude sessions', () => {
+    const renderer = TestRenderer.create(
+      <AgentIcon agentType="claude" className="icon" />
+    )
+
+    const icon = renderer.root.findByProps({ viewBox: '0 0 92.2 92.2' })
+    expect(icon.props.className).toBe('icon')
+  })
+
+  test('renders Anthropic icon for claude-prefixed agents', () => {
+    const renderer = TestRenderer.create(
+      <AgentIcon agentType="claude-rp" className="icon" />
+    )
+
+    const icon = renderer.root.findByProps({ viewBox: '0 0 92.2 92.2' })
+    expect(icon.props.className).toBe('icon')
+  })
+
+  test('renders OpenAI icon based on command', () => {
+    const renderer = TestRenderer.create(
+      <AgentIcon command="Codex --help" />
+    )
+
+    expect(renderer.root.findByProps({ viewBox: '-1 -1 26 26' })).toBeTruthy()
+  })
+
+  test('renders Devin icon for devin sessions', () => {
+    const renderer = TestRenderer.create(
+      <AgentIcon agentType="devin" className="icon" />
+    )
+
+    const icon = renderer.root.findByProps({ viewBox: '41 41 343 343' })
+    expect(icon.props.className).toBe('icon')
+  })
+
+  test('renders Grok icon for grok sessions', () => {
+    const renderer = TestRenderer.create(
+      <AgentIcon agentType="grok" className="icon" />
+    )
+
+    const icon = renderer.root.findByProps({ viewBox: '0 0 512 512' })
+    expect(icon.props.className).toBe('icon')
+  })
+
+  test('renders oh-my-pi icon for omp sessions', () => {
+    const renderer = TestRenderer.create(
+      <AgentIcon agentType="omp" className="icon" />
+    )
+
+    const icon = renderer.root.findByProps({ viewBox: '0 -15 120 120' })
+    expect(icon.props.className).toBe('icon')
+  })
+
+  test('renders oh-my-pi icon based on command', () => {
+    const renderer = TestRenderer.create(
+      <AgentIcon command="omp --model opus" />
+    )
+
+    expect(renderer.root.findByProps({ viewBox: '0 -15 120 120' })).toBeTruthy()
+  })
+
+  test('renders pi icon for pi sessions', () => {
+    const renderer = TestRenderer.create(
+      <AgentIcon agentType="pi" className="icon" />
+    )
+
+    const icon = renderer.root.findByProps({ viewBox: '0 0 588.42 568.88' })
+    expect(icon.props.className).toBe('icon')
+  })
+
+  test('falls back to terminal icon for unknown agent', () => {
+    const renderer = TestRenderer.create(
+      <AgentIcon command="bash" className="fallback" />
+    )
+
+    const fallback = renderer.root.findByProps({ 'data-testid': 'terminal-icon' })
+    expect(fallback.props.className).toBe('fallback')
+  })
+})

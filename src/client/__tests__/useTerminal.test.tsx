@@ -1,0 +1,5550 @@
+import { afterEach, beforeEach, describe, expect, jest, test, mock } from 'bun:test'
+import TestRenderer, { act } from 'react-test-renderer'
+import type { AgentType, ServerMessage, Session } from '@shared/types'
+import { useSettingsStore } from '../stores/settingsStore'
+import type { ITheme } from '@xterm/xterm'
+import type { ConnectionStatus } from '../stores/sessionStore'
+
+const globalAny = globalThis as typeof globalThis & {
+  window?: Window
+  document?: Document
+  navigator?: Navigator
+  ResizeObserver?: typeof ResizeObserver
+}
+
+const originalWindow = globalAny.window
+const originalDocument = globalAny.document
+const originalNavigator = globalAny.navigator
+const originalResizeObserver = globalAny.ResizeObserver
+
+class TerminalMock {
+  static instances: TerminalMock[] = []
+  cols = 80
+  rows = 24
+  options: Record<string, unknown> = {}
+  buffer = { active: { viewportY: 0, baseY: 0 } }
+  element: HTMLElement | null = null
+  writes: string[] = []
+  pasteCalls: string[] = []
+  resetCalls = 0
+  focusCalls = 0
+  scrollCalls = 0
+  disposed = false
+  selection = ''
+  private mouseTrackingMode: 'none' | 'x10' | 'vt200' | 'drag' | 'any' = 'none'
+  private dataHandler?: (data: string) => void
+  private keyHandler?: (event: KeyboardEvent) => boolean
+  private wheelHandler?: (event: WheelEvent) => boolean
+
+  constructor(options: Record<string, unknown> = {}) {
+    this.options = { ...options }
+    TerminalMock.instances.push(this)
+  }
+
+  loadAddon() {}
+  onRender() { return { dispose() {} } }
+
+  open(container: HTMLElement) {
+    this.element = container
+  }
+
+  get textarea() {
+    return this.element?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | undefined
+  }
+
+  get modes() {
+    return { mouseTrackingMode: this.mouseTrackingMode }
+  }
+
+  reset() {
+    this.resetCalls += 1
+    this.mouseTrackingMode = 'none'
+  }
+
+  onData(handler: (data: string) => void) {
+    this.dataHandler = handler
+  }
+
+  attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean) {
+    this.keyHandler = handler
+    return true
+  }
+
+  attachCustomWheelEventHandler(handler: (event: WheelEvent) => boolean) {
+    this.wheelHandler = handler
+    return true
+  }
+
+  holdWrites = false
+  pendingWrites: Array<() => void> = []
+
+  finishWrite() { this.pendingWrites.shift()?.() }
+
+  write(data: string, callback?: () => void) {
+    if (data) this.writes.push(data)
+    if (data.includes('\x1b[?1002h')) this.mouseTrackingMode = 'drag'
+    else if (data.includes('\x1b[?1003h')) this.mouseTrackingMode = 'any'
+    else if (data.includes('\x1b[?1000h')) this.mouseTrackingMode = 'vt200'
+    else if (
+      data.includes('\x1b[?1000l') ||
+      data.includes('\x1b[?1002l') ||
+      data.includes('\x1b[?1003l')
+    ) {
+      this.mouseTrackingMode = 'none'
+    }
+    if (callback) {
+      if (this.holdWrites) this.pendingWrites.push(callback)
+      else callback()
+    }
+  }
+
+  paste(text: string) {
+    this.pasteCalls.push(text)
+  }
+
+  scrollToBottom() {
+    this.scrollCalls += 1
+  }
+
+  focus() {
+    this.focusCalls += 1
+  }
+
+  hasSelection() {
+    return this.selection.length > 0
+  }
+
+  getSelection() {
+    return this.selection
+  }
+
+  refreshCalls: Array<[number, number]> = []
+  refresh(start: number, end: number) { this.refreshCalls.push([start, end]) }
+
+  dispose() {
+    this.disposed = true
+  }
+
+  emitData(data: string) {
+    this.dataHandler?.(data)
+  }
+
+  emitWheel(event: WheelEvent) {
+    return this.wheelHandler?.(event)
+  }
+
+  emitKey(event: {
+    key: string
+    code?: string
+    type: string
+    ctrlKey?: boolean
+    shiftKey?: boolean
+    altKey?: boolean
+    metaKey?: boolean
+  }) {
+    return this.keyHandler?.(event as KeyboardEvent)
+  }
+}
+
+class FitAddonMock {
+  static instances: FitAddonMock[] = []
+  fitCalls = 0
+
+  constructor() {
+    FitAddonMock.instances.push(this)
+  }
+
+  fit() {
+    this.fitCalls += 1
+  }
+}
+
+class WebglAddonMock {
+  static instances: WebglAddonMock[] = []
+  disposed = false
+  disposeCalls = 0
+  private onContextLossHandler?: () => void
+
+  constructor() {
+    WebglAddonMock.instances.push(this)
+  }
+
+  dispose() {
+    this.disposeCalls += 1
+    this.disposed = true
+  }
+
+  onContextLoss(callback: () => void) {
+    this.onContextLossHandler = callback
+  }
+
+  emitContextLoss() {
+    this.onContextLossHandler?.()
+  }
+}
+
+class ClipboardAddonMock {}
+
+class SearchAddonMock {}
+class SerializeAddonMock {
+  serialize() { return '\x1b[mtest-snapshot-data' }
+}
+class ProgressAddonMock {}
+
+mock.module('@xterm/xterm', () => ({ Terminal: TerminalMock }))
+mock.module('@xterm/addon-fit', () => ({ FitAddon: FitAddonMock }))
+mock.module('@xterm/addon-clipboard', () => ({ ClipboardAddon: ClipboardAddonMock }))
+mock.module('@xterm/addon-webgl', () => ({ WebglAddon: WebglAddonMock }))
+mock.module('@xterm/addon-search', () => ({ SearchAddon: SearchAddonMock }))
+mock.module('@xterm/addon-serialize', () => ({ SerializeAddon: SerializeAddonMock }))
+mock.module('@xterm/addon-progress', () => ({ ProgressAddon: ProgressAddonMock }))
+mock.module('@xterm/addon-web-links', () => ({ WebLinksAddon: class {} }))
+
+const { forceTextPresentation, sanitizeLink, useTerminal, invalidateSnapshotCache, clearSnapshotCache } = await import('../hooks/useTerminal')
+const { default: TerminalComponent } = await import('../components/Terminal')
+
+// Tracks a registered event listener with its capture flag
+interface ListenerEntry {
+  handler: EventListener
+  capture: boolean
+}
+
+type MockTextarea = HTMLTextAreaElement & { focusCalls: number }
+
+function createContainerMock() {
+  const textareaListeners = new Map<string, EventListener>()
+  const textareaState = { focusCalls: 0 }
+  const textareaAttributes = new Map<string, string>()
+  const textarea = {
+    get focusCalls() { return textareaState.focusCalls },
+    set focusCalls(value: number) { textareaState.focusCalls = value },
+    addEventListener: (event: string, handler: EventListener) => {
+      textareaListeners.set(event, handler)
+    },
+    removeEventListener: (event: string, handler: EventListener) => {
+      if (textareaListeners.get(event) === handler) {
+        textareaListeners.delete(event)
+      }
+    },
+    getAttribute: (name: string) => textareaAttributes.get(name) ?? null,
+    setAttribute: (name: string, value: string) => { textareaAttributes.set(name, value) },
+    removeAttribute: (name: string) => { textareaAttributes.delete(name) },
+    focus: () => {
+      textareaState.focusCalls += 1
+    },
+  } as unknown as MockTextarea
+
+  // Store multiple listeners per event to support both bubble and capture phase
+  const listenerEntries = new Map<string, ListenerEntry[]>()
+
+  // Legacy single-entry map kept for backward compatibility with existing tests
+  const listeners = new Map<string, EventListener>()
+
+  // Track display style changes for iOS compositor repaint tests
+  const displayLog: string[] = []
+  const containerStyle = {
+    cssText: '',
+    setProperty(name: string, value: string) {
+      ;(this as Record<string, unknown>)[name] = value
+    },
+  } as CSSStyleDeclaration & Record<string, unknown>
+  Object.defineProperty(containerStyle, 'display', {
+    get() { return displayLog.length ? displayLog[displayLog.length - 1] : '' },
+    set(v: string) { displayLog.push(v) },
+    enumerable: true,
+    configurable: true,
+  })
+
+  const screen = {
+    getBoundingClientRect: () => ({
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      x: 0,
+      y: 0,
+      toJSON: () => {},
+    }),
+  }
+  const xtermRoot = {
+    getBoundingClientRect: () => ({
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      x: 0,
+      y: 0,
+      toJSON: () => {},
+    }),
+    querySelector: (selector: string) => {
+      if (selector === '.xterm-screen') return screen
+      return null
+    },
+  }
+
+  const attributes = new Set<string>()
+  const container = {
+    innerHTML: 'existing',
+    style: containerStyle,
+    hasAttribute: (name: string) => attributes.has(name),
+    setAttribute: (name: string) => { attributes.add(name) },
+    removeAttribute: (name: string) => { attributes.delete(name) },
+    get offsetHeight() { return 100 },
+    closest: () => null,
+    contains: () => false,
+    getBoundingClientRect: () => ({
+      left: 0,
+      top: 0,
+      right: 800,
+      bottom: 240,
+      width: 800,
+      height: 240,
+      x: 0,
+      y: 0,
+      toJSON: () => {},
+    }),
+    addEventListener: (
+      event: string,
+      handler: EventListener,
+      options?: boolean | AddEventListenerOptions,
+    ) => {
+      const capture = typeof options === 'boolean' ? options : (options?.capture ?? false)
+      const entries = listenerEntries.get(event) ?? []
+      entries.push({ handler, capture })
+      listenerEntries.set(event, entries)
+      // Keep legacy map in sync (last writer wins, mirrors old behavior)
+      listeners.set(event, handler)
+    },
+    removeEventListener: (
+      event: string,
+      handler: EventListener,
+      options?: boolean | EventListenerOptions,
+    ) => {
+      const capture = typeof options === 'boolean' ? options : (options?.capture ?? false)
+      const entries = listenerEntries.get(event)
+      if (entries) {
+        const idx = entries.findIndex(
+          (e) => e.handler === handler && e.capture === capture,
+        )
+        if (idx !== -1) entries.splice(idx, 1)
+        if (entries.length === 0) listenerEntries.delete(event)
+      }
+      // Legacy map cleanup
+      if (listeners.get(event) === handler) {
+        listeners.delete(event)
+      }
+    },
+    querySelector: (selector: string) => {
+      if (selector === '.xterm-helper-textarea') return textarea
+      if (selector === '.xterm') return xtermRoot
+      if (selector === '.xterm-screen') return screen
+      return null
+    },
+  } as unknown as HTMLDivElement
+
+  /**
+   * Dispatch a mock event to all registered listeners for the given event name.
+   * Capture-phase listeners fire first, then bubble-phase listeners.
+   */
+  const dispatchEvent = (event: string, eventObj: unknown) => {
+    const entries = listenerEntries.get(event)
+    if (!entries) return
+    // Fire capture-phase listeners first
+    for (const entry of entries) {
+      if (entry.capture) entry.handler(eventObj as Event)
+    }
+    // Then bubble-phase listeners
+    for (const entry of entries) {
+      if (!entry.capture) entry.handler(eventObj as Event)
+    }
+  }
+
+  return { container, textarea, listeners, listenerEntries, dispatchEvent, displayLog, attributes }
+}
+
+// Input/clipboard fixtures model the server's initial attachment acknowledgment.
+function subscribeReadyTerminal(listener: (message: ServerMessage) => void) {
+  listener({ type: 'terminal-ready', sessionId: 'session-1' })
+  return () => {}
+}
+
+function TerminalHarness(props: {
+  sessionId: string | null
+  tmuxTarget?: string | null
+  agentType?: AgentType
+  connectionStatus?: ConnectionStatus
+  connectionEpoch?: number
+  sendMessage: (message: any) => void
+  subscribe: (listener: (message: ServerMessage) => void) => () => void
+  theme: ITheme
+  fontSize: number
+  lineHeight?: number
+  letterSpacing?: number
+  fontFamily?: string
+  useWebGL?: boolean
+  onScrollChange?: (isAtBottom: boolean) => void
+  onPasteFiles?: (draft: { text: string; files: File[] }) => void
+  onPasteError?: (message: string) => void
+  onDeferredInput?: (data: string, kind: 'typing' | 'paste') => void
+  deferInput?: boolean
+}) {
+  const { containerRef, isTmuxCopyMode } = useTerminal({
+    ...props,
+    tmuxTarget: props.tmuxTarget ?? null,
+    connectionStatus: props.connectionStatus ?? 'connected',
+    connectionEpoch: props.connectionEpoch ?? 0,
+    lineHeight: props.lineHeight ?? 1.0,
+    letterSpacing: props.letterSpacing ?? 0,
+    fontFamily: props.fontFamily ?? '"JetBrains Mono Variable", monospace',
+    useWebGL: props.useWebGL ?? true,
+  })
+  return <div ref={containerRef} data-copy-mode={isTmuxCopyMode ? 'true' : 'false'} />
+}
+
+const terminalSession: Session = {
+  id: 'session-1',
+  name: 'alpha',
+  tmuxWindow: 'agentboard:@1',
+  projectPath: '/tmp/alpha',
+  status: 'working',
+  lastActivity: new Date().toISOString(),
+  createdAt: new Date().toISOString(),
+  source: 'managed',
+}
+
+beforeEach(() => {
+  TerminalMock.instances = []
+  FitAddonMock.instances = []
+  WebglAddonMock.instances = []
+  useSettingsStore.setState({ shortcutModifier: 'auto' })
+
+  globalAny.window = {
+    setTimeout: ((callback: () => void) => {
+      callback()
+      return 1 as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout,
+    clearTimeout: (() => {}) as typeof clearTimeout,
+    setInterval: (() => 1 as unknown as ReturnType<typeof setInterval>) as unknown as typeof setInterval,
+    clearInterval: (() => {}) as typeof clearInterval,
+    matchMedia: () => ({
+      matches: false,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+    }),
+    getSelection: () => ({ isCollapsed: true }),
+    getComputedStyle: () => ({
+      getPropertyValue: (name: string) => name === '--xterm-cell-height' ? '10px' : '',
+    }),
+    requestAnimationFrame: ((callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    }) as typeof requestAnimationFrame,
+    cancelAnimationFrame: (() => {}) as typeof cancelAnimationFrame,
+    devicePixelRatio: 1,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  } as unknown as Window & typeof globalThis
+
+  // Mock requestAnimationFrame to execute callback synchronously
+  globalAny.requestAnimationFrame = (callback: FrameRequestCallback) => {
+    callback(0)
+    return 1
+  }
+  globalAny.cancelAnimationFrame = () => {}
+
+  globalAny.document = {
+    fonts: { ready: Promise.resolve() },
+    visibilityState: 'visible',
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  } as unknown as Document
+
+  globalAny.ResizeObserver = class ResizeObserverMock {
+    private callback: ResizeObserverCallback
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback
+    }
+    observe() {
+      this.callback([], this as unknown as ResizeObserver)
+    }
+    unobserve() {}
+    disconnect() {}
+  }
+})
+
+afterEach(() => {
+  jest.useRealTimers()
+  globalAny.window = originalWindow
+  globalAny.document = originalDocument
+  globalAny.navigator = originalNavigator
+  globalAny.ResizeObserver = originalResizeObserver
+})
+
+describe('forceTextPresentation', () => {
+  test('returns input when no emoji substitutions needed', () => {
+    expect(forceTextPresentation('hello')).toBe('hello')
+  })
+
+  test('inserts text presentation selector for emoji-like chars', () => {
+    const result = forceTextPresentation(`x\u23FAy`)
+    expect(result).toBe(`x\u23FA\uFE0Ey`)
+  })
+})
+
+describe('sanitizeLink', () => {
+  test('strips trailing punctuation and unmatched brackets', () => {
+    expect(sanitizeLink('https://github.com/tmux-plugins/tmux-resurrect))')).toBe(
+      'https://github.com/tmux-plugins/tmux-resurrect'
+    )
+    expect(sanitizeLink('https://example.com/path).')).toBe('https://example.com/path')
+  })
+
+  test('preserves balanced brackets', () => {
+    expect(sanitizeLink('https://en.wikipedia.org/wiki/Foo_(bar)')).toBe(
+      'https://en.wikipedia.org/wiki/Foo_(bar)'
+    )
+  })
+})
+
+describe('useTerminal', () => {
+  test('leaves PTY line-feed semantics unchanged in xterm', async () => {
+    const { container } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    expect(TerminalMock.instances[0]?.options.convertEol).toBe(false)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('lets configured modifier digit shortcuts bypass xterm', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+    } as unknown as Navigator
+    const { container } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    expect(terminal?.emitKey({
+      key: '2',
+      code: 'Digit2',
+      type: 'keydown',
+      ctrlKey: true,
+      altKey: true,
+    })).toBe(false)
+    expect(terminal?.emitKey({ key: '2', code: 'Digit2', type: 'keydown' })).toBe(true)
+    expect(terminal?.emitKey({
+      key: '2',
+      code: 'Digit2',
+      type: 'keydown',
+      ctrlKey: true,
+    })).toBe(true)
+
+    useSettingsStore.setState({ shortcutModifier: 'cmd-shift' })
+    expect(terminal?.emitKey({
+      key: '3',
+      code: 'Digit3',
+      type: 'keydown',
+      metaKey: true,
+      shiftKey: true,
+    })).toBe(false)
+    expect(terminal?.emitKey({
+      key: '3',
+      code: 'Digit3',
+      type: 'keyup',
+      metaKey: true,
+      shiftKey: true,
+    })).toBe(true)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('attaches, forwards input/output, and handles key events', () => {
+    const clipboardWrites: string[] = []
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: (text: string) => {
+          clipboardWrites.push(text)
+          return Promise.resolve()
+        },
+      },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const scrollStates: boolean[] = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+          onScrollChange={(isAtBottom) => scrollStates.push(isAtBottom)}
+        />,
+        {
+          createNodeMock: () => container,
+        }
+      )
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) {
+      throw new Error('Expected terminal instance')
+    }
+
+    act(() => {
+      listeners[0]?.({ type: 'terminal-ready', sessionId: 'session-1' })
+    })
+
+    act(() => {
+      terminal.emitData('ls')
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: 'ls',
+    })
+
+    terminal.selection = 'copy-me'
+    const handledCopy = terminal.emitKey({
+      key: 'c',
+      type: 'keydown',
+      ctrlKey: true,
+    })
+
+    expect(handledCopy).toBe(false)
+    expect(clipboardWrites).toEqual(['copy-me'])
+
+    terminal.emitKey({ key: 'Backspace', type: 'keydown', ctrlKey: true })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x17',
+    })
+
+    act(() => {
+      listeners[0]?.({
+        type: 'terminal-output',
+        sessionId: 'session-1',
+        data: `x\u23FAy`,
+      })
+    })
+
+    expect(terminal.writes).toEqual([`x\u23FAy`])
+
+    terminal.selection = ''
+
+    act(() => {
+      terminal.emitWheel({ deltaY: -30 } as WheelEvent)
+    })
+
+    expect(scrollStates).toContain(false)
+
+    act(() => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={14}
+          onScrollChange={(isAtBottom) => scrollStates.push(isAtBottom)}
+        />
+      )
+    })
+
+    expect(terminal.options.fontSize).toBe(14)
+    expect(sendCalls.some((call) => call.type === 'terminal-resize')).toBe(true)
+  })
+
+  test('adds text presentation selectors to output on iOS only', async () => {
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    await act(async () => {
+      TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+          onScrollChange={() => {}}
+        />,
+        {
+          createNodeMock: () => container,
+        }
+      )
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) {
+      throw new Error('Expected terminal instance')
+    }
+
+    act(() => {
+      listeners[0]?.({
+        type: 'terminal-output',
+        sessionId: 'session-1',
+        data: `x\u23FAy`,
+      })
+    })
+
+    expect(terminal.writes).toEqual([`x\u23FA\uFE0Ey`])
+  })
+
+  test('buffers split escape sequences across output chunks without injecting sync markers', async () => {
+    const pendingTimers = new Map<number, { callback: () => void; delay: number }>()
+    let nextTimerId = 1
+    globalAny.window = {
+      setTimeout: ((callback: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.set(id, { callback, delay: delay ?? 0 })
+        return id as unknown as ReturnType<typeof setTimeout>
+      }) as typeof setTimeout,
+      clearTimeout: ((id: ReturnType<typeof setTimeout>) => {
+        pendingTimers.delete(id as unknown as number)
+      }) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Window & typeof globalThis
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    act(() => {
+      listeners[0]?.({
+        type: 'terminal-output',
+        sessionId: 'session-1',
+        data: '\x1b[31',
+      })
+      listeners[0]?.({
+        type: 'terminal-output',
+        sessionId: 'session-1',
+        data: 'mHELLO\x1b[0m',
+      })
+    })
+
+    const idleFlushTimer = [...pendingTimers.values()].find(timer => timer.delay === 2)
+    expect(idleFlushTimer).toBeDefined()
+
+    act(() => {
+      idleFlushTimer?.callback()
+    })
+
+    expect(terminal.writes).toEqual(['\x1b[31mHELLO\x1b[0m'])
+    expect(terminal.writes[0]?.includes('\x1b[?2026')).toBe(false)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('detaches previous session and cleans up on unmount', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        {
+          createNodeMock: () => container,
+        }
+      )
+      // Wait for document.fonts.ready promise to resolve
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    act(() => {
+      listeners.forEach((listener) => listener({
+        type: 'terminal-ready',
+        sessionId: 'session-1',
+      }))
+      terminal.emitData('before-switch')
+    })
+
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-2"
+          tmuxTarget="agentboard:@2"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />
+      )
+      await Promise.resolve()
+    })
+
+    act(() => {
+      terminal.emitData('during-switch')
+    })
+
+    expect(sendCalls).not.toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: 'during-switch',
+    })
+    expect(sendCalls).not.toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-2',
+      data: 'during-switch',
+    })
+
+    act(() => {
+      listeners.forEach((listener) => listener({
+        type: 'terminal-ready',
+        sessionId: 'session-2',
+      }))
+      terminal.emitData('after-ready')
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-2',
+      data: 'after-ready',
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-detach',
+      sessionId: 'session-1',
+    })
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-attach',
+      sessionId: 'session-2',
+      tmuxTarget: 'agentboard:@2',
+      cols: 80,
+      rows: 24,
+    })
+
+    act(() => {
+      renderer.unmount()
+    })
+
+    const webglAddon = WebglAddonMock.instances[0]
+
+    expect(terminal?.disposed).toBe(true)
+    expect(webglAddon?.disposed).toBe(true)
+    expect(container.innerHTML).toBe('')
+  })
+
+  test('disposes WebGL addon on context loss and clears it for future toggles', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          useWebGL
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const firstWebglAddon = WebglAddonMock.instances[0]
+    if (!firstWebglAddon) throw new Error('Expected initial WebGL addon')
+
+    act(() => {
+      firstWebglAddon.emitContextLoss()
+    })
+    expect(firstWebglAddon.disposed).toBe(true)
+    expect(firstWebglAddon.disposeCalls).toBe(1)
+
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          useWebGL={false}
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+    expect(firstWebglAddon.disposeCalls).toBe(1)
+
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          useWebGL
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+
+    expect(WebglAddonMock.instances.length).toBe(2)
+    expect(WebglAddonMock.instances[1]).not.toBe(firstWebglAddon)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('reattaches active session after websocket reconnect', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          connectionStatus="connected"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        {
+          createNodeMock: () => container,
+        }
+      )
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          connectionStatus="reconnecting"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />
+      )
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          connectionStatus="connected"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />
+      )
+      await Promise.resolve()
+    })
+
+    const attachCalls = sendCalls.filter((call) => call.type === 'terminal-attach')
+    expect(attachCalls).toHaveLength(2)
+    expect(attachCalls[1]).toEqual({
+      type: 'terminal-attach',
+      sessionId: 'session-1',
+      tmuxTarget: 'agentboard:@1',
+      cols: 80,
+      rows: 24,
+    })
+  })
+
+  test('reattaches active session when connection epoch changes while connected', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          connectionStatus="connected"
+          connectionEpoch={1}
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        {
+          createNodeMock: () => container,
+        }
+      )
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          connectionStatus="connected"
+          connectionEpoch={2}
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />
+      )
+      await Promise.resolve()
+    })
+
+    const attachCalls = sendCalls.filter((call) => call.type === 'terminal-attach')
+    expect(attachCalls).toHaveLength(2)
+    expect(attachCalls[1]).toEqual({
+      type: 'terminal-attach',
+      sessionId: 'session-1',
+      tmuxTarget: 'agentboard:@1',
+      cols: 80,
+      rows: 24,
+    })
+  })
+
+  test('rapid epoch changes produce only one terminal-attach (debounce)', async () => {
+    // Use deferred timers so we can control when the debounce fires
+    const pendingTimers = new Map<number, { callback: () => void; delay: number }>()
+    let nextTimerId = 1
+    globalAny.window = {
+      setTimeout: ((callback: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.set(id, { callback, delay: delay ?? 0 })
+        return id as unknown as ReturnType<typeof setTimeout>
+      }) as typeof setTimeout,
+      clearTimeout: ((id: ReturnType<typeof setTimeout>) => {
+        pendingTimers.delete(id as unknown as number)
+      }) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Window & typeof globalThis
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    // Initial render with epoch=1
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          connectionStatus="connected"
+          connectionEpoch={1}
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    // Fire all pending timers (initial attach debounce)
+    for (const [id, timer] of pendingTimers) {
+      timer.callback()
+      pendingTimers.delete(id)
+    }
+
+    const initialAttaches = sendCalls.filter((c) => c.type === 'terminal-attach')
+    expect(initialAttaches).toHaveLength(1)
+
+    // Clear for the reconnect test
+    sendCalls.length = 0
+
+    // Rapid epoch changes: 1 → 2 → 3 (simulating double onopen)
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          connectionStatus="connected"
+          connectionEpoch={2}
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          connectionStatus="connected"
+          connectionEpoch={3}
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+
+    // Before timers fire, no attach should have been sent
+    const attachesBeforeTimer = sendCalls.filter((c) => c.type === 'terminal-attach')
+    expect(attachesBeforeTimer).toHaveLength(0)
+
+    // Fire all pending timers — only the LAST debounced attach should fire
+    for (const [id, timer] of pendingTimers) {
+      timer.callback()
+      pendingTimers.delete(id)
+    }
+
+    const attachesAfterTimer = sendCalls.filter((c) => c.type === 'terminal-attach')
+    // Debounce should have collapsed epoch=2 and epoch=3 into ONE attach
+    expect(attachesAfterTimer).toHaveLength(1)
+    expect(attachesAfterTimer[0]).toEqual({
+      type: 'terminal-attach',
+      sessionId: 'session-1',
+      tmuxTarget: 'agentboard:@1',
+      cols: 80,
+      rows: 24,
+    })
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('does not auto-scroll on attach and focuses when terminal-ready arrives', async () => {
+    const pendingTimers = new Map<number, { callback: () => void; delay: number }>()
+    let nextTimerId = 1
+    globalAny.window = {
+      setTimeout: ((callback: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.set(id, { callback, delay: delay ?? 0 })
+        return id as unknown as ReturnType<typeof setTimeout>
+      }) as typeof setTimeout,
+      clearTimeout: ((id: ReturnType<typeof setTimeout>) => {
+        pendingTimers.delete(id as unknown as number)
+      }) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Window & typeof globalThis
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    await act(async () => {
+      TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          connectionStatus="connected"
+          connectionEpoch={1}
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) {
+      throw new Error('Expected terminal instance')
+    }
+
+    const runAllTimers = () => {
+      while (pendingTimers.size > 0) {
+        const timers = [...pendingTimers.entries()]
+        pendingTimers.clear()
+        for (const [, timer] of timers) {
+          timer.callback()
+        }
+      }
+    }
+
+    runAllTimers()
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-attach',
+      sessionId: 'session-1',
+      tmuxTarget: 'agentboard:@1',
+      cols: 80,
+      rows: 24,
+    })
+    expect(terminal.scrollCalls).toBe(0)
+    expect(terminal.focusCalls).toBe(0)
+
+    act(() => {
+      listeners[0]?.({ type: 'terminal-ready', sessionId: 'session-1' })
+    })
+
+    expect(terminal.scrollCalls).toBe(0)
+    expect(terminal.focusCalls).toBe(1)
+  })
+
+  test('emits the pending dropped-output aggregate on unmount', async () => {
+    const originalFetch = globalThis.fetch
+    const dropLogs: Array<{ drops: number; bytes: number }> = []
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      if (url === '/api/client-log' && typeof init?.body === 'string') {
+        const body = JSON.parse(init.body) as {
+          event: string
+          data: { drops: number; bytes: number }
+        }
+        if (body.event === 'terminal_output_dropped') dropLogs.push(body.data)
+      }
+      return new Response(null, { status: 204 })
+    }) as unknown as typeof fetch
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+    try {
+      await act(async () => {
+        renderer = TestRenderer.create(
+          <TerminalHarness
+            sessionId="session-1"
+            tmuxTarget="agentboard:@1"
+            sendMessage={() => {}}
+            subscribe={(listener) => {
+              listeners.push(listener)
+              return () => {}
+            }}
+            theme={{ background: '#000' }}
+            fontSize={12}
+          />,
+          { createNodeMock: () => container }
+        )
+        await Promise.resolve()
+      })
+
+      // Output for a session we are not attached to is dropped. The first
+      // drop may emit immediately; the rest wait on the 1s aggregation timer.
+      act(() => {
+        for (const data of ['aa', 'bbb', 'cccc']) {
+          listeners.forEach((listener) =>
+            listener({ type: 'terminal-output', sessionId: 'other-session', data })
+          )
+        }
+      })
+      const sum = () =>
+        dropLogs.reduce(
+          (acc, log) => ({ drops: acc.drops + log.drops, bytes: acc.bytes + log.bytes }),
+          { drops: 0, bytes: 0 }
+        )
+      expect(sum().drops).toBeLessThan(3)
+
+      act(() => {
+        renderer.unmount()
+      })
+
+      expect(sum()).toEqual({ drops: 3, bytes: 9 })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test.each(['MacIntel', 'Win32'])('browser file paste on %s uploads without reading the host clipboard', async (platform) => {
+    globalAny.navigator = { platform, userAgent: 'Chrome', maxTouchPoints: 0 } as Navigator
+    const originalFetch = globalThis.fetch
+    const requests: unknown[] = []
+    globalThis.fetch = (async (url: unknown) => { if (url !== '/api/client-log') requests.push(url); throw new Error('Unexpected host lookup') }) as unknown as typeof fetch
+    const drafts: Array<{text: string; files: File[]}> = []
+    const errors: string[] = []
+    const sent: unknown[] = []
+    const {container, dispatchEvent} = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+    try {
+      await act(async () => { renderer = TestRenderer.create(
+        <TerminalHarness sessionId="session-1" tmuxTarget="agentboard:@1" theme={{}} fontSize={12}
+          sendMessage={(message) => sent.push(message)} subscribe={subscribeReadyTerminal}
+          onPasteFiles={(draft) => drafts.push(draft)} onPasteError={message => errors.push(message)} />,
+        {createNodeMock: () => container},
+      ) })
+      const file = new File(['real document bytes'], 'report.docx')
+      act(() => {
+        expect(TerminalMock.instances[0]!.emitKey({key:'v',type:'keydown',metaKey:platform==='MacIntel',ctrlKey:platform!=='MacIntel'})).toBe(platform === 'MacIntel')
+        dispatchEvent('paste', {preventDefault() {}, stopPropagation() {}, clipboardData: {files:[file],getData:()=>'report.docx'}})
+      })
+      await act(async () => { await Promise.resolve() })
+      expect(drafts).toEqual([{text:'',files:[file]}])
+      expect(requests).toEqual([])
+      expect(sent.filter((message: any) => ['terminal-paste', 'terminal-input'].includes(message.type))).toEqual([])
+      // An opaque remote clipboard must never fall back to the host clipboard.
+      act(() => {
+        TerminalMock.instances[0]!.emitKey({key:'v',type:'keydown',metaKey:platform==='MacIntel',ctrlKey:platform!=='MacIntel'})
+        dispatchEvent('paste', {preventDefault() {}, stopPropagation() {}, clipboardData: {files:[],types:['Files'],getData:()=>'report.docx'}})
+      })
+      await act(async () => { await Promise.resolve() })
+      expect(errors).toEqual(['The browser did not provide file data. Drop the file onto the terminal or choose it to upload.'])
+      expect(requests).toEqual([])
+    } finally {
+      act(() => { renderer?.unmount() })
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('Cmd+V triggers paste via capture-phase listener', async () => {
+    jest.useFakeTimers()
+    const originalFetch = globalThis.fetch
+    const clipboardLookup = mock(() => {})
+    // Mock fetch so /api/clipboard-file-path returns no file path (normal paste flow)
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        clipboardLookup()
+        return { ok: true, json: async () => ({ path: null }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve('fallback-text'),
+      },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        {
+          createNodeMock: () => container,
+        },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    // Emit Cmd+V keydown (metaKey=true on macOS)
+    const result = terminal.emitKey({
+      key: 'v',
+      type: 'keydown',
+      metaKey: true,
+      ctrlKey: false,
+    })
+    // Key handler should return false to swallow the event
+    expect(result).toBe(false)
+
+    // Simulate the browser paste event that follows Cmd+V.
+    // The hook's capture-phase listener grabs clipboardData text.
+    const pasteEvent = {
+      type: 'paste',
+      preventDefault: mock(() => {}),
+      stopPropagation: mock(() => {}),
+      clipboardData: { getData: () => 'pasted-text' },
+    }
+    dispatchEvent('paste', pasteEvent)
+
+    // Advance past the 100ms paste timeout and flush the async paste handler
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    // Pasted text is delivered as an explicit terminal-paste message (bracketed
+    // server-side via tmux), NOT via terminal.paste() — which would only bracket
+    // when the browser's own bracketedPasteMode is on, and otherwise auto-submit.
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-paste',
+      sessionId: 'session-1',
+      data: 'pasted-text',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+    expect(clipboardLookup).not.toHaveBeenCalled()
+    // The capture-phase listener should have prevented the default to block ClipboardAddon
+    expect(pasteEvent.preventDefault).toHaveBeenCalled()
+    expect(pasteEvent.stopPropagation).toHaveBeenCalled()
+
+    act(() => {
+      renderer.unmount()
+    })
+
+    globalThis.fetch = originalFetch
+  })
+
+  test('Ctrl+V on macOS with a clipboard image sends a bracketed image path', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return { ok: true, json: async () => ({ path: '/tmp/shot.png', isImage: true }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        {
+          createNodeMock: () => container,
+        },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    // Ctrl+V on macOS (ctrlKey=true, metaKey=false) is the dedicated image-paste
+    // shortcut. There's no browser paste event, so the server resolves the path.
+    const result = terminal.emitKey({
+      key: 'v',
+      type: 'keydown',
+      ctrlKey: true,
+      metaKey: false,
+    })
+
+    // Should return false (swallowed because session is attached)
+    expect(result).toBe(false)
+    // Flush the async pasteboard lookup
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    // Should deliver the resolved image path inside bracketed-paste markers so
+    // Claude attaches it natively ([Image #N]) in both renderers.
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[200~/tmp/shot.png\x1b[201~',
+    })
+    // Should NOT have called terminal.paste() — that path depends on bracketedPasteMode
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => {
+      renderer.unmount()
+    })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Ctrl+V on macOS with no clipboard image falls back to empty bracket paste', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return { ok: true, json: async () => ({ path: null }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        {
+          createNodeMock: () => container,
+        },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    const result = terminal.emitKey({
+      key: 'v',
+      type: 'keydown',
+      ctrlKey: true,
+      metaKey: false,
+    })
+
+    expect(result).toBe(false)
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[200~\x1b[201~',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => {
+      renderer.unmount()
+    })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Ctrl+V on macOS sends literal Ctrl+V for Codex image paste', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          agentType="codex"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        {
+          createNodeMock: () => container,
+        },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    const result = terminal.emitKey({
+      key: 'v',
+      type: 'keydown',
+      ctrlKey: true,
+      metaKey: false,
+    })
+
+    expect(result).toBe(false)
+    // Codex short-circuits to a literal Ctrl+V byte (its own native paste path),
+    // resolved on a microtask — flush before asserting.
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x16',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('Ctrl+V while in tmux copy-mode exits copy-mode first', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return { ok: true, json: async () => ({ path: null }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener); listener({ type: 'terminal-ready', sessionId: 'session-1' })
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        {
+          createNodeMock: () => container,
+        },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    // Put the hook into copy-mode via server message
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: true,
+      })
+    })
+
+    sendCalls.length = 0 // Clear prior messages
+
+    // Ctrl+V while in copy-mode
+    terminal.emitKey({
+      key: 'v',
+      type: 'keydown',
+      ctrlKey: true,
+      metaKey: false,
+    })
+
+    // cancel-copy-mode is sent synchronously, before the async paste resolves.
+    expect(sendCalls[0]).toEqual({
+      type: 'tmux-cancel-copy-mode',
+      sessionId: 'session-1',
+    })
+    // Flush the async pasteboard lookup; with no image it falls back to empty bracket.
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    expect(sendCalls[1]).toEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[200~\x1b[201~',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => {
+      renderer.unmount()
+    })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V text paste while in tmux copy-mode exits copy-mode before pasting', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener); listener({ type: 'terminal-ready', sessionId: 'session-1' })
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    // Enter copy-mode via server status, then paste multi-line text.
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: true,
+      })
+    })
+    sendCalls.length = 0
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: mock(() => {}),
+      stopPropagation: mock(() => {}),
+      clipboardData: { getData: () => 'line-a\nline-b' },
+    })
+    await act(async () => { jest.advanceTimersByTime(100) })
+
+    // copy-mode must be cancelled BEFORE the paste is delivered, otherwise the
+    // paste-buffer lands in copy-mode and never reaches the program.
+    const cancelIdx = sendCalls.findIndex((c) => c.type === 'tmux-cancel-copy-mode')
+    const pasteIdx = sendCalls.findIndex((c) => c.type === 'terminal-paste')
+    expect(cancelIdx).toBeGreaterThanOrEqual(0)
+    expect(pasteIdx).toBeGreaterThan(cancelIdx)
+    expect(sendCalls[pasteIdx]).toEqual({
+      type: 'terminal-paste',
+      sessionId: 'session-1',
+      data: 'line-a\nline-b',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => {
+      renderer.unmount()
+    })
+    jest.useRealTimers()
+  })
+
+  test('appMouse=true scroll-up forwards wheel without disabling mouse tracking or entering copy-mode', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener); listener({ type: 'terminal-ready', sessionId: 'session-1' })
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: true,
+      })
+    })
+
+    expect(terminal.writes).toContain('\x1b[?1000h\x1b[?1002h\x1b[?1006h')
+    terminal.writes.length = 0
+    sendCalls.length = 0
+
+    act(() => {
+      terminal.emitWheel({ deltaY: -30, target: container } as unknown as WheelEvent)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[<64;40;12M',
+    })
+    expect(sendCalls.some((call) => call.type === 'tmux-check-copy-mode')).toBe(false)
+    expect(sendCalls.some((call) => call.type === 'tmux-cancel-copy-mode')).toBe(false)
+    expect(terminal.writes.some((write) => write.includes('\x1b[?1000l'))).toBe(false)
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: true,
+        wheelBounds: { firstCol: 12, firstRow: 1, lastCol: 20, lastRow: 8 },
+      })
+      terminal.emitWheel({ deltaY: -30, clientX: 140, clientY: 35, target: container } as unknown as WheelEvent)
+    })
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[<64;15;4M',
+    })
+
+    act(() => {
+      terminal.emitData('x')
+    })
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: 'x',
+    })
+    expect(sendCalls.some((call) => call.type === 'tmux-cancel-copy-mode')).toBe(false)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('appMouse=true after a scroll re-enables tracking and forwards mouse SGR onData', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener); listener({ type: 'terminal-ready', sessionId: 'session-1' })
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    act(() => {
+      terminal.emitWheel({ deltaY: -30, target: container } as unknown as WheelEvent)
+    })
+    expect(terminal.writes).toContain('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l')
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: true,
+      })
+    })
+    expect(terminal.writes).toContain('\x1b[?1000h\x1b[?1002h\x1b[?1006h')
+
+    sendCalls.length = 0
+    act(() => {
+      terminal.emitData('\x1b[<0;10;5M')
+    })
+
+    expect(sendCalls).toEqual([{
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[<0;10;5M',
+    }])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('appMouse false-to-true status reasserts xterm mouse tracking', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+    } as unknown as Navigator
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: false,
+      })
+    })
+    expect(terminal.writes).not.toContain('\x1b[?1000h\x1b[?1002h\x1b[?1006h')
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: true,
+      })
+    })
+    expect(terminal.writes).toContain('\x1b[?1000h\x1b[?1002h\x1b[?1006h')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('mouse-app to mouse-app session switch re-enables tracking after terminal reset', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const subscribe = (listener: (message: ServerMessage) => void) => {
+      listeners.push(listener)
+      return () => {}
+    }
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribe}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+    const listener = () => listeners[listeners.length - 1]
+
+    act(() => {
+      listener()?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: true,
+      })
+    })
+    expect(terminal.writes).toContain('\x1b[?1000h\x1b[?1002h\x1b[?1006h')
+
+    // When the mode is already synced, the poll must NOT re-emit the DECSET:
+    // every write fires xterm's onProtocolChange even for a same-value set,
+    // and that handler clears any in-progress selection.
+    terminal.writes.length = 0
+    act(() => {
+      listener()?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: true,
+      })
+    })
+    // eslint-disable-next-line no-control-regex
+    const mouseModeWrite = /\x1b\[\?(9|1000|1002|1003|1006)[hl]/
+    expect(terminal.writes.some((w) => mouseModeWrite.test(w))).toBe(false)
+
+    // Switch to session-2, whose pane also reports mouse_any_flag=1.
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-2"
+          tmuxTarget="agentboard:@2"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribe}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+
+    // terminal-ready with empty output buffer executes the deferred reset,
+    // which clears xterm's DECSET mouse modes.
+    act(() => {
+      listener()?.({ type: 'terminal-ready', sessionId: 'session-2' })
+    })
+    expect(terminal.resetCalls).toBeGreaterThan(0)
+
+    // appMouse stays true across the switch (no false transition), but tracking
+    // must still be re-enabled — otherwise drags become DOM selections and the
+    // pane never receives mouse input.
+    terminal.writes.length = 0
+    act(() => {
+      listener()?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-2',
+        inCopyMode: false,
+        appMouse: true,
+      })
+    })
+    expect(terminal.writes).toContain('\x1b[?1000h\x1b[?1002h\x1b[?1006h')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('pane-output mouse-mode sequences are stripped, including across chunk boundaries', async () => {
+    const pendingTimers = new Map<number, { callback: () => void; delay: number }>()
+    let nextTimerId = 1
+    globalAny.window = {
+      setTimeout: ((callback: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.set(id, { callback, delay: delay ?? 0 })
+        return id as unknown as ReturnType<typeof setTimeout>
+      }) as typeof setTimeout,
+      clearTimeout: ((id: ReturnType<typeof setTimeout>) => {
+        pendingTimers.delete(id as unknown as number)
+      }) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Window & typeof globalThis
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+    const flushIdle = () => {
+      const timer = [...pendingTimers.values()].find((t) => t.delay === 2)
+      timer?.callback()
+    }
+    const output = (data: string) =>
+      listeners[0]?.({ type: 'terminal-output', sessionId: 'session-1', data })
+
+    // Mount may replay a cached snapshot (module-level cache shared across
+    // tests) — only care about pane output writes from here on.
+    terminal.writes.length = 0
+
+    // tmux client redraws emit a DECRST burst (?1006l ?1000l ?1002l ?1003l);
+    // pane apps emit their own DECSET enables. All must be stripped so they
+    // can't fire xterm's onProtocolChange → clearSelection.
+    act(() => {
+      output('A\x1b[?7727h\x1b[?12l\x1b[?25h\x1b[?1006l\x1b[?1000l\x1b[?1002l\x1b[?1003lB')
+      flushIdle()
+    })
+    expect(terminal.writes[0]).toBe('A\x1b[?7727h\x1b[?12l\x1b[?25hB')
+    expect(terminal.modes.mouseTrackingMode).toBe('none')
+
+    // A sequence split across ws frames is held in the tail and still caught.
+    act(() => {
+      output('C\x1b[?10')
+      flushIdle()
+      output('02hD')
+      flushIdle()
+    })
+    expect(terminal.writes[1]).toBe('C')
+    expect(terminal.writes[2]).toBe('D')
+    expect(terminal.modes.mouseTrackingMode).toBe('none')
+
+    // Combined params keep non-mouse modes, drop only mouse ones.
+    act(() => {
+      output('E\x1b[?2004;1006hF')
+      flushIdle()
+    })
+    expect(terminal.writes[3]).toBe('E\x1b[?2004hF')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('appMouse true→false status disables xterm mouse tracking once', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+    const status = (appMouse: boolean) =>
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse,
+      })
+
+    // Pane enables mouse reporting → tracking installed.
+    act(() => status(true))
+    expect(terminal.modes.mouseTrackingMode).toBe('drag')
+
+    // Pane exits mouse reporting → pane output can no longer carry the DECRST
+    // (stripped), so the poll writes the disable itself — once.
+    terminal.writes.length = 0
+    act(() => status(false))
+    expect(terminal.writes).toContain('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l')
+    expect(terminal.modes.mouseTrackingMode).toBe('none')
+
+    terminal.writes.length = 0
+    act(() => status(false))
+    // eslint-disable-next-line no-control-regex
+    const mouseModeWrite = /\x1b\[\?(9|1000|1002|1003|1006)[hl]/
+    expect(terminal.writes.some((w) => mouseModeWrite.test(w))).toBe(false)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('actual copy-mode stays authoritative when the pane also reports app mouse', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener); listener({ type: 'terminal-ready', sessionId: 'session-1' })
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: true,
+        appMouse: true,
+      })
+    })
+
+    expect(renderer.root.findByType('div').props['data-copy-mode']).toBe('true')
+    expect(terminal.writes).toContain('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l')
+
+    sendCalls.length = 0
+    act(() => {
+      terminal.emitData('x')
+    })
+
+    expect(sendCalls).toEqual([
+      { type: 'tmux-cancel-copy-mode', sessionId: 'session-1' },
+      { type: 'terminal-input', sessionId: 'session-1', data: 'x' },
+    ])
+    expect(renderer.root.findByType('div').props['data-copy-mode']).toBe('false')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('appMouse=false keeps classic scroll-up copy-mode behavior', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener); listener({ type: 'terminal-ready', sessionId: 'session-1' })
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: false,
+        wheelBounds: { firstCol: 12, firstRow: 1, lastCol: 20, lastRow: 8 },
+      })
+    })
+    terminal.writes.length = 0
+    sendCalls.length = 0
+
+    act(() => {
+      terminal.emitWheel({ deltaY: -30, target: container } as unknown as WheelEvent)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[<64;12;1M',
+    })
+    expect(sendCalls).toContainEqual({
+      type: 'tmux-check-copy-mode',
+      sessionId: 'session-1',
+    })
+    expect(terminal.writes).toContain('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l')
+
+    sendCalls.length = 0
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: false,
+        wheelBounds: null,
+      })
+      terminal.emitWheel({ deltaY: -30, target: container } as unknown as WheelEvent)
+    })
+    expect(sendCalls).toEqual([])
+    expect(renderer.root.findByType('div').props['data-copy-mode']).toBe('false')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('polls copy-mode status for the currently attached session', async () => {
+    const intervals = new Map<number, () => void>()
+    let nextIntervalId = 1
+    const originalSetInterval = globalThis.setInterval
+    const originalClearInterval = globalThis.clearInterval
+    globalThis.setInterval = ((callback: () => void) => {
+      const id = nextIntervalId++
+      intervals.set(id, callback)
+      return id as unknown as ReturnType<typeof setInterval>
+    }) as typeof setInterval
+    globalThis.clearInterval = ((id: ReturnType<typeof setInterval>) => {
+      intervals.delete(id as unknown as number)
+    }) as typeof clearInterval
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    sendCalls.length = 0
+    act(() => {
+      intervals.get(1)?.()
+    })
+
+    expect(sendCalls).toEqual([{
+      type: 'tmux-check-copy-mode',
+      sessionId: 'session-1',
+    }])
+
+    act(() => {
+      renderer.unmount()
+    })
+    expect(intervals.size).toBe(0)
+    globalThis.setInterval = originalSetInterval
+    globalThis.clearInterval = originalClearInterval
+  })
+
+  test('iOS appMouse=true tap emits SGR mouse press and release at tapped cell', async () => {
+    globalAny.window = {
+      ...globalAny.window,
+      matchMedia: () => ({
+        matches: true,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+      }),
+    } as unknown as Window & typeof globalThis
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+      vibrate: () => true,
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, dispatchEvent, textarea } = createContainerMock()
+    let preventDefaultCalls = 0
+    let stopPropagationCalls = 0
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalComponent
+          session={terminalSession}
+          sessions={[terminalSession]}
+          connectionStatus="connected"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: true,
+      })
+    })
+    sendCalls.length = 0
+
+    const touch = { clientX: 25, clientY: 25 } as Touch
+    act(() => {
+      dispatchEvent('touchstart', {
+        touches: [touch],
+      })
+      dispatchEvent('touchend', {
+        changedTouches: [touch],
+        preventDefault: () => { preventDefaultCalls += 1 },
+        stopPropagation: () => { stopPropagationCalls += 1 },
+      })
+    })
+
+    expect(sendCalls).toEqual([{
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[<0;3;3M\x1b[<0;3;3m',
+    }])
+    expect((textarea as HTMLTextAreaElement & { focusCalls: number }).focusCalls).toBe(1)
+    expect(preventDefaultCalls).toBe(1)
+    expect(stopPropagationCalls).toBe(1)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('iOS swipe uses the visible pane and cancels momentum on session switch', async () => {
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: async () => {}, readText: async () => '' },
+    } as unknown as Navigator
+    const { container, dispatchEvent } = createContainerMock()
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const nextSession = { ...terminalSession, id: 'session-2', tmuxWindow: 'agentboard:@2' }
+    const props = {
+      sessions: [terminalSession, nextSession],
+      connectionStatus: 'connected' as const,
+      sendMessage: (message: Record<string, unknown>) => { sendCalls.push(message) },
+      subscribe: (listener: (message: ServerMessage) => void) => {
+        listeners.push(listener)
+        return () => {}
+      },
+      onClose: () => {},
+      onSelectSession: () => {},
+      onNewSession: () => {},
+      onKillSession: () => {},
+      onRenameSession: () => {},
+      onResumeSession: () => {},
+      onOpenSettings: () => {},
+    }
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(<TerminalComponent {...props} session={terminalSession} />, {
+        createNodeMock: () => container,
+      })
+    })
+    act(() => {
+      listeners[0]?.({ type: 'terminal-ready', sessionId: terminalSession.id })
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: terminalSession.id,
+        inCopyMode: false,
+        appMouse: false,
+        wheelBounds: { firstCol: 12, firstRow: 3, lastCol: 20, lastRow: 8 },
+      })
+    })
+    const originalPerformance = globalThis.performance
+    const clock = { time: 1000 }
+    Object.defineProperty(globalThis, 'performance', { configurable: true, value: { now: () => clock.time } })
+    const scheduled: FrameRequestCallback[] = []
+    const cancelled: number[] = []
+    globalAny.requestAnimationFrame = callback => scheduled.push(callback)
+    globalAny.cancelAnimationFrame = id => { cancelled.push(id) }
+    const start = { clientX: 120, clientY: 100 }
+    const end = { clientX: 120, clientY: 140 }
+    const handled = { preventDefault: () => {}, stopPropagation: () => {} }
+    try {
+      act(() => { dispatchEvent('touchstart', { touches: [start] }) })
+      clock.time += 20
+      act(() => {
+        dispatchEvent('touchmove', { touches: [end], ...handled })
+        dispatchEvent('touchend', { changedTouches: [end], ...handled })
+      })
+      expect(sendCalls).toContainEqual({
+        type: 'terminal-input', sessionId: terminalSession.id, data: '\x1b[<64;12;3M',
+      })
+      expect(scheduled).toHaveLength(1)
+      await act(async () => { renderer.update(<TerminalComponent {...props} session={nextSession} />) })
+      expect(cancelled).toContain(1)
+    } finally {
+      Object.defineProperty(globalThis, 'performance', { configurable: true, value: originalPerformance })
+      act(() => { renderer.unmount() })
+    }
+  })
+
+  test('iOS appMouse=true long press drag emits SGR mouse selection events', async () => {
+    jest.useFakeTimers()
+    globalAny.window = {
+      ...globalAny.window,
+      matchMedia: () => ({
+        matches: true,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+      }),
+    } as unknown as Window & typeof globalThis
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+      vibrate: () => true,
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, dispatchEvent } = createContainerMock()
+    let preventDefaultCalls = 0
+    let stopPropagationCalls = 0
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalComponent
+          session={terminalSession}
+          sessions={[terminalSession]}
+          connectionStatus="connected"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: true,
+      })
+    })
+    sendCalls.length = 0
+
+    const startTouch = { clientX: 25, clientY: 25 } as Touch
+    const dragTouch = { clientX: 45, clientY: 35 } as Touch
+
+    act(() => {
+      dispatchEvent('touchstart', {
+        touches: [startTouch],
+      })
+    })
+    act(() => {
+      jest.advanceTimersByTime(350)
+    })
+    act(() => {
+      dispatchEvent('touchmove', {
+        touches: [dragTouch],
+        preventDefault: () => { preventDefaultCalls += 1 },
+        stopPropagation: () => { stopPropagationCalls += 1 },
+      })
+      dispatchEvent('touchend', {
+        changedTouches: [dragTouch],
+        preventDefault: () => { preventDefaultCalls += 1 },
+        stopPropagation: () => { stopPropagationCalls += 1 },
+      })
+    })
+
+    expect(sendCalls).toEqual([
+      {
+        type: 'terminal-input',
+        sessionId: 'session-1',
+        data: '\x1b[<0;3;3M',
+      },
+      {
+        type: 'terminal-input',
+        sessionId: 'session-1',
+        data: '\x1b[<32;5;4M',
+      },
+      {
+        type: 'terminal-input',
+        sessionId: 'session-1',
+        data: '\x1b[<0;5;4m',
+      },
+    ])
+    expect(preventDefaultCalls).toBe(2)
+    expect(stopPropagationCalls).toBe(2)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('iOS: native selection is handed to the app while it owns the mouse', async () => {
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+      vibrate: () => true,
+    } as unknown as Navigator
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, attributes } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            listener({ type: 'terminal-ready', sessionId: 'session-1' })
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const status = (appMouse: boolean, inCopyMode = false) => act(() => {
+      listeners[0]?.({ type: 'tmux-copy-mode-status', sessionId: 'session-1', inCopyMode, appMouse })
+    })
+
+    status(true)
+    expect(attributes.has('data-app-mouse')).toBe(true)
+    // tmux copy-mode takes the mouse back from the app: native selection returns.
+    status(true, true)
+    expect(attributes.has('data-app-mouse')).toBe(false)
+    status(true)
+    status(false)
+    expect(attributes.has('data-app-mouse')).toBe(false)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('iOS appMouse=true touchcancel releases a remote selection and disarms the long press', async () => {
+    jest.useFakeTimers()
+    globalAny.window = {
+      ...globalAny.window,
+      matchMedia: () => ({
+        matches: true,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+      }),
+    } as unknown as Window & typeof globalThis
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+      vibrate: () => true,
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalComponent
+          session={terminalSession}
+          sessions={[terminalSession]}
+          connectionStatus="connected"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: true,
+      })
+    })
+    sendCalls.length = 0
+
+    const startTouch = { clientX: 25, clientY: 25 } as Touch
+    const dragTouch = { clientX: 45, clientY: 35 } as Touch
+    const noop = { preventDefault: () => {}, stopPropagation: () => {} }
+
+    // Cancelled mid-drag: the app gets a release so its button is not left held.
+    act(() => { dispatchEvent('touchstart', { touches: [startTouch] }) })
+    act(() => { jest.advanceTimersByTime(350) })
+    act(() => {
+      dispatchEvent('touchmove', { touches: [dragTouch], ...noop })
+      dispatchEvent('touchcancel', { changedTouches: [dragTouch], ...noop })
+    })
+    expect(sendCalls.filter((call) => call.type === 'terminal-input').map((call) => call.data)).toEqual([
+      '\x1b[<0;3;3M',
+      '\x1b[<32;5;4M',
+      '\x1b[<0;5;4m',
+    ])
+
+    // A later move is a scroll again, not a drag of the cancelled selection.
+    sendCalls.length = 0
+    act(() => {
+      dispatchEvent('touchstart', { touches: [startTouch] })
+      dispatchEvent('touchcancel', { changedTouches: [startTouch], ...noop })
+    })
+    // Cancelled before the long press fired: the timer must not start a selection.
+    act(() => { jest.advanceTimersByTime(1000) })
+    expect(sendCalls.filter((call) => call.type === 'terminal-input')).toEqual([])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('iOS appMouse=false tap keeps existing focus-only behavior', async () => {
+    globalAny.window = {
+      ...globalAny.window,
+      matchMedia: () => ({
+        matches: true,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+      }),
+    } as unknown as Window & typeof globalThis
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+      vibrate: () => true,
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, dispatchEvent, textarea } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalComponent
+          session={terminalSession}
+          sessions={[terminalSession]}
+          connectionStatus="connected"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: 'session-1',
+        inCopyMode: false,
+        appMouse: false,
+      })
+    })
+    sendCalls.length = 0
+
+    const touch = { clientX: 25, clientY: 25 } as Touch
+    act(() => {
+      dispatchEvent('touchstart', {
+        touches: [touch],
+      })
+      dispatchEvent('touchend', {
+        changedTouches: [touch],
+        preventDefault: () => {},
+        stopPropagation: () => {},
+      })
+    })
+
+    expect(sendCalls.some((call) => call.type === 'terminal-input')).toBe(false)
+    expect((textarea as HTMLTextAreaElement & { focusCalls: number }).focusCalls).toBe(1)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('iOS PWA resume refocuses an interrupted terminal on the next touchstart', async () => {
+    const docListeners = new Map<string, Set<EventListener>>()
+    const winListeners = new Map<string, Set<EventListener>>()
+    let visibilityState: DocumentVisibilityState = 'visible'
+    let documentFocused = true
+    let activeElement: Element | null = null
+
+    globalAny.window = {
+      ...globalAny.window,
+      matchMedia: () => ({
+        matches: true,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+      }),
+      addEventListener(event: string, handler: EventListener) {
+        const set = winListeners.get(event) ?? new Set()
+        set.add(handler)
+        winListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        winListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Window & typeof globalThis
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      get visibilityState() { return visibilityState },
+      get activeElement() { return activeElement },
+      hasFocus: () => documentFocused,
+      addEventListener(event: string, handler: EventListener) {
+        const set = docListeners.get(event) ?? new Set()
+        set.add(handler)
+        docListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        docListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Document
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
+      vibrate: () => true,
+    } as unknown as Navigator
+
+    const { container, dispatchEvent, textarea } = createContainerMock()
+    const dispatchDocument = (event: string, value: Event) => {
+      for (const handler of docListeners.get(event) ?? []) handler(value)
+    }
+    const dispatchWindow = (event: string, value: Event) => {
+      for (const handler of winListeners.get(event) ?? []) handler(value)
+    }
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalComponent
+          session={terminalSession}
+          sessions={[terminalSession]}
+          connectionStatus="connected"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const touch = { clientX: 25, clientY: 25 } as Touch
+
+    // A foreground transition must not arm focus when the keyboard was already hidden.
+    act(() => {
+      visibilityState = 'hidden'
+      documentFocused = false
+      dispatchDocument('visibilitychange', new Event('visibilitychange'))
+      visibilityState = 'visible'
+      documentFocused = true
+      dispatchDocument('visibilitychange', new Event('visibilitychange'))
+      dispatchEvent('touchstart', { touches: [touch] })
+    })
+    expect(textarea.focusCalls).toBe(0)
+
+    // Focused terminal is interrupted by app backgrounding. The first trusted
+    // touchstart after resume restores it; a second touchstart does not refocus.
+    act(() => {
+      activeElement = textarea
+      dispatchDocument('focusin', { target: textarea } as unknown as FocusEvent)
+      dispatchWindow('blur', new Event('blur'))
+      visibilityState = 'hidden'
+      documentFocused = false
+      dispatchDocument('visibilitychange', new Event('visibilitychange'))
+      activeElement = null
+      dispatchDocument('focusout', { target: textarea } as unknown as FocusEvent)
+      visibilityState = 'visible'
+      documentFocused = true
+      dispatchDocument('visibilitychange', new Event('visibilitychange'))
+      dispatchWindow('focus', new Event('focus'))
+      dispatchEvent('touchstart', { touches: [touch] })
+    })
+    expect(textarea.focusCalls).toBe(1)
+
+    act(() => {
+      dispatchEvent('touchstart', { touches: [touch] })
+    })
+    expect(textarea.focusCalls).toBe(1)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('falls back to clipboard API when paste event never fires', async () => {
+    jest.useFakeTimers()
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return { ok: true, json: async () => ({ path: null }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve('clipboard-api-text'),
+      },
+    } as unknown as Navigator
+
+    const { container } = createContainerMock()
+    const sendCalls: Array<Record<string, unknown>> = []
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    // Emit Cmd+V but do NOT dispatch a paste event
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    // Trigger the 100ms paste timeout and flush the async clipboard fallback
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    // Should have fallen back to navigator.clipboard.readText() and delivered it
+    // as an explicit terminal-paste (bracketed server-side), not terminal.paste().
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-paste',
+      sessionId: 'session-1',
+      data: 'clipboard-api-text',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V with empty clipboard checks Finder file path on macOS', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return { ok: true, json: async () => ({ path: '/Users/test/file.txt' }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    // Emit Cmd+V
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    // Dispatch paste event with empty text (simulating Finder file copy)
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: { getData: () => '' },
+    })
+
+    // Advance past the paste timeout and flush the async fetch handler
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    // Should have sent the file path as terminal-input (not bracket paste)
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '/Users/test/file.txt ',
+    })
+    // Should NOT have called terminal.paste() since we used raw input
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V with non-image file metadata still sends Finder path on macOS', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return { ok: true, json: async () => ({ path: '/Users/test/report.pdf', isImage: false }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: {
+        files: [{ type: 'application/pdf' }],
+        items: [{ kind: 'file', type: 'application/pdf' }],
+        getData: () => '',
+      },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '/Users/test/report.pdf ',
+    })
+    expect(sendCalls).not.toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[200~\x1b[201~',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test.each([ ...(['claude', 'codex'] as const).flatMap((agentType) =>
+    ['report.docx', 'report.pdf', 'sheet.xlsx', 'slides.pptx', 'archive.zip', 'data.csv', 'script.py', 'custom.unknown', 'LICENSE']
+      .map((filename) => ({
+        agentType, filename, path: `/Users/test/${filename}`, expectedPath: `/Users/test/${filename}`,
+        metadata: { files: [{ type: '' }] }, copyMode: false,
+      }))
+  ),
+    { agentType: 'codex' as const, filename: 'types-only.docx', path: '/tmp/types-only.docx', expectedPath: '/tmp/types-only.docx', metadata: { types: ['Files'] }, copyMode: false },
+    { agentType: 'claude' as const, filename: 'items-only.docx', path: '/tmp/items-only.docx', expectedPath: '/tmp/items-only.docx', metadata: { items: [{ kind: 'file', type: '' }] }, copyMode: false },
+    { agentType: 'codex' as const, filename: 'unresolved.docx', path: null, expectedPath: null, metadata: { types: ['Files'] }, copyMode: false },
+    { agentType: 'claude' as const, filename: 'control-characters.docx', path: '/tmp/report\n\r\x1b\x7f.docx', expectedPath: '/tmp/report.docx', metadata: { types: ['Files'] }, copyMode: true },
+  ])('Cmd+V handles copied file $filename for $agentType', async ({ agentType, filename, path, expectedPath, metadata, copyMode }) => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return { ok: true, json: async () => ({ path, isImage: false }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          agentType={agentType}
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => { listeners.push(listener); listener({ type: 'terminal-ready', sessionId: 'session-1' }); return () => {} }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    if (copyMode) {
+      act(() => { listeners[0]?.({ type: 'tmux-copy-mode-status', sessionId: 'session-1', inCopyMode: true }) })
+    }
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: {
+        ...metadata,
+        getData: () => filename,
+      },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: expectedPath === null ? 'terminal-paste' : 'terminal-input',
+      sessionId: 'session-1',
+      data: expectedPath === null ? filename : expectedPath + ' ',
+    })
+    expect(sendCalls).not.toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[200~\x1b[201~',
+    })
+    expect(sendCalls.filter((message) => ['terminal-paste', 'terminal-input'].includes(String(message.type)))).toHaveLength(1)
+    if (copyMode) {
+      const cancelIndex = sendCalls.findIndex((message) => message.type === 'tmux-cancel-copy-mode')
+      expect(cancelIndex).toBeGreaterThanOrEqual(0)
+      expect(sendCalls.findIndex((message) => message.type === 'terminal-input')).toBeGreaterThan(cancelIndex)
+    }
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V with macOS clipboard image path sends a bracketed image path', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const imagePath = '/Users/test/Documents/Screenshots/CleanShot 2026-06-13 at 10.41.52@2x.png'
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return {
+          ok: true,
+          json: async () => ({ path: imagePath, isImage: true }),
+        } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: { getData: () => '' },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    // The resolved image path is delivered as a bracketed paste so Claude
+    // attaches it natively, instead of the old empty-bracket clipboard signal.
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: `\x1b[200~${imagePath}\x1b[201~`,
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V with macOS clipboard image path sends literal Ctrl+V for Codex', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/Users/test/Documents/Screenshots/CleanShot 2026-06-13 at 10.41.52@2x.png',
+            isImage: true,
+          }),
+        } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          agentType="codex"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: { getData: () => '' },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x16',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V image paste uses latest agent type after session switch', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/Users/test/Documents/Screenshots/paste.png',
+            isImage: true,
+          }),
+        } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          agentType="claude"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-2"
+          tmuxTarget="agentboard:@2"
+          agentType="codex"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    act(() => {
+      listeners.forEach((listener) => listener({
+        type: 'terminal-ready',
+        sessionId: 'session-2',
+      }))
+    })
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: { getData: () => '' },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-2',
+      data: '\x16',
+    })
+    expect(sendCalls).not.toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-2',
+      data: '\x1b[200~\x1b[201~',
+    })
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V with empty macOS clipboard and no Finder path sends empty bracket paste', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') {
+        return { ok: true, json: async () => ({ path: null }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: { getData: () => '' },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[200~\x1b[201~',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V with image clipboard metadata (no readable blob) resolves a pasteboard path', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const imagePath = '/tmp/agentboard-paste-abc.png'
+    const originalFetch = globalThis.fetch
+    const fetchCalls: string[] = []
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      fetchCalls.push(String(input))
+      if (String(input) === '/api/clipboard-file-path') {
+        return { ok: true, json: async () => ({ path: imagePath, isImage: true }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    // Image present only as metadata (no getAsFile) — the blob can't be read in
+    // the browser, so we fall back to a server-side pasteboard lookup.
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: {
+        files: { length: 1 },
+        items: [{ kind: 'file', type: 'image/png' }],
+        getData: () => '',
+      },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: `\x1b[200~${imagePath}\x1b[201~`,
+    })
+    expect(fetchCalls).toContain('/api/clipboard-file-path')
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V with a readable image blob uploads it and sends a bracketed path', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const uploadedPath = '/tmp/paste-123-abcdef.png'
+    const originalFetch = globalThis.fetch
+    const fetchCalls: string[] = []
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      fetchCalls.push(String(input))
+      if (String(input) === '/api/paste-image') {
+        return { ok: true, json: async () => ({ path: uploadedPath }) } as Response
+      }
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    // Real screenshot paste: the clipboard exposes a readable image File.
+    const blob = new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'image/png' })
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: {
+        files: [blob],
+        items: [{ kind: 'file', type: 'image/png', getAsFile: () => blob }],
+        getData: () => '',
+      },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    // The blob is uploaded and its stored path delivered as a bracketed paste.
+    expect(fetchCalls).toContain('/api/paste-image')
+    expect(fetchCalls).not.toContain('/api/clipboard-file-path')
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: `\x1b[200~${uploadedPath}\x1b[201~`,
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V with image clipboard metadata sends literal Ctrl+V for Codex', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const originalFetch = globalThis.fetch
+    const fetchCalls: string[] = []
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      fetchCalls.push(String(input))
+      return originalFetch(input)
+    }) as typeof fetch
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          agentType="codex"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: {
+        files: { length: 1 },
+        items: [{ kind: 'file', type: 'image/png' }],
+        getData: () => '',
+      },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x16',
+    })
+    expect(fetchCalls).not.toContain('/api/clipboard-file-path')
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+    globalThis.fetch = originalFetch
+  })
+
+  test('Cmd+V with macOS shared-pasteboard path sends empty bracket paste', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container, dispatchEvent } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={subscribeReadyTerminal}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    dispatchEvent('paste', {
+      type: 'paste',
+      preventDefault: () => {},
+      stopPropagation: () => {},
+      clipboardData: {
+        getData: () => '/Users/garybasin/Library/Group Containers/group.com.apple.coreservices.useractivityd/shared-pasteboard/items/88E743D0-B583-40F8-90DC-C25DF63BBFDF/CleanShot 2026-06-13 at 09.55.20.png',
+      },
+    })
+
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-input',
+      sessionId: 'session-1',
+      data: '\x1b[200~\x1b[201~',
+    })
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('Cmd+V does nothing when no session is attached', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve('some-text'),
+      },
+    } as unknown as Navigator
+
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId={null}
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    // Emit Cmd+V with no attached session
+    terminal.emitKey({ key: 'v', type: 'keydown', metaKey: true, ctrlKey: false })
+
+    // Advance past the paste timeout and flush any async operations
+    await act(async () => {
+      jest.advanceTimersByTime(100)
+    })
+
+    // Should not have pasted anything since no session is attached
+    expect(terminal.pasteCalls).toEqual([])
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('forces iOS compositor repaint on visibility resume', async () => {
+    // Use deferred timers to verify the 200ms delay behavior
+    const pendingTimers: Array<{ callback: () => void; delay: number; id: number }> = []
+    let nextTimerId = 100
+    globalAny.window = {
+      matchMedia: () => ({ matches: false }),
+      setTimeout: ((cb: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.push({ callback: cb, delay: delay ?? 0, id })
+        return id
+      }) as typeof setTimeout,
+      clearTimeout: (() => {}) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Window & typeof globalThis
+
+    let visibilityState = 'hidden'
+    const docListeners = new Map<string, Set<EventListener>>()
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      get visibilityState() { return visibilityState },
+      addEventListener(event: string, handler: EventListener) {
+        const set = docListeners.get(event) ?? new Set()
+        set.add(handler)
+        docListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        docListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Document
+
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    // Clear initialization artifacts
+    pendingTimers.length = 0
+    displayLog.length = 0
+
+    // Simulate resume: visibility changes to 'visible'
+    visibilityState = 'visible'
+    act(() => {
+      for (const handler of docListeners.get('visibilitychange') ?? []) {
+        handler(new Event('visibilitychange'))
+      }
+    })
+
+    // No display toggle yet — 200ms timer is pending
+    expect(displayLog).toEqual([])
+
+    // Find and execute the 200ms repaint timer
+    const repaintTimer = pendingTimers.find(t => t.delay === 200)
+    expect(repaintTimer).toBeDefined()
+    act(() => { repaintTimer!.callback() })
+
+    // Now display should be toggled
+    expect(displayLog).toEqual(['none', ''])
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('skips repaint on non-iOS visibility resume', async () => {
+    let visibilityState = 'hidden'
+    const docListeners = new Map<string, Set<EventListener>>()
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      get visibilityState() { return visibilityState },
+      addEventListener(event: string, handler: EventListener) {
+        const set = docListeners.get(event) ?? new Set()
+        set.add(handler)
+        docListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        docListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Document
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    displayLog.length = 0
+
+    visibilityState = 'visible'
+    act(() => {
+      for (const handler of docListeners.get('visibilitychange') ?? []) {
+        handler(new Event('visibilitychange'))
+      }
+    })
+
+    // Non-iOS: no display toggle should have happened
+    expect(displayLog).toEqual([])
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('forces repaint after terminal-ready on iOS', async () => {
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    displayLog.length = 0
+
+    // Deliver terminal-ready for the attached session
+    act(() => {
+      listeners[0]?.({
+        type: 'terminal-ready',
+        sessionId: 'session-1',
+      })
+    })
+
+    // Should have toggled display for compositor repaint
+    expect(displayLog).toEqual(['none', ''])
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('does not force repaint after terminal-ready on non-iOS', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    displayLog.length = 0
+
+    act(() => {
+      listeners[0]?.({
+        type: 'terminal-ready',
+        sessionId: 'session-1',
+      })
+    })
+
+    // Non-iOS: no display toggle
+    expect(displayLog).toEqual([])
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('cleans up iOS visibilitychange listener and pending timer on unmount', async () => {
+    // Deferred timers to verify pending timer cancellation
+    const pendingTimers: Array<{ callback: () => void; delay: number; id: number }> = []
+    let nextTimerId = 100
+    const clearedIds = new Set<number>()
+    globalAny.window = {
+      matchMedia: () => ({ matches: false }),
+      setTimeout: ((cb: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.push({ callback: cb, delay: delay ?? 0, id })
+        return id
+      }) as typeof setTimeout,
+      clearTimeout: ((id: number) => { clearedIds.add(id) }) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Window & typeof globalThis
+
+    const docListeners = new Map<string, Set<EventListener>>()
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      visibilityState: 'visible',
+      addEventListener(event: string, handler: EventListener) {
+        const set = docListeners.get(event) ?? new Set()
+        set.add(handler)
+        docListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        docListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Document
+
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    // 2 listeners: iOS repaint handler + unconditional diagnostics handler
+    expect(docListeners.get('visibilitychange')?.size).toBe(2)
+
+    // Fire visibilitychange to create a pending repaint timer
+    pendingTimers.length = 0
+    act(() => {
+      for (const handler of docListeners.get('visibilitychange') ?? []) {
+        handler(new Event('visibilitychange'))
+      }
+    })
+    const repaintTimer = pendingTimers.find(t => t.delay === 200)
+    expect(repaintTimer).toBeDefined()
+
+    act(() => { renderer.unmount() })
+
+    // After unmount, listener should be removed
+    const remaining = docListeners.get('visibilitychange')?.size ?? 0
+    expect(remaining).toBe(0)
+
+    // Pending repaint timer should have been cleared
+    expect(clearedIds.has(repaintTimer!.id)).toBe(true)
+
+    // Fire visibilitychange after unmount — should not toggle display
+    displayLog.length = 0
+    for (const handler of docListeners.get('visibilitychange') ?? []) {
+      handler(new Event('visibilitychange'))
+    }
+    expect(displayLog).toEqual([])
+  })
+
+  test('coalesces rapid iOS visibility resumes into single repaint', async () => {
+    const pendingTimers: Array<{ callback: () => void; delay: number; id: number }> = []
+    let nextTimerId = 100
+    const clearedIds = new Set<number>()
+    globalAny.window = {
+      matchMedia: () => ({ matches: false }),
+      setTimeout: ((cb: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.push({ callback: cb, delay: delay ?? 0, id })
+        return id
+      }) as typeof setTimeout,
+      clearTimeout: ((id: number) => { clearedIds.add(id) }) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Window & typeof globalThis
+
+    let visibilityState = 'hidden'
+    const docListeners = new Map<string, Set<EventListener>>()
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      get visibilityState() { return visibilityState },
+      addEventListener(event: string, handler: EventListener) {
+        const set = docListeners.get(event) ?? new Set()
+        set.add(handler)
+        docListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        docListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Document
+
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    pendingTimers.length = 0
+    displayLog.length = 0
+
+    // Fire visibilitychange twice rapidly
+    visibilityState = 'visible'
+    act(() => {
+      for (const handler of docListeners.get('visibilitychange') ?? []) {
+        handler(new Event('visibilitychange'))
+      }
+    })
+    const firstTimer = pendingTimers.find(t => t.delay === 200)
+    expect(firstTimer).toBeDefined()
+
+    act(() => {
+      for (const handler of docListeners.get('visibilitychange') ?? []) {
+        handler(new Event('visibilitychange'))
+      }
+    })
+
+    // First timer should have been cleared
+    expect(clearedIds.has(firstTimer!.id)).toBe(true)
+
+    // Execute only the latest timer
+    const lastTimer = pendingTimers.filter(t => t.delay === 200).pop()
+    act(() => { lastTimer!.callback() })
+
+    // Only one repaint should have happened
+    expect(displayLog).toEqual(['none', ''])
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('triggers repaint on iOS pageshow with persisted=true', async () => {
+    const pendingTimers: Array<{ callback: () => void; delay: number; id: number }> = []
+    let nextTimerId = 100
+    const winListeners = new Map<string, Set<EventListener>>()
+    globalAny.window = {
+      matchMedia: () => ({ matches: false }),
+      setTimeout: ((cb: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.push({ callback: cb, delay: delay ?? 0, id })
+        return id
+      }) as typeof setTimeout,
+      clearTimeout: (() => {}) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener(event: string, handler: EventListener) {
+        const set = winListeners.get(event) ?? new Set()
+        set.add(handler)
+        winListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        winListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Window & typeof globalThis
+
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      visibilityState: 'visible',
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Document
+
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    pendingTimers.length = 0
+    displayLog.length = 0
+
+    // pageshow with persisted=true should trigger repaint
+    act(() => {
+      for (const handler of winListeners.get('pageshow') ?? []) {
+        handler({ type: 'pageshow', persisted: true } as unknown as Event)
+      }
+    })
+
+    const repaintTimer = pendingTimers.find(t => t.delay === 200)
+    expect(repaintTimer).toBeDefined()
+
+    act(() => { repaintTimer!.callback() })
+    expect(displayLog).toEqual(['none', ''])
+
+    // Reset and test persisted=false — should NOT trigger repaint
+    pendingTimers.length = 0
+    displayLog.length = 0
+
+    act(() => {
+      for (const handler of winListeners.get('pageshow') ?? []) {
+        handler({ type: 'pageshow', persisted: false } as unknown as Event)
+      }
+    })
+
+    expect(pendingTimers.find(t => t.delay === 200)).toBeUndefined()
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('triggers repaint on iOS window focus (fallback for PWA foreground)', async () => {
+    const pendingTimers: Array<{ callback: () => void; delay: number; id: number }> = []
+    let nextTimerId = 100
+    const winListeners = new Map<string, Set<EventListener>>()
+    globalAny.window = {
+      matchMedia: () => ({ matches: false }),
+      setTimeout: ((cb: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.push({ callback: cb, delay: delay ?? 0, id })
+        return id
+      }) as typeof setTimeout,
+      clearTimeout: (() => {}) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener(event: string, handler: EventListener) {
+        const set = winListeners.get(event) ?? new Set()
+        set.add(handler)
+        winListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        winListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Window & typeof globalThis
+
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      visibilityState: 'visible',
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Document
+
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    pendingTimers.length = 0
+    displayLog.length = 0
+
+    // window 'focus' should trigger repaint on iOS
+    act(() => {
+      for (const handler of winListeners.get('focus') ?? []) {
+        handler(new Event('focus'))
+      }
+    })
+
+    const repaintTimer = pendingTimers.find(t => t.delay === 200)
+    expect(repaintTimer).toBeDefined()
+
+    act(() => { repaintTimer!.callback() })
+    expect(displayLog).toEqual(['none', ''])
+
+    // Verify terminal.refresh was called to force xterm re-render
+    const terminal = TerminalMock.instances[0]
+    expect(terminal?.refreshCalls.length).toBeGreaterThan(0)
+    expect(terminal?.refreshCalls[0]).toEqual([0, 23])
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('does not trigger repaint on non-iOS window focus', async () => {
+    const winListeners = new Map<string, Set<EventListener>>()
+    globalAny.window = {
+      setTimeout: ((callback: () => void) => {
+        callback()
+        return 1 as unknown as ReturnType<typeof setTimeout>
+      }) as typeof setTimeout,
+      clearTimeout: (() => {}) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener(event: string, handler: EventListener) {
+        const set = winListeners.get(event) ?? new Set()
+        set.add(handler)
+        winListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        winListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Window & typeof globalThis
+
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      visibilityState: 'visible',
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Document
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    displayLog.length = 0
+
+    // window 'focus' should NOT register a listener on non-iOS
+    const focusHandlers = winListeners.get('focus')
+    expect(focusHandlers?.size ?? 0).toBe(0)
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('restores display when repaint canceled mid-toggle', async () => {
+    // Deferred timers AND deferred rAF to test cancel between hide and restore
+    const pendingTimers: Array<{ callback: () => void; delay: number; id: number }> = []
+    let nextTimerId = 100
+    const clearedTimerIds = new Set<number>()
+
+    const pendingRafs: Array<{ callback: FrameRequestCallback; id: number }> = []
+    let nextRafId = 500
+    const canceledRafIds = new Set<number>()
+
+    globalAny.window = {
+      matchMedia: () => ({ matches: false }),
+      setTimeout: ((cb: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.push({ callback: cb, delay: delay ?? 0, id })
+        return id
+      }) as typeof setTimeout,
+      clearTimeout: ((id: number) => { clearedTimerIds.add(id) }) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Window & typeof globalThis
+
+    globalAny.requestAnimationFrame = (cb: FrameRequestCallback) => {
+      const id = nextRafId++
+      pendingRafs.push({ callback: cb, id })
+      return id
+    }
+    globalAny.cancelAnimationFrame = (id: number) => { canceledRafIds.add(id) }
+
+    let visibilityState = 'hidden'
+    const docListeners = new Map<string, Set<EventListener>>()
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      get visibilityState() { return visibilityState },
+      addEventListener(event: string, handler: EventListener) {
+        const set = docListeners.get(event) ?? new Set()
+        set.add(handler)
+        docListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        docListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Document
+
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    pendingTimers.length = 0
+    pendingRafs.length = 0
+    displayLog.length = 0
+
+    // Fire first resume
+    visibilityState = 'visible'
+    act(() => {
+      for (const handler of docListeners.get('visibilitychange') ?? []) {
+        handler(new Event('visibilitychange'))
+      }
+    })
+
+    // Execute the 200ms timer → forceRepaint → display='none', raf1 queued
+    const timer1 = pendingTimers.find(t => t.delay === 200)
+    expect(timer1).toBeDefined()
+    act(() => { timer1!.callback() })
+    expect(displayLog).toEqual(['none'])
+
+    // raf1 is pending but NOT executed yet
+    expect(pendingRafs.length).toBeGreaterThan(0)
+
+    // Fire second resume BEFORE raf1 completes — should cancel and restore
+    pendingTimers.length = 0
+    act(() => {
+      for (const handler of docListeners.get('visibilitychange') ?? []) {
+        handler(new Event('visibilitychange'))
+      }
+    })
+
+    // cancelIosRepaint should have restored display to original value
+    expect(displayLog).toEqual(['none', ''])
+
+    // Now let the second repaint run to completion
+    const timer2 = pendingTimers.find(t => t.delay === 200)
+    expect(timer2).toBeDefined()
+    act(() => { timer2!.callback() })
+    // display='none' again
+    expect(displayLog).toEqual(['none', '', 'none'])
+
+    // Run both rAFs
+    while (pendingRafs.length > 0) {
+      const raf = pendingRafs.shift()!
+      if (!canceledRafIds.has(raf.id)) {
+        act(() => { raf.callback(0) })
+      }
+    }
+
+    // Should be restored
+    expect(displayLog[displayLog.length - 1]).toBe('')
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('visibility + terminal-ready triggers coalesce into single repaint', async () => {
+    // Both triggers fire close together (reconnect + resume scenario).
+    // The 50ms terminal-ready repaint should supersede the 200ms visibility
+    // repaint, resulting in exactly one hide/restore cycle.
+    const pendingTimers: Array<{ callback: () => void; delay: number; id: number }> = []
+    let nextTimerId = 100
+    const clearedTimerIds = new Set<number>()
+
+    globalAny.window = {
+      matchMedia: () => ({ matches: false }),
+      setTimeout: ((cb: () => void, delay?: number) => {
+        const id = nextTimerId++
+        pendingTimers.push({ callback: cb, delay: delay ?? 0, id })
+        return id
+      }) as typeof setTimeout,
+      clearTimeout: ((id: number) => { clearedTimerIds.add(id) }) as typeof clearTimeout,
+      devicePixelRatio: 1,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as Window & typeof globalThis
+
+    let visibilityState = 'hidden'
+    const docListeners = new Map<string, Set<EventListener>>()
+    globalAny.document = {
+      fonts: { ready: Promise.resolve() },
+      get visibilityState() { return visibilityState },
+      addEventListener(event: string, handler: EventListener) {
+        const set = docListeners.get(event) ?? new Set()
+        set.add(handler)
+        docListeners.set(event, set)
+      },
+      removeEventListener(event: string, handler: EventListener) {
+        docListeners.get(event)?.delete(handler)
+      },
+    } as unknown as Document
+
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { container, displayLog } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    pendingTimers.length = 0
+    displayLog.length = 0
+
+    // 1. Visibility resume fires → schedules 200ms repaint
+    visibilityState = 'visible'
+    act(() => {
+      for (const handler of docListeners.get('visibilitychange') ?? []) {
+        handler(new Event('visibilitychange'))
+      }
+    })
+
+    const visibilityTimer = pendingTimers.find(t => t.delay === 200)
+    expect(visibilityTimer).toBeDefined()
+
+    // 2. terminal-ready fires shortly after → schedules 50ms repaint,
+    //    which cancels the 200ms visibility repaint
+    act(() => {
+      listeners[0]?.({ type: 'terminal-ready', sessionId: 'session-1' })
+    })
+
+    const readyTimer = pendingTimers.find(t => t.delay === 50)
+    expect(readyTimer).toBeDefined()
+
+    // The 200ms visibility timer should have been cleared
+    expect(clearedTimerIds.has(visibilityTimer!.id)).toBe(true)
+
+    // No display toggle yet — only 50ms timer is pending
+    expect(displayLog).toEqual([])
+
+    // 3. Execute the 50ms timer (the only one that should fire)
+    act(() => { readyTimer!.callback() })
+
+    // Exactly one hide/restore cycle
+    expect(displayLog).toEqual(['none', ''])
+
+    act(() => { renderer.unmount() })
+  })
+
+  test('paste capture-phase listener is cleaned up on unmount', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: {
+        writeText: () => Promise.resolve(),
+        readText: () => Promise.resolve(''),
+      },
+    } as unknown as Navigator
+
+    const { container, listenerEntries } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        {
+          createNodeMock: () => container,
+        },
+      )
+      await Promise.resolve()
+    })
+
+    // Verify the paste capture-phase listener was registered
+    const pasteEntries = listenerEntries.get('paste')
+    const hasCaptureListener = pasteEntries?.some((e) => e.capture) ?? false
+    expect(hasCaptureListener).toBe(true)
+
+    act(() => {
+      renderer.unmount()
+    })
+
+    // After unmount, the capture-phase paste listener should have been removed
+    const pasteEntriesAfter = listenerEntries.get('paste')
+    const hasCaptureListenerAfter = pasteEntriesAfter?.some((e) => e.capture) ?? false
+    expect(hasCaptureListenerAfter).toBe(false)
+  })
+
+  test('captures terminal snapshot on session switch and restores on switch-back', async () => {
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    // Start fresh
+    clearSnapshotCache()
+
+    const sendCalls: Array<Record<string, unknown>> = []
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    // Switch to session-2 — should capture snapshot of session-1
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-2"
+          tmuxTarget="agentboard:@2"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+
+    // Verify detach was sent (snapshot captured before detach)
+    expect(sendCalls).toContainEqual({
+      type: 'terminal-detach',
+      sessionId: 'session-1',
+    })
+
+    // Switch back to session-1 — should write cached snapshot
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={(message) => { sendCalls.push(message) }}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+
+    // Terminal should have had reset() + write(cached) called for the snapshot restore
+    expect(terminal.resetCalls).toBeGreaterThan(0)
+    // The cached snapshot content should have been written
+    expect(terminal.writes).toContainEqual('\x1b[mtest-snapshot-data')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('invalidateSnapshotCache removes entry and clearSnapshotCache removes all', async () => {
+    clearSnapshotCache()
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+    } as unknown as Navigator
+
+    const { container } = createContainerMock()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    // Attach to session-1
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+        { createNodeMock: () => container },
+      )
+      await Promise.resolve()
+    })
+
+    // Switch to session-2 (caches session-1)
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-2"
+          tmuxTarget="agentboard:@2"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+
+    const terminal = TerminalMock.instances[0]
+    if (!terminal) throw new Error('Expected terminal instance')
+
+    // Invalidate session-1's cache
+    invalidateSnapshotCache('session-1')
+
+    // Switch back to session-1 — should NOT write cached snapshot (it was invalidated)
+    terminal.writes.length = 0
+    terminal.resetCalls = 0
+    await act(async () => {
+      renderer.update(
+        <TerminalHarness
+          sessionId="session-1"
+          tmuxTarget="agentboard:@1"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          theme={{ background: '#000' }}
+          fontSize={12}
+        />,
+      )
+      await Promise.resolve()
+    })
+
+    // No snapshot data should have been written (cache was invalidated)
+    expect(terminal.writes).not.toContainEqual('\x1b[mtest-snapshot-data')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+})
+
+describe('terminal parser readiness', () => {
+  async function mount(onPasteFiles?: (payload: { text: string; files: File[] }) => void, options: { onDeferredInput?: (data: string, kind: 'typing' | 'paste') => void; deferInput?: boolean; rejectInput?: boolean } = {}) {
+    clearSnapshotCache()
+    const { container, dispatchEvent } = createContainerMock()
+    const sent: Array<Record<string, unknown>> = []
+    let listener: (message: ServerMessage) => void = () => {}
+    const subscribe = (next: (message: ServerMessage) => void) => { listener = next; return () => {} }
+    const sendMessage = (message: any) => {
+      if (options.rejectInput && (message.type === 'terminal-input' || message.type === 'terminal-paste')) return false
+      sent.push(message)
+    }
+    const props = (sessionId: string, connectionEpoch: number) => ({
+      sessionId, tmuxTarget: `agentboard:${sessionId}`, connectionEpoch,
+      sendMessage, subscribe, onPasteFiles, onDeferredInput: options.onDeferredInput, deferInput: options.deferInput, theme: {}, fontSize: 12,
+    })
+    let renderer!: TestRenderer.ReactTestRenderer
+    await act(async () => {
+      renderer = TestRenderer.create(<TerminalHarness {...props('A', 1)} />, { createNodeMock: () => container })
+    })
+    const terminal = TerminalMock.instances[0]!
+    return {
+      terminal, sent, dispatchEvent,
+      message(message: ServerMessage & { _connectionEpoch?: number }) { act(() => listener(message)) },
+      input(data: string) { act(() => terminal.emitData(data)) },
+      async select(sessionId: string, epoch = 1) {
+        await act(async () => renderer.update(<TerminalHarness {...props(sessionId, epoch)} />))
+      },
+      drain() { act(() => { while (terminal.pendingWrites.length) terminal.finishWrite() }) },
+      close() { act(() => renderer.unmount()) },
+    }
+  }
+
+  test('recovery text is captured for review without replaying on readiness', async () => {
+    const deferred: unknown[] = []
+    const h = await mount(undefined, { onDeferredInput: (data, kind) => deferred.push({ data, kind }) })
+    h.input('hello 🦊')
+    h.input('\r\n\x08\x7f')
+    for (const command of ['\x03', '\t', '\x1b[A', '\x1b[<0;1;1M', 'prefix\x1b[200~text', '\x85']) h.input(command)
+    expect(deferred).toEqual([{ data: 'hello 🦊', kind: 'typing' }, { data: '\r\n\x08\x7f', kind: 'typing' }])
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.drain()
+    expect(h.sent.some(m => m.type === 'terminal-input' || m.type === 'terminal-paste')).toBe(false)
+    h.input('live')
+    expect(deferred).toHaveLength(2) // Legacy void send callbacks still mean accepted.
+    expect(h.sent).toContainEqual({ type: 'terminal-input', sessionId: 'A', data: 'live' })
+    h.close()
+  })
+
+  test('transport rejection captures text even before React observes recovery', async () => {
+    const deferred: unknown[] = []
+    const h = await mount(undefined, { rejectInput: true, onDeferredInput: (data, kind) => deferred.push({ data, kind }) })
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.drain()
+    h.input('resume gap')
+    h.input('\x03')
+    expect(deferred).toEqual([{ data: 'resume gap', kind: 'typing' }])
+    expect(h.sent.some(m => m.type === 'terminal-input')).toBe(false)
+    h.close()
+  })
+
+  test('transport rejection preserves current plain clipboard text without replay', async () => {
+    jest.useFakeTimers()
+    globalAny.navigator = { userAgent: 'Chrome', platform: 'MacIntel', maxTouchPoints: 0 } as Navigator
+    const deferred: unknown[] = []
+    const h = await mount(undefined, { rejectInput: true, onDeferredInput: (data, kind) => deferred.push({ data, kind }) })
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.drain()
+    act(() => { h.terminal.emitKey({ type: 'keydown', key: 'v', metaKey: true } as KeyboardEvent) })
+    await act(async () => {
+      h.dispatchEvent('paste', { preventDefault() {}, stopPropagation() {}, clipboardData: { getData: () => 'plain\r\n\ttext', files: [], items: [], types: ['text/plain'] } })
+    })
+    expect(deferred).toEqual([{ data: 'plain\n\ttext', kind: 'paste' }])
+    expect(h.sent.some(m => m.type === 'terminal-input' || m.type === 'terminal-paste')).toBe(false)
+    h.close()
+  })
+
+  test('an existing review draft keeps ready typing and native paste out of the terminal', async () => {
+    const deferred: unknown[] = []
+    const h = await mount(undefined, { deferInput: true, onDeferredInput: (data, kind) => deferred.push({ data, kind }) })
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.drain()
+    h.input('continued')
+    h.dispatchEvent('paste', { preventDefault() {}, stopPropagation() {}, clipboardData: { getData: () => 'paste', files: [], items: [], types: ['text/plain'] } })
+    expect(deferred).toEqual([{ data: 'continued', kind: 'typing' }, { data: 'paste', kind: 'paste' }])
+    expect(h.sent.some(m => m.type === 'terminal-input' || m.type === 'terminal-paste')).toBe(false)
+    h.close()
+  })
+
+  test('recovery paste captures only plain text synchronously, including indentation', async () => {
+    const deferred: unknown[] = []
+    let fileCalls = 0
+    const h = await mount(() => { fileCalls++ }, { onDeferredInput: (data, kind) => deferred.push({ data, kind }) })
+    const paste = (text: string, files: File[] = []) => h.dispatchEvent('paste', {
+      preventDefault() {}, stopPropagation() {},
+      clipboardData: { getData: () => text, files, items: [], types: ['text/plain'] },
+    })
+    paste('one\r\n\ttwo\rthree')
+    for (const text of ['bad\x03', '\x1b[200~paste', 'back\x08', 'delete\x7f', '\x85']) paste(text)
+    paste('file fallback', [new File(['image'], 'image.png', { type: 'image/png' })])
+    expect(deferred).toEqual([{ data: 'one\n\ttwo\nthree', kind: 'paste' }])
+    expect(fileCalls).toBe(0)
+    expect(h.sent.some(m => m.type === 'terminal-input' || m.type === 'terminal-paste')).toBe(false)
+    h.close()
+  })
+
+  test.each(['MacIntel', 'Linux x86_64', 'Win32'])('a blocked paste gesture on %s stays deferred across ready but is cancelled across reconnect', async (platform) => {
+    globalAny.navigator = { platform, userAgent: 'Chrome', maxTouchPoints: 0 } as Navigator
+    const deferred: unknown[] = []
+    const h = await mount(undefined, { onDeferredInput: (data, kind) => deferred.push({ data, kind }) })
+    const gesture = () => act(() => { h.terminal.emitKey({ type: 'keydown', key: 'v', metaKey: platform === 'MacIntel', ctrlKey: platform !== 'MacIntel' } as KeyboardEvent) })
+    const paste = () => h.dispatchEvent('paste', { preventDefault() {}, stopPropagation() {}, clipboardData: { getData: () => 'captured', files: [], items: [], types: ['text/plain'] } })
+    gesture()
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.drain()
+    paste()
+    expect(deferred).toEqual([{ data: 'captured', kind: 'paste' }])
+    await h.select('A', 2)
+    gesture()
+    await h.select('A', 3)
+    paste()
+    expect(deferred).toHaveLength(1)
+    h.close()
+  })
+
+  test('initial input waits for screen parse and ready barrier; ACK follows parser progress', async () => {
+    const h = await mount()
+    h.input('before-ready')
+    expect(h.sent.some(m => m.type === 'terminal-input')).toBe(false)
+    h.terminal.holdWrites = true
+    h.message({ type: 'terminal-output', sessionId: 'A', data: 'screen', outputSeq: 7 })
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.input('before-parse')
+    expect(h.sent.some(m => m.type === 'terminal-input' || m.type === 'terminal-ack')).toBe(false)
+    act(() => h.terminal.finishWrite())
+    expect(h.sent).toContainEqual({ type: 'terminal-ack', outputSeq: 7, connectionEpoch: 1 })
+    h.input('before-barrier')
+    expect(h.sent.some(m => m.type === 'terminal-input')).toBe(false)
+    h.drain()
+    h.input('after-parse')
+    expect(h.sent.filter(m => m.type === 'terminal-input')).toEqual([
+      { type: 'terminal-input', sessionId: 'A', data: 'after-parse' },
+    ])
+    h.close()
+  })
+
+  test('old A ready callback cannot enable a new A after A-B-A switching', async () => {
+    const h = await mount()
+    h.terminal.holdWrites = true
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    expect(h.terminal.pendingWrites).toHaveLength(1)
+    await h.select('B')
+    await h.select('A')
+    h.drain()
+    h.input('stale-ready')
+    expect(h.sent.some(m => m.type === 'terminal-input')).toBe(false)
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.input('current-not-parsed')
+    expect(h.sent.some(m => m.type === 'terminal-input')).toBe(false)
+    h.drain()
+    h.input('current-ready')
+    expect(h.sent.filter(m => m.type === 'terminal-input')).toEqual([
+      { type: 'terminal-input', sessionId: 'A', data: 'current-ready' },
+    ])
+    h.close()
+  })
+
+  test('same-session reconnect rejects old parser readiness and ACKs only current socket output', async () => {
+    const h = await mount()
+    h.terminal.holdWrites = true
+    h.message({ type: 'terminal-output', sessionId: 'A', data: 'old', outputSeq: 90 })
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    await h.select('A', 2)
+    h.drain()
+    h.input('stale-epoch')
+    expect(h.sent.some(m => m.type === 'terminal-input' || m.type === 'terminal-ack')).toBe(false)
+    h.message({ type: 'terminal-output', sessionId: 'A', data: 'new', outputSeq: 1 })
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.drain()
+    expect(h.sent.filter(m => m.type === 'terminal-ack')).toEqual([{ type: 'terminal-ack', outputSeq: 1, connectionEpoch: 2 }])
+    h.input('new-epoch')
+    expect(h.sent.filter(m => m.type === 'terminal-input')).toEqual([
+      { type: 'terminal-input', sessionId: 'A', data: 'new-epoch' },
+    ])
+    h.close()
+  })
+
+  test('output arriving before React sees a new socket retains its diagnostic epoch', async () => {
+    const h = await mount()
+    h.terminal.holdWrites = true
+    // The manager has advanced to epoch 2, but React still exposes epoch 1.
+    h.message({ type: 'terminal-output', sessionId: 'A', data: 'new-socket', outputSeq: 1, _connectionEpoch: 2 })
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    await h.select('A', 2)
+    h.drain()
+    expect(h.sent.filter(m => m.type === 'terminal-ack')).toEqual([
+      { type: 'terminal-ack', outputSeq: 1, connectionEpoch: 2 },
+    ])
+    h.input('old-ready')
+    expect(h.sent.some(m => m.type === 'terminal-input')).toBe(false)
+    // Late output from the old socket cannot acknowledge a sequence on socket 2.
+    h.message({ type: 'terminal-output', sessionId: 'A', data: 'old-socket', outputSeq: 99, _connectionEpoch: 1 })
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.drain()
+    expect(h.sent.filter(m => m.type === 'terminal-ack')).toEqual([
+      { type: 'terminal-ack', outputSeq: 1, connectionEpoch: 2 },
+    ])
+    h.close()
+  })
+
+  test('a new screen reset waits for old parsing instead of painting ahead of it', async () => {
+    const h = await mount()
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.terminal.holdWrites = true
+    h.message({ type: 'terminal-output', sessionId: 'A', data: 'old-screen', outputSeq: 3 })
+    const resets = h.terminal.resetCalls
+    await h.select('B')
+    h.message({ type: 'terminal-output', sessionId: 'B', data: 'new-screen', outputSeq: 4 })
+    h.message({ type: 'terminal-ready', sessionId: 'B' })
+    expect(h.terminal.resetCalls).toBe(resets)
+    expect(h.terminal.writes).not.toContain('new-screen')
+    h.input('too-early')
+    expect(h.sent.some(m => m.type === 'terminal-input')).toBe(false)
+    h.drain()
+    expect(h.terminal.resetCalls).toBe(resets + 1)
+    expect(h.terminal.writes.at(-1)).toBe('new-screen')
+    expect(h.sent.filter(m => m.type === 'terminal-ack')).toEqual([
+      { type: 'terminal-ack', outputSeq: 3, connectionEpoch: 1 }, { type: 'terminal-ack', outputSeq: 4, connectionEpoch: 1 },
+    ])
+    h.input('B-ready')
+    expect(h.sent.filter(m => m.type === 'terminal-input')).toEqual([
+      { type: 'terminal-input', sessionId: 'B', data: 'B-ready' },
+    ])
+    h.close()
+  })
+
+  test.each(['switch', 'reconnect'] as const)('async clipboard text cannot replay after %s', async (transition) => {
+    jest.useFakeTimers()
+    let finishRead!: (text: string) => void
+    globalAny.navigator = {
+      userAgent: 'Chrome', platform: 'MacIntel', maxTouchPoints: 0,
+      clipboard: { readText: () => new Promise<string>(resolve => { finishRead = resolve }), writeText: async () => {} },
+    } as unknown as Navigator
+    const deferred: unknown[] = []
+    const h = await mount(undefined, { onDeferredInput: (data, kind) => deferred.push({ data, kind }) })
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    act(() => { h.terminal.emitKey({ type: 'keydown', key: 'v', metaKey: true } as KeyboardEvent) })
+    await act(async () => { jest.advanceTimersByTime(100) })
+    expect(typeof finishRead).toBe('function')
+    if (transition === 'switch') { await h.select('B'); await h.select('A') }
+    else await h.select('A', 2)
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    await act(async () => { finishRead('stale text') })
+    expect(h.sent.some(m => m.type === 'terminal-input' || m.type === 'terminal-paste')).toBe(false)
+    h.input('fresh')
+    expect(h.sent).toContainEqual({ type: 'terminal-input', sessionId: 'A', data: 'fresh' })
+    expect(deferred).toEqual([])
+    h.close()
+  })
+
+  test.each(['switch', 'reconnect'] as const)('async image resolution cannot replay after %s', async (transition) => {
+    globalAny.navigator = { userAgent: 'Chrome', platform: 'MacIntel', maxTouchPoints: 0 } as Navigator
+    const originalFetch = globalThis.fetch
+    let finishImage!: (response: Response) => void
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/clipboard-file-path') return new Promise<Response>(resolve => { finishImage = resolve })
+      return new Response('{}')
+    }) as typeof fetch
+    const h = await mount()
+    try {
+      h.message({ type: 'terminal-ready', sessionId: 'A' })
+      act(() => { h.terminal.emitKey({ type: 'keydown', key: 'v', ctrlKey: true } as KeyboardEvent) })
+      expect(typeof finishImage).toBe('function')
+      if (transition === 'switch') { await h.select('B'); await h.select('A') }
+      else await h.select('A', 2)
+      h.message({ type: 'terminal-ready', sessionId: 'A' })
+      await act(async () => { finishImage({ ok: true, json: async () => ({ path: '/tmp/stale.png', isImage: true }) } as Response) })
+      expect(h.sent.some(m => m.type === 'terminal-input' || m.type === 'terminal-paste')).toBe(false)
+      h.input('fresh')
+      expect(h.sent).toContainEqual({ type: 'terminal-input', sessionId: 'A', data: 'fresh' })
+    } finally { h.close(); globalThis.fetch = originalFetch }
+  })
+
+  test('pending native file paste cannot start an upload after reconnect', async () => {
+    globalAny.navigator = { userAgent: 'Chrome', platform: 'MacIntel', maxTouchPoints: 0 } as Navigator
+    const uploads: unknown[] = []
+    const h = await mount(payload => uploads.push(payload))
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    act(() => { h.terminal.emitKey({ type: 'keydown', key: 'v', metaKey: true } as KeyboardEvent) })
+    // Resolve the native event, then change the attachment before its promise runs.
+    h.dispatchEvent('paste', {
+      preventDefault() {}, stopPropagation() {},
+      clipboardData: { getData: () => '', files: [new File(['data'], 'file.txt')], items: [], types: ['Files'] },
+    })
+    await h.select('A', 2)
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    await act(async () => {})
+    expect(uploads).toEqual([])
+    h.close()
+  })
+
+  test('terminal error revokes pending parser readiness', async () => {
+    const h = await mount()
+    h.terminal.holdWrites = true
+    h.message({ type: 'terminal-ready', sessionId: 'A' })
+    h.message({ type: 'terminal-error', sessionId: 'A', code: 'ERR_TMUX_ATTACH_FAILED', message: 'gone', retryable: true })
+    h.drain()
+    h.input('after-error')
+    expect(h.sent.some(m => m.type === 'terminal-input')).toBe(false)
+    h.close()
+  })
+
+})

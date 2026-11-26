@@ -1,0 +1,2317 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import fs from 'node:fs/promises'
+import fsSync from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { initDatabase } from '../db'
+import { LogPoller } from '../logPoller'
+import { logger } from '../logger'
+import { SessionRegistry } from '../SessionRegistry'
+import type { Session } from '../../shared/types'
+import { encodeProjectPath } from '../logDiscovery'
+import { handleMatchWorkerRequest } from '../logMatchWorker'
+import type { PollSnapshot, SessionReader } from '../sessionReads'
+import type {
+  MatchWorkerRequest,
+  MatchWorkerResponse,
+} from '../logMatchWorkerTypes'
+
+const bunAny = Bun as typeof Bun & { spawnSync: typeof Bun.spawnSync }
+const originalSpawnSync = bunAny.spawnSync
+
+const tmuxOutputs = new Map<string, string>()
+
+const baseProjectPath = path.join(process.cwd(), 'fixtures', 'alpha')
+const baseSession: Session = {
+  id: 'window-1',
+  name: 'alpha',
+  tmuxWindow: 'agentboard:1',
+  projectPath: baseProjectPath,
+  status: 'waiting',
+  lastActivity: new Date().toISOString(),
+  createdAt: new Date().toISOString(),
+  source: 'managed',
+}
+
+let tempRoot: string
+const originalClaude = process.env.CLAUDE_CONFIG_DIR
+const originalCodex = process.env.CODEX_HOME
+const originalPi = process.env.PI_HOME
+const originalOmpAgentDir = process.env.PI_CODING_AGENT_DIR
+const originalAgentboardData = process.env.AGENTBOARD_DATA_DIR
+const originalDevinCliDir = process.env.DEVIN_CLI_DIR
+const originalGrok = process.env.GROK_HOME
+
+function setTmuxOutput(target: string, content: string) {
+  tmuxOutputs.set(target, content)
+}
+
+function findJsonlFiles(dir: string): string[] {
+  const results: string[] = []
+  if (!fsSync.existsSync(dir)) return results
+  const entries = fsSync.readdirSync(dir, { withFileTypes: true })
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name)
+    if (entry.isDirectory()) {
+      results.push(...findJsonlFiles(fullPath))
+    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      results.push(fullPath)
+    }
+  }
+  return results
+}
+
+function runRg(args: string[]) {
+  const patternIndex = args.indexOf('-e')
+  const pattern = patternIndex >= 0 ? args[patternIndex + 1] ?? '' : ''
+  const regex = pattern ? new RegExp(pattern, 'm') : null
+
+  if (args.includes('--json')) {
+    const filePath = args[args.length - 1] ?? ''
+    if (!filePath || !regex || !fsSync.existsSync(filePath)) {
+      return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+    }
+    const lines = fsSync.readFileSync(filePath, 'utf8').split('\n')
+    const output: string[] = []
+    lines.forEach((line, index) => {
+      if (regex.test(line)) {
+        output.push(
+          JSON.stringify({ type: 'match', data: { line_number: index + 1 } })
+        )
+      }
+    })
+    const exitCode = output.length > 0 ? 0 : 1
+    return {
+      exitCode,
+      stdout: Buffer.from(output.join('\n')),
+      stderr: Buffer.from(''),
+    }
+  }
+
+  if (args.includes('-l')) {
+    if (!regex) {
+      return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+    }
+    const targets: string[] = []
+    let skipNext = false
+    for (let i = patternIndex + 2; i < args.length; i += 1) {
+      const arg = args[i] ?? ''
+      if (skipNext) {
+        skipNext = false
+        continue
+      }
+      if (!arg) continue
+      if (arg === '--glob') {
+        skipNext = true
+        continue
+      }
+      if (arg === '--threads') {
+        skipNext = true
+        continue
+      }
+      if (arg.startsWith('-')) {
+        continue
+      }
+      targets.push(arg)
+    }
+    const files: string[] = []
+    for (const target of targets) {
+      if (!fsSync.existsSync(target)) continue
+      const stat = fsSync.statSync(target)
+      if (stat.isDirectory()) {
+        files.push(...findJsonlFiles(target))
+      } else if (stat.isFile()) {
+        files.push(target)
+      }
+    }
+    const matches = files.filter((file) => {
+      const content = fsSync.readFileSync(file, 'utf8')
+      return regex.test(content)
+    })
+    return {
+      exitCode: matches.length > 0 ? 0 : 1,
+      stdout: Buffer.from(matches.join('\n')),
+      stderr: Buffer.from(''),
+    }
+  }
+
+  return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+}
+
+function buildLastExchangeOutput(tokens: string): string {
+  return `❯ previous\n⏺ ${tokens}\n❯ ${tokens}\n`
+}
+
+/**
+ * Build a log entry in proper Claude/Codex format with "text" field.
+ * This format is required for the JSON field pattern matching.
+ */
+function buildUserLogEntry(message: string, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    ...extra,
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text: message }] }
+  })
+}
+
+class InlineMatchWorkerClient {
+  async poll(
+    request: Omit<MatchWorkerRequest, 'id'>,
+    _options?: { timeoutMs?: number }
+  ): Promise<MatchWorkerResponse> {
+    const response = handleMatchWorkerRequest({ ...request, id: 'test' })
+    if (response.type === 'error') {
+      throw new Error(response.error ?? 'Log match worker error')
+    }
+    return response
+  }
+
+  dispose(): void {}
+}
+
+class RecordingMatchWorkerClient {
+  requests: Array<Omit<MatchWorkerRequest, 'id'>> = []
+
+  async poll(
+    request: Omit<MatchWorkerRequest, 'id'>,
+    _options?: { timeoutMs?: number }
+  ): Promise<MatchWorkerResponse> {
+    this.requests.push(request)
+    return {
+      id: 'test',
+      type: 'result',
+      entries: [],
+      orphanMatches: [],
+    }
+  }
+
+  dispose(): void {}
+}
+
+class BlockingMatchWorkerClient extends RecordingMatchWorkerClient {
+  private releaseFirst: (() => void) | null = null
+
+  override async poll(
+    request: Omit<MatchWorkerRequest, 'id'>,
+    _options?: { timeoutMs?: number }
+  ): Promise<MatchWorkerResponse> {
+    this.requests.push(request)
+    if (this.requests.length === 1) {
+      await new Promise<void>((resolve) => {
+        this.releaseFirst = resolve
+      })
+    }
+    return {
+      id: 'test',
+      type: 'result',
+      entries: [],
+      orphanMatches: [],
+    }
+  }
+
+  release(): void {
+    this.releaseFirst?.()
+    this.releaseFirst = null
+  }
+}
+
+async function waitForRequestCount(
+  worker: RecordingMatchWorkerClient,
+  expected: number
+): Promise<void> {
+  const deadline = Date.now() + 1000
+  while (worker.requests.length < expected && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  expect(worker.requests).toHaveLength(expected)
+}
+
+beforeEach(async () => {
+  tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-poller-'))
+  process.env.CLAUDE_CONFIG_DIR = path.join(tempRoot, 'claude')
+  process.env.CODEX_HOME = path.join(tempRoot, 'codex')
+  process.env.PI_HOME = path.join(tempRoot, 'pi')
+  process.env.PI_CODING_AGENT_DIR = path.join(tempRoot, 'omp-agent')
+  process.env.AGENTBOARD_DATA_DIR = path.join(tempRoot, 'agentboard')
+  process.env.DEVIN_CLI_DIR = path.join(tempRoot, 'devin')
+  process.env.GROK_HOME = path.join(tempRoot, 'grok')
+
+  bunAny.spawnSync = ((args: string[]) => {
+    const tmuxSubcommand = args[1] === '-u' ? args[2] : args[1]
+    if (args[0] === 'tmux' && tmuxSubcommand === 'capture-pane') {
+      const targetIndex = args.indexOf('-t')
+      const target = targetIndex >= 0 ? args[targetIndex + 1] : ''
+      const output = tmuxOutputs.get(target ?? '') ?? ''
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(output),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }
+    if (args[0] === 'rg') {
+      return runRg(args) as ReturnType<typeof Bun.spawnSync>
+    }
+    return {
+      exitCode: 0,
+      stdout: Buffer.from(''),
+      stderr: Buffer.from(''),
+    } as ReturnType<typeof Bun.spawnSync>
+  }) as typeof Bun.spawnSync
+})
+
+afterEach(async () => {
+  bunAny.spawnSync = originalSpawnSync
+  tmuxOutputs.clear()
+  if (originalClaude) process.env.CLAUDE_CONFIG_DIR = originalClaude
+  else delete process.env.CLAUDE_CONFIG_DIR
+  if (originalCodex) process.env.CODEX_HOME = originalCodex
+  else delete process.env.CODEX_HOME
+  if (originalPi) process.env.PI_HOME = originalPi
+  else delete process.env.PI_HOME
+  if (originalOmpAgentDir) process.env.PI_CODING_AGENT_DIR = originalOmpAgentDir
+  else delete process.env.PI_CODING_AGENT_DIR
+  if (originalAgentboardData) process.env.AGENTBOARD_DATA_DIR = originalAgentboardData
+  else delete process.env.AGENTBOARD_DATA_DIR
+  if (originalDevinCliDir) process.env.DEVIN_CLI_DIR = originalDevinCliDir
+  else delete process.env.DEVIN_CLI_DIR
+  if (originalGrok) process.env.GROK_HOME = originalGrok
+  else delete process.env.GROK_HOME
+  await fs.rm(tempRoot, { recursive: true, force: true })
+})
+
+describe('LogPoller', () => {
+  test('startup wait remains pending until the initial snapshot completes', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const worker = new RecordingMatchWorkerClient()
+    let release!: (snapshot: PollSnapshot) => void
+    const snapshot = new Promise<PollSnapshot>(resolve => { release = resolve })
+    const poller = new LogPoller(db, new SessionRegistry(), {
+      reader: { snapshot: () => snapshot, importCandidates: async () => [] },
+      matchWorkerClient: worker, devinSyncClient: null,
+    })
+    let finished = false
+    try {
+      poller.start()
+      const completion = poller.waitForOrphanRematch().then(() => { finished = true })
+      // Drain promise continuations while deliberately withholding the snapshot.
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(finished).toBe(false)
+      release({ lists: db.getSessionLists(), knownSessions: [] })
+      await completion
+      expect(finished).toBe(true)
+      expect(worker.requests).toHaveLength(1)
+    } finally {
+      release({ lists: db.getSessionLists(), knownSessions: [] })
+      poller.stop()
+      db.close()
+    }
+  })
+
+  test('background snapshot failures surface as matching errors without an unhandled rejection', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const worker = new RecordingMatchWorkerClient()
+    const poller = new LogPoller(db, new SessionRegistry(), {
+      reader: {
+        snapshot: async () => { throw new Error('read connection unavailable') },
+        importCandidates: async () => [],
+      },
+      matchWorkerClient: worker, devinSyncClient: null,
+    })
+    try {
+      poller.start()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(poller.matchingError).toContain('read connection unavailable')
+      expect(worker.requests).toHaveLength(0)
+    } finally {
+      poller.stop()
+      db.close()
+    }
+  })
+
+  test('a hibernate committed during the snapshot read prevents orphan fallback from reclaiming it', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+    db.insertSession({
+      sessionId: 'race', logFilePath: path.join(tempRoot, 'race.jsonl'),
+      projectPath: baseSession.projectPath, slug: null, agentType: 'claude',
+      displayName: baseSession.name, createdAt: '2020-01-01', lastActivityAt: '2020-01-01',
+      lastUserMessage: 'hello', currentWindow: null, isHibernating: false,
+      lastResumeError: null, lastKnownLogSize: 0, isCodexExec: false, launchCommand: null,
+    })
+    const worker = new RecordingMatchWorkerClient()
+    const poller = new LogPoller(db, registry, {
+      reader: {
+        snapshot: async (options) => {
+          const lists = db.getSessionLists(options)
+          if (!options.maxAgeHours) db.updateSession('race', { isHibernating: true })
+          return { lists, knownSessions: [] }
+        },
+        importCandidates: async () => [],
+      },
+      matchWorkerClient: worker, devinSyncClient: null,
+    })
+    try {
+      poller.start()
+      await waitForRequestCount(worker, 2)
+      await poller.waitForOrphanRematch()
+      expect(worker.requests[1].orphanCandidates?.map((c) => c.sessionId)).toContain('race')
+      expect(db.getSessionById('race')?.isHibernating).toBe(true)
+      expect(db.getSessionById('race')?.currentWindow).toBeNull()
+    } finally {
+      poller.stop()
+      db.close()
+    }
+  })
+
+  test('async snapshot waits coalesce polls and stop discards the late read', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const worker = new RecordingMatchWorkerClient()
+    let release!: (snapshot: PollSnapshot) => void
+    let reads = 0
+    const reader: SessionReader = {
+      snapshot: () => {
+        reads++
+        return new Promise((resolve) => { release = resolve })
+      },
+      importCandidates: async () => [],
+    }
+    db.getSessionLists = () => { throw new Error('must not read snapshots on main') }
+    db.getKnownSessionKeys = () => { throw new Error('must not read keys on main') }
+    const poller = new LogPoller(db, new SessionRegistry(), {
+      reader, matchWorkerClient: worker, devinSyncClient: null,
+    })
+    try {
+      const first = poller.pollOnce()
+      expect((await poller.pollOnce()).completed).toBe(false)
+      expect(reads).toBe(1)
+      expect(worker.requests).toHaveLength(0)
+      release({ lists: { active: [], hibernating: [], history: [] }, knownSessions: [] })
+      expect((await first).completed).toBe(true)
+      expect(worker.requests).toHaveLength(1)
+
+      const second = poller.pollOnce()
+      poller.stop()
+      release({ lists: { active: [], hibernating: [], history: [] }, knownSessions: [] })
+      await expect(second).rejects.toThrow('stopped')
+      expect(worker.requests).toHaveLength(1)
+    } finally {
+      poller.stop()
+      db.close()
+    }
+  })
+
+  test('watch-mode startup refreshes only persisted active log paths', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encodeProjectPath(baseProjectPath)
+    )
+    await fs.mkdir(logDir, { recursive: true })
+    const activeLogPath = path.join(logDir, 'active.jsonl')
+    await fs.writeFile(
+      activeLogPath,
+      `${buildUserLogEntry('active', {
+        sessionId: 'active-session',
+        cwd: baseProjectPath,
+      })}\n`
+    )
+    const now = new Date().toISOString()
+    db.insertSession({
+      sessionId: 'active-session',
+      logFilePath: activeLogPath,
+      projectPath: baseProjectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: 'active',
+      createdAt: now,
+      lastActivityAt: now,
+      lastUserMessage: 'active',
+      currentWindow: baseSession.tmuxWindow,
+      isHibernating: false,
+      lastResumeError: null,
+      lastKnownLogSize: 0,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    // This historical file makes a full-tree scan observable: it must not be
+    // included in the startup request.
+    const historicalLogPath = path.join(logDir, 'historical.jsonl')
+    await fs.writeFile(
+      historicalLogPath,
+      `${buildUserLogEntry('historical', {
+        sessionId: 'historical-session',
+        cwd: baseProjectPath,
+      })}\n`
+    )
+
+    db.getKnownSessionKeys = () => {
+      throw new Error('watch startup must not load the full history key set')
+    }
+
+    const worker = new RecordingMatchWorkerClient()
+    const poller = new LogPoller(db, registry, { matchWorkerClient: worker })
+    poller.start(5000, 'watch')
+
+    await waitForRequestCount(worker, 1)
+    await poller.waitForOrphanRematch()
+
+    expect(worker.requests[0]?.preFilteredPaths).toEqual([activeLogPath])
+    expect(worker.requests[0]?.preFilteredPaths).not.toContain(historicalLogPath)
+
+    poller.stop()
+    db.close()
+  })
+
+  test('runs orphan rematch only after delayed comprehensive reconciliation', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+    const now = new Date().toISOString()
+    db.insertSession({
+      sessionId: 'dormant-session',
+      logFilePath: path.join(tempRoot, 'dormant.jsonl'),
+      projectPath: baseProjectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: 'dormant',
+      createdAt: now,
+      lastActivityAt: now,
+      lastUserMessage: 'old session',
+      currentWindow: null,
+      isHibernating: false,
+      lastResumeError: null,
+      lastKnownLogSize: 0,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const worker = new RecordingMatchWorkerClient()
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: worker,
+      startupReconciliationDelayMs: 5,
+    })
+    poller.start(5000, 'watch')
+
+    await waitForRequestCount(worker, 2)
+
+    expect(worker.requests[0]?.preFilteredPaths).toBeUndefined()
+    expect(worker.requests[0]?.forceOrphanRematch).toBe(false)
+    expect(worker.requests[1]?.forceOrphanRematch).toBe(true)
+
+    poller.stop()
+    db.close()
+  })
+
+  test('delayed reconciliation discovers logs created while offline', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    const projectPath = path.join(tempRoot, 'offline-project')
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encodeProjectPath(projectPath)
+    )
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'offline-session.jsonl')
+    await fs.writeFile(
+      logPath,
+      `${buildUserLogEntry('created before startup', {
+        sessionId: 'offline-session',
+        cwd: projectPath,
+      })}\n`
+    )
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+      startupReconciliationDelayMs: 5,
+    })
+    poller.start(5000, 'watch')
+
+    const deadline = Date.now() + 1000
+    while (!db.getSessionById('offline-session') && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+
+    expect(db.getSessionById('offline-session')?.logFilePath).toBe(logPath)
+
+    poller.stop()
+    db.close()
+  })
+
+  test('coalesces watcher paths received while another poll is in flight', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    const worker = new BlockingMatchWorkerClient()
+    const poller = new LogPoller(db, registry, { matchWorkerClient: worker })
+
+    const firstPath = path.join(tempRoot, 'first.jsonl')
+    const secondPath = path.join(tempRoot, 'second.jsonl')
+    const firstPoll = poller.pollChanged([firstPath])
+    await waitForRequestCount(worker, 1)
+
+    await poller.pollChanged([secondPath, secondPath])
+    expect(worker.requests).toHaveLength(1)
+
+    worker.release()
+    await firstPoll
+    await waitForRequestCount(worker, 2)
+
+    expect(worker.requests[0]?.preFilteredPaths).toEqual([firstPath])
+    expect(worker.requests[1]?.preFilteredPaths).toEqual([secondPath])
+
+    poller.stop()
+    db.close()
+  })
+
+  test('drains large watcher batches in bounded worker requests', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    const worker = new RecordingMatchWorkerClient()
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: worker,
+      maxLogsPerPoll: 2,
+    })
+    const changedPaths = [
+      path.join(tempRoot, 'one.jsonl'),
+      path.join(tempRoot, 'two.jsonl'),
+      path.join(tempRoot, 'three.jsonl'),
+    ]
+
+    await poller.pollChanged(changedPaths)
+    await waitForRequestCount(worker, 2)
+
+    expect(worker.requests[0]?.preFilteredPaths).toEqual(changedPaths.slice(0, 2))
+    expect(worker.requests[1]?.preFilteredPaths).toEqual(changedPaths.slice(2))
+
+    poller.stop()
+    db.close()
+  })
+
+  test('retries failed watcher batches on the next trigger without losing paths or spinning', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const worker = new (class extends RecordingMatchWorkerClient {
+      override async poll(request: Omit<MatchWorkerRequest, 'id'>): Promise<MatchWorkerResponse> {
+        const response = await super.poll(request)
+        if (this.requests.length === 1) throw new Error('Temporary worker failure')
+        return response
+      }
+    })()
+    const poller = new LogPoller(db, new SessionRegistry(), {
+      matchWorkerClient: worker,
+      maxLogsPerPoll: 2,
+    })
+    const changedPaths = ['one', 'two', 'three'].map((name) =>
+      path.join(tempRoot, `${name}.jsonl`)
+    )
+
+    try {
+      await poller.pollChanged(changedPaths)
+      // Allow scheduled microtasks and a full event-loop turn to run: failure
+      // must wait for a new trigger instead of immediately retrying itself.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(worker.requests).toHaveLength(1)
+      expect(worker.requests[0]?.preFilteredPaths).toEqual(changedPaths.slice(0, 2))
+      expect(poller.matchingError).toContain('Temporary worker failure')
+
+      await poller.pollChanged([])
+      await waitForRequestCount(worker, 3)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const retriedPaths = worker.requests.slice(1).flatMap((request) =>
+        request.preFilteredPaths ?? []
+      )
+      expect(retriedPaths.toSorted()).toEqual(changedPaths.toSorted())
+      expect(worker.requests.every((request) =>
+        request.preFilteredPaths!.length <= 2
+      )).toBe(true)
+      expect(poller.matchingError).toBeNull()
+    } finally {
+      poller.stop()
+      db.close()
+    }
+  })
+
+  // Seeds 10,000 rows; a loaded machine can take longer than bun's 5s default.
+  test('skips startup orphan rematch when every live window is already claimed', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+    const now = new Date().toISOString()
+
+    db.insertSession({
+      sessionId: 'active-session',
+      logFilePath: path.join(tempRoot, 'active.jsonl'),
+      projectPath: baseSession.projectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: baseSession.name,
+      createdAt: now,
+      lastActivityAt: now,
+      lastUserMessage: 'ready',
+      currentWindow: baseSession.tmuxWindow,
+      isHibernating: false,
+      lastResumeError: null,
+      lastKnownLogSize: 0,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const oldTimestamp = '2020-01-01T00:00:00.000Z'
+    for (let index = 0; index < 10_000; index += 1) {
+      db.insertSession({
+        sessionId: `history-${index}`,
+        logFilePath: path.join(tempRoot, `history-${index}.jsonl`),
+        projectPath: `/archived/project-${index}`,
+        slug: null,
+        agentType: index % 2 === 0 ? 'claude' : 'codex',
+        displayName: `history-${index}`,
+        createdAt: oldTimestamp,
+        lastActivityAt: oldTimestamp,
+        lastUserMessage: 'archived',
+        currentWindow: null,
+        isHibernating: false,
+        lastResumeError: null,
+        lastKnownLogSize: 0,
+        isCodexExec: false,
+        launchCommand: null,
+      })
+    }
+
+    const listQueries: Array<{ maxAgeHours?: number } | undefined> = []
+    const getSessionLists = db.getSessionLists
+    db.getSessionLists = (options) => {
+      listQueries.push(options)
+      return getSessionLists(options)
+    }
+    // The consolidated getter must be the only scan — the separate history
+    // query staying silent is the regression being guarded.
+    const historyQueries: Array<{ maxAgeHours?: number } | undefined> = []
+    const getHistorySessions = db.getHistorySessions
+    db.getHistorySessions = (options) => {
+      historyQueries.push(options)
+      return getHistorySessions(options)
+    }
+
+    const worker = new RecordingMatchWorkerClient()
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: worker,
+    })
+
+    poller.start(5000)
+    await poller.waitForOrphanRematch()
+
+    // One request is the normal startup poll. A second request would be the
+    // expensive orphan rematch that previously loaded all 10,000 rows.
+    expect(worker.requests).toHaveLength(1)
+    expect(listQueries).toEqual([{ maxAgeHours: 72 }])
+    expect(historyQueries).toEqual([])
+
+    poller.stop()
+    db.close()
+  }, 30_000)
+
+  test('skips file content reads for already-known sessions', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokens = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokens))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session-known.jsonl')
+    const line = buildUserLogEntry(tokens, { sessionId: 'claude-session-known', cwd: projectPath })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${line}\n${assistantLine}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+
+    // First poll - session is discovered
+    const stats1 = await poller.pollOnce()
+    expect(stats1.newSessions).toBe(1)
+
+    const record = db.getSessionByLogPath(logPath)
+    expect(record?.sessionId).toBe('claude-session-known')
+
+    // Touch the file to update mtime
+    const now = new Date()
+    await fs.utimes(logPath, now, now)
+
+    // Second poll - session already known, should skip enrichment
+    // We verify this by checking that the response includes the entry
+    // but with logTokenCount = -1 (marker for skipped enrichment)
+    const stats2 = await poller.pollOnce()
+    expect(stats2.newSessions).toBe(0)
+
+    // Verify the session was updated (lastActivityAt changed)
+    const updatedRecord = db.getSessionById('claude-session-known')
+    expect(updatedRecord).toBeDefined()
+
+    db.close()
+  })
+
+  test('detects new sessions and matches windows', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokens = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokens))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session-1.jsonl')
+    const line = buildUserLogEntry(tokens, { sessionId: 'claude-session-1', cwd: projectPath })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${line}\n${assistantLine}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    const stats = await poller.pollOnce()
+    expect(stats.newSessions).toBe(1)
+
+    const record = db.getSessionByLogPath(logPath)
+    expect(record?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    db.close()
+  })
+
+  test('does not orphan-rematch hibernating sessions', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const tokens = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    const logPath = path.join(logDir, 'hibernating-session.jsonl')
+    const userLine = buildUserLogEntry(tokens, {
+      sessionId: 'hibernating-session',
+      cwd: projectPath,
+    })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${userLine}\n${assistantLine}\n`)
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokens))
+
+    db.insertSession({
+      sessionId: 'hibernating-session',
+      logFilePath: logPath,
+      projectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: 'alpha',
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      lastUserMessage: null,
+      currentWindow: null,
+      isHibernating: true,
+      lastResumeError: null,
+      lastKnownLogSize: 0,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const activated: Array<{ sessionId: string; window: string }> = []
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+      onSessionActivated: (sessionId, window) => activated.push({ sessionId, window }),
+    })
+
+    poller.start(5000)
+    await poller.waitForOrphanRematch()
+
+    const record = db.getSessionById('hibernating-session')
+    expect(record?.currentWindow).toBeNull()
+    expect(record?.isHibernating).toBeTrue()
+    expect(activated).toEqual([])
+
+    poller.stop()
+    db.close()
+  })
+
+  test('orphan-rematches hibernating sessions with pending wake marker', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const tokens = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    const logPath = path.join(logDir, 'wake-pending-session.jsonl')
+    const userLine = buildUserLogEntry(tokens, {
+      sessionId: 'wake-pending-session',
+      cwd: projectPath,
+    })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${userLine}\n${assistantLine}\n`)
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokens))
+
+    const stats = await fs.stat(logPath)
+    db.insertSession({
+      sessionId: 'wake-pending-session',
+      logFilePath: logPath,
+      projectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: 'alpha',
+      createdAt: stats.birthtime.toISOString(),
+      lastActivityAt: '2020-01-01T00:00:00.000Z',
+      lastUserMessage: null,
+      currentWindow: null,
+      isHibernating: true,
+      lastResumeError: 'server restarted during wake',
+      wakeStartedAt: new Date().toISOString(),
+      lastKnownLogSize: stats.size,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const activated: Array<{ sessionId: string; window: string }> = []
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+      onSessionActivated: (sessionId, window) => activated.push({ sessionId, window }),
+    })
+
+    poller.start(5000)
+    await poller.waitForOrphanRematch()
+
+    const record = db.getSessionById('wake-pending-session')
+    expect(record?.currentWindow).toBe(baseSession.tmuxWindow)
+    expect(record?.isHibernating).toBeTrue()
+    expect(record?.lastResumeError).toBeNull()
+    expect(record?.wakeStartedAt).toBeNull()
+    expect(activated).toEqual([
+      { sessionId: 'wake-pending-session', window: baseSession.tmuxWindow },
+    ])
+
+    poller.stop()
+    db.close()
+  })
+
+  test('supersedes existing session via slug match (plan→execute transition)', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    // Session A: planning session with slug
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: 'starry-leaping-orbit',
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    // Session A now has the window
+    const recordA = db.getSessionById('claude-session-a')
+    expect(recordA?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // Session B: execution session with SAME slug (plan→execute transition)
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+      slug: 'starry-leaping-orbit',
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    // Session A should be orphaned (superseded)
+    const oldRecord = db.getSessionById('claude-session-a')
+    expect(oldRecord?.currentWindow).toBeNull()
+
+    // Session B should claim the window via slug supersede
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(newRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    db.close()
+  })
+
+  test('ownership veto prevents text and slug from replacing the confirmed session)', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    // Session A: planning session with slug
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: 'starry-leaping-orbit',
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+      allowsMatch: (_window, sessionId) => sessionId === 'claude-session-a',
+    })
+    await poller.pollOnce()
+
+    // Session A now has the window
+    const recordA = db.getSessionById('claude-session-a')
+    expect(recordA?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // Session B: execution session with SAME slug (plan→execute transition)
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+      slug: 'starry-leaping-orbit',
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    // Confirmed ownership overrides the slug and matching terminal text.
+    const oldRecord = db.getSessionById('claude-session-a')
+    expect(oldRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // Discovery still records the competing transcript.
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(newRecord?.currentWindow).toBeNull()
+
+    db.close()
+  })
+
+  test('backfills missing slug on existing session and then supersedes by slug', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: 'backfill-slug',
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    db.insertSession({
+      sessionId: 'claude-session-a',
+      logFilePath: logPathA,
+      projectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: 'mint-reed',
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      lastUserMessage: null,
+      currentWindow: baseSession.tmuxWindow,
+      isHibernating: false,
+      lastResumeError: null,
+      lastKnownLogSize: null,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+
+    // Existing record should learn slug from log metadata even when DB slug is null.
+    await poller.pollOnce()
+    const backfilled = db.getSessionById('claude-session-a')
+    expect(backfilled?.slug).toBe('backfill-slug')
+    expect(backfilled?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // New impl session with same slug should supersede existing session.
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+      slug: 'backfill-slug',
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    const oldRecord = db.getSessionById('claude-session-a')
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(oldRecord?.currentWindow).toBeNull()
+    expect(newRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    db.close()
+  })
+
+  test('does not supersede when slugs differ', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: 'slug-alpha',
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    const recordA = db.getSessionById('claude-session-a')
+    expect(recordA?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // Different slug → no supersede
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+      slug: 'slug-beta',
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    // Session A should KEEP the window (different slug = no supersede)
+    const oldRecord = db.getSessionById('claude-session-a')
+    expect(oldRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // Session B should be orphaned
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(newRecord?.currentWindow).toBeNull()
+
+    db.close()
+  })
+
+  test('does not supersede when same slug but different project', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: 'shared-slug',
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    const recordA = db.getSessionById('claude-session-a')
+    expect(recordA?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // Same slug but different project → no supersede
+    const differentProject = path.join(process.cwd(), 'fixtures', 'beta')
+    const encodedBeta = encodeProjectPath(differentProject)
+    const logDirBeta = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encodedBeta
+    )
+    await fs.mkdir(logDirBeta, { recursive: true })
+
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDirBeta, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: differentProject,
+      slug: 'shared-slug',
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    // Session A should KEEP the window (different project = no supersede)
+    const oldRecord = db.getSessionById('claude-session-a')
+    expect(oldRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // Session B should be orphaned
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(newRecord?.currentWindow).toBeNull()
+
+    db.close()
+  })
+
+  test('supersedes same-project session when another project has newer activity with same slug', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const sharedSlug = 'shared-collision-slug'
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: sharedSlug,
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    const activeA = db.getSessionById('claude-session-a')
+    expect(activeA?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    const differentProject = path.join(process.cwd(), 'fixtures', 'beta')
+    db.insertSession({
+      sessionId: 'claude-session-other-project',
+      logFilePath: path.join(
+        process.env.CLAUDE_CONFIG_DIR ?? '',
+        'projects',
+        encodeProjectPath(differentProject),
+        'session-other-project.jsonl'
+      ),
+      projectPath: differentProject,
+      slug: sharedSlug,
+      agentType: 'claude',
+      displayName: 'other-project',
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date(Date.now() + 60_000).toISOString(),
+      lastUserMessage: null,
+      currentWindow: 'agentboard:99',
+      isHibernating: false,
+      lastResumeError: null,
+      lastKnownLogSize: null,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+      slug: sharedSlug,
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    const oldRecord = db.getSessionById('claude-session-a')
+    expect(oldRecord?.currentWindow).toBeNull()
+
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(newRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    const otherProjectRecord = db.getSessionById('claude-session-other-project')
+    expect(otherProjectRecord?.currentWindow).toBe('agentboard:99')
+
+    db.close()
+  })
+
+  test('transfers hibernation marker when superseding via slug', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: 'hibernate-slug',
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    // Mark session A for hibernation
+    db.setHibernating('claude-session-a', true)
+    const markedA = db.getSessionById('claude-session-a')
+    expect(markedA?.isHibernating).toBe(true)
+
+    // Session B with same slug supersedes hibernation-marked session A
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+      slug: 'hibernate-slug',
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    // Session B should inherit the hibernation marker
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(newRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+    expect(newRecord?.isHibernating).toBe(true)
+
+    // Session A should be orphaned
+    const oldRecord = db.getSessionById('claude-session-a')
+    expect(oldRecord?.currentWindow).toBeNull()
+    expect(oldRecord?.isHibernating).toBe(false)
+
+    db.close()
+  })
+
+  test('fires onOrphanSessionsDiscovered when a new session is discovered as orphan', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    // Empty registry: no tmux windows to match against, so any new log
+    // becomes an orphan on first discovery.
+    registry.replaceSessions([])
+
+    const orphanProjectPath = path.join(tempRoot, 'orphan-project')
+    const encoded = encodeProjectPath(orphanProjectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const tokens = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    const logPath = path.join(logDir, 'orphan-session.jsonl')
+    const userLine = buildUserLogEntry(tokens, {
+      sessionId: 'claude-orphan-session',
+      cwd: orphanProjectPath,
+    })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${userLine}\n${assistantLine}\n`)
+
+    const discovered: Array<{ newOrphans: number }> = []
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+      onOrphanSessionsDiscovered: (stats) => discovered.push(stats),
+    })
+
+    const stats = await poller.pollOnce()
+    expect(stats.newSessions).toBe(1)
+    expect(stats.orphans).toBe(1)
+    expect(stats.matches).toBe(0)
+
+    // The DB row should exist as an orphan.
+    const record = db.getSessionById('claude-orphan-session')
+    expect(record).toBeDefined()
+    expect(record?.currentWindow).toBeNull()
+
+    // Callback must fire exactly once with the orphan count, so the server
+    // can broadcast the new history entries over the WebSocket.
+    expect(discovered).toEqual([{ newOrphans: 1 }])
+
+    db.close()
+  })
+
+  test('fires onOrphanSessionsDiscovered from pollChanged (watch-mode path)', async () => {
+    // Watch mode is the default deployment, and new log files reach the
+    // poller through pollChanged() rather than pollOnce(). The broadcast
+    // must fire on both code paths.
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([])
+
+    const orphanProjectPath = path.join(tempRoot, 'orphan-project-watch')
+    const encoded = encodeProjectPath(orphanProjectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const tokens = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    const logPath = path.join(logDir, 'orphan-watch.jsonl')
+    const userLine = buildUserLogEntry(tokens, {
+      sessionId: 'claude-orphan-watch',
+      cwd: orphanProjectPath,
+    })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${userLine}\n${assistantLine}\n`)
+
+    const discovered: Array<{ newOrphans: number }> = []
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+      onOrphanSessionsDiscovered: (stats) => discovered.push(stats),
+    })
+
+    await poller.pollChanged([logPath])
+
+    const record = db.getSessionById('claude-orphan-watch')
+    expect(record).toBeDefined()
+    expect(record?.currentWindow).toBeNull()
+    expect(discovered).toEqual([{ newOrphans: 1 }])
+
+    db.close()
+  })
+
+  test('does not fire onOrphanSessionsDiscovered when no new orphans are created', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokens = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokens))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'matched-session.jsonl')
+    const userLine = buildUserLogEntry(tokens, {
+      sessionId: 'claude-matched-session',
+      cwd: projectPath,
+    })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${userLine}\n${assistantLine}\n`)
+
+    const discovered: Array<{ newOrphans: number }> = []
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+      onOrphanSessionsDiscovered: (stats) => discovered.push(stats),
+    })
+
+    const stats = await poller.pollOnce()
+    expect(stats.newSessions).toBe(1)
+    expect(stats.orphans).toBe(0)
+    expect(discovered).toEqual([])
+
+    db.close()
+  })
+
+  test('fires onSessionOrphaned callback when superseding via slug', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: 'callback-slug',
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const orphanedIds: { id: string; supersededBy?: string }[] = []
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+      onSessionOrphaned: (sessionId, supersededBy) => orphanedIds.push({ id: sessionId, supersededBy }),
+    })
+    await poller.pollOnce()
+
+    // Session B with same slug
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+      slug: 'callback-slug',
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    // onSessionOrphaned should have been called for session A with supersededBy
+    expect(orphanedIds).toHaveLength(1)
+    expect(orphanedIds[0]!.id).toBe('claude-session-a')
+    expect(orphanedIds[0]!.supersededBy).toBe('claude-session-b')
+
+    db.close()
+  })
+
+  test('inherits display name from superseded session via slug', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: 'inherit-name-slug',
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    // Session A gets a display name based on the window
+    const recordA = db.getSessionById('claude-session-a')
+    expect(recordA?.currentWindow).toBe(baseSession.tmuxWindow)
+    const originalDisplayName = recordA!.displayName
+
+    // Session B with same slug supersedes
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+      slug: 'inherit-name-slug',
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    // Session B should inherit Session A's display name
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(newRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+    expect(newRecord?.displayName).toBe(originalDisplayName)
+
+    db.close()
+  })
+
+  test('updates lastUserMessage when newer log entry arrives', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session.jsonl')
+
+    const sessionId = 'claude-session-a'
+    const oldMessage = 'old prompt'
+    const newMessage = 'new prompt'
+    const logLines = [
+      buildUserLogEntry(oldMessage, { sessionId, cwd: projectPath }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'ack' }] } }),
+      buildUserLogEntry(newMessage, { sessionId, cwd: projectPath }),
+    ].join('\n')
+    await fs.writeFile(logPath, `${logLines}\n`)
+
+    const stats = await fs.stat(logPath)
+    db.insertSession({
+      sessionId,
+      logFilePath: logPath,
+      projectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: 'alpha',
+      createdAt: stats.birthtime.toISOString(),
+      lastActivityAt: new Date(stats.mtime.getTime() - 1000).toISOString(),
+      lastUserMessage: oldMessage,
+      currentWindow: baseSession.tmuxWindow,
+      isHibernating: false,
+      lastResumeError: null,
+      lastKnownLogSize: 0,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    const updated = db.getSessionById(sessionId)
+    expect(updated?.lastUserMessage).toBe(newMessage)
+
+    db.close()
+  })
+
+  test('rematches an old orphan with stale project metadata on startup', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokens = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokens))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session-orphan.jsonl')
+    const line = buildUserLogEntry(tokens, { sessionId: 'claude-session-orphan', cwd: projectPath })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${line}\n${assistantLine}\n`)
+
+    const stats = await fs.stat(logPath)
+    db.insertSession({
+      sessionId: 'claude-session-orphan',
+      logFilePath: logPath,
+      projectPath: '/stale/moved/project',
+      slug: null,
+      agentType: 'claude',
+      displayName: 'orphan',
+      createdAt: stats.birthtime.toISOString(),
+      lastActivityAt: '2020-01-01T00:00:00.000Z',
+      lastUserMessage: null,
+      currentWindow: null,
+      isHibernating: false,
+      lastResumeError: 'wake failed',
+      lastKnownLogSize: stats.size,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    // Start poller which triggers first poll and background orphan rematch
+    poller.start(5000)
+    // Wait for orphan rematch to complete
+    await poller.waitForOrphanRematch()
+
+    const updated = db.getSessionById('claude-session-orphan')
+    expect(updated?.currentWindow).toBe(baseSession.tmuxWindow)
+    expect(updated?.displayName).toBe(baseSession.name)
+    expect(updated?.lastResumeError).toBeNull()
+
+    poller.stop()
+    db.close()
+  })
+
+  test('orphan rematch sees history rows beyond the sidebar cap', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+    const base = {
+      projectPath: baseSession.projectPath,
+      slug: null,
+      agentType: 'claude' as const,
+      createdAt: '2020-01-01T00:00:00.000Z',
+      lastUserMessage: null,
+      currentWindow: null,
+      isHibernating: false,
+      lastResumeError: null,
+      lastKnownLogSize: 0,
+      isCodexExec: false,
+      launchCommand: null,
+    }
+    // 120 newer History rows push the oldest one past the 100-row sidebar cap.
+    for (let i = 0; i < 120; i++) {
+      db.insertSession({
+        ...base,
+        sessionId: `newer-${i}`,
+        logFilePath: path.join(tempRoot, `newer-${i}.jsonl`),
+        displayName: `newer-${i}`,
+        lastActivityAt: new Date(Date.UTC(2025, 0, 1, 0, i)).toISOString(),
+      })
+    }
+    db.insertSession({
+      ...base,
+      sessionId: 'oldest',
+      logFilePath: path.join(tempRoot, 'oldest.jsonl'),
+      displayName: 'oldest',
+      lastActivityAt: '2020-01-01T00:00:00.000Z',
+    })
+    expect(
+      db.getHistorySessions({ limit: 100 }).some((r) => r.sessionId === 'oldest')
+    ).toBe(false)
+
+    const worker = new RecordingMatchWorkerClient()
+    const poller = new LogPoller(db, registry, { matchWorkerClient: worker })
+    poller.start(5000)
+    await poller.waitForOrphanRematch()
+    poller.stop()
+
+    const rematch = worker.requests.find((r) => (r.orphanCandidates?.length ?? 0) > 0)
+    const ids = rematch?.orphanCandidates?.map((c) => c.sessionId) ?? []
+    expect(ids).toHaveLength(121)
+    expect(ids).toContain('oldest')
+
+    db.close()
+  })
+
+  test('clears resume error when orphaned session rematches during poll', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokens = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokens))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session-rematch.jsonl')
+    const line = buildUserLogEntry(tokens, {
+      sessionId: 'claude-session-rematch',
+      cwd: projectPath,
+    })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${line}\n${assistantLine}\n`)
+
+    const stats = await fs.stat(logPath)
+    db.insertSession({
+      sessionId: 'claude-session-rematch',
+      logFilePath: logPath,
+      projectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: 'rematch',
+      createdAt: stats.birthtime.toISOString(),
+      lastActivityAt: stats.mtime.toISOString(),
+      lastUserMessage: null,
+      currentWindow: null,
+      isHibernating: false,
+      lastResumeError: 'wake failed',
+      lastKnownLogSize: 0,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    const updated = db.getSessionById('claude-session-rematch')
+    expect(updated?.currentWindow).toBe(baseSession.tmuxWindow)
+    expect(updated?.lastResumeError).toBeNull()
+
+    db.close()
+  })
+
+  test('matches new session to window when existing session is orphaned between polls', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    // Poll 1: Session A is discovered and matched to the window
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    const recordA = db.getSessionById('claude-session-a')
+    expect(recordA?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // Between polls: Session A's window claim is removed (simulating orphan cleanup)
+    db.updateSession('claude-session-a', { currentWindow: null })
+    const orphanedA = db.getSessionById('claude-session-a')
+    expect(orphanedA?.currentWindow).toBeNull()
+
+    // Poll 2: Session B appears with different content.
+    // The window is now unclaimed, so the optimization should allow matching.
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    // Session B should get matched to the now-unclaimed window
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(newRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    db.close()
+  })
+
+  test('new session with slug supersedes claimed window without needing match', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    registry.replaceSessions([baseSession])
+
+    const tokensA = Array.from({ length: 60 }, (_, i) => `token${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensA))
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    // Poll 1: Session A gets matched to the window (with slug)
+    const logPathA = path.join(logDir, 'session-a.jsonl')
+    const lineA = buildUserLogEntry(tokensA, {
+      sessionId: 'claude-session-a',
+      cwd: projectPath,
+      slug: 'supersede-slug',
+    })
+    const assistantLineA = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensA }] },
+    })
+    await fs.writeFile(logPathA, `${lineA}\n${assistantLineA}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    await poller.pollOnce()
+
+    const recordA = db.getSessionById('claude-session-a')
+    expect(recordA?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    // Poll 2: Session B appears with the same slug + project.
+    // The window is still claimed by A, so match-based matching is skipped
+    // for this window. However, slug supersede should detach A and give
+    // the window to B without needing rg matching.
+    const tokensB = Array.from({ length: 60 }, (_, i) => `next${i}`).join(' ')
+    setTmuxOutput(baseSession.tmuxWindow, buildLastExchangeOutput(tokensB))
+
+    const logPathB = path.join(logDir, 'session-b.jsonl')
+    const lineB = buildUserLogEntry(tokensB, {
+      sessionId: 'claude-session-b',
+      cwd: projectPath,
+      slug: 'supersede-slug',
+    })
+    const assistantLineB = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokensB }] },
+    })
+    await fs.writeFile(logPathB, `${lineB}\n${assistantLineB}\n`)
+
+    await poller.pollOnce()
+
+    // Session A should be detached (superseded by slug)
+    const oldRecord = db.getSessionById('claude-session-a')
+    expect(oldRecord?.currentWindow).toBeNull()
+
+    // Session B should claim the window via slug supersede,
+    // even though the optimization skipped rg matching for claimed windows
+    const newRecord = db.getSessionById('claude-session-b')
+    expect(newRecord?.currentWindow).toBe(baseSession.tmuxWindow)
+
+    db.close()
+  })
+
+  test('ignores external windows in name-based orphan fallback', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    const externalWindow: Session = {
+      ...baseSession,
+      id: 'external:1',
+      name: 'orphan',
+      tmuxWindow: 'external:1',
+      projectPath: '/tmp/external',
+      source: 'external',
+    }
+    registry.replaceSessions([externalWindow])
+
+    const tokens = Array.from({ length: 10 }, (_, i) => `token${i}`).join(' ')
+    const projectPath = '/tmp/orphan'
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session-orphan.jsonl')
+    const line = buildUserLogEntry(tokens, {
+      sessionId: 'claude-session-orphan',
+      cwd: projectPath,
+    })
+    await fs.writeFile(logPath, `${line}\n`)
+
+    const stats = await fs.stat(logPath)
+    db.insertSession({
+      sessionId: 'claude-session-orphan',
+      logFilePath: logPath,
+      projectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: 'orphan',
+      createdAt: stats.birthtime.toISOString(),
+      lastActivityAt: stats.mtime.toISOString(),
+      lastUserMessage: null,
+      currentWindow: null,
+      isHibernating: false,
+      lastResumeError: null,
+      lastKnownLogSize: null,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+    poller.start(5000)
+    await poller.waitForOrphanRematch()
+
+    const updated = db.getSessionById('claude-session-orphan')
+    expect(updated?.currentWindow).toBeNull()
+
+    poller.stop()
+    db.close()
+  })
+
+  test('defers orphan insertion when booting window shares project path', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    // Window has empty tmux output (still booting)
+    const bootingWindow: Session = {
+      ...baseSession,
+      id: 'window-booting',
+      name: 'booting',
+      tmuxWindow: 'agentboard:5',
+    }
+    registry.replaceSessions([bootingWindow])
+
+    // Empty terminal: no user messages, no trace lines
+    setTmuxOutput('agentboard:5', '')
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    // Create a log file in the same project path
+    const logPath = path.join(logDir, 'session-deferred.jsonl')
+    const tokens = Array.from({ length: 60 }, (_, i) => `defer${i}`).join(' ')
+    const line = buildUserLogEntry(tokens, {
+      sessionId: 'claude-session-deferred',
+      cwd: projectPath,
+    })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${line}\n${assistantLine}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+
+    // First poll: session should be deferred (window is booting, shares project path)
+    const stats1 = await poller.pollOnce()
+    expect(stats1.newSessions).toBe(0)
+    const deferredRecord = db.getSessionByLogPath(logPath)
+    expect(deferredRecord).toBeNull()
+
+    // Now the window has content that matches the log
+    setTmuxOutput('agentboard:5', buildLastExchangeOutput(tokens))
+
+    // Second poll: session should now be inserted with currentWindow set
+    const stats2 = await poller.pollOnce()
+    expect(stats2.newSessions).toBe(1)
+
+    const record = db.getSessionByLogPath(logPath)
+    expect(record?.sessionId).toBe('claude-session-deferred')
+    expect(record?.currentWindow).toBe('agentboard:5')
+
+    db.close()
+  })
+
+  test('does NOT defer when no-message window is already claimed', async () => {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    // Window has empty tmux output (still booting)
+    const bootingWindow: Session = {
+      ...baseSession,
+      id: 'window-claimed',
+      name: 'claimed',
+      tmuxWindow: 'agentboard:6',
+    }
+    registry.replaceSessions([bootingWindow])
+
+    // Empty terminal: no user messages, no trace lines
+    setTmuxOutput('agentboard:6', '')
+
+    const projectPath = baseSession.projectPath
+    const encoded = encodeProjectPath(projectPath)
+    const logDir = path.join(
+      process.env.CLAUDE_CONFIG_DIR ?? '',
+      'projects',
+      encoded
+    )
+    await fs.mkdir(logDir, { recursive: true })
+
+    // Pre-insert a session that claims the booting window
+    db.insertSession({
+      sessionId: 'claude-session-existing',
+      logFilePath: path.join(logDir, 'session-existing.jsonl'),
+      projectPath,
+      slug: null,
+      agentType: 'claude',
+      displayName: 'existing',
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      lastUserMessage: null,
+      currentWindow: 'agentboard:6',
+      isHibernating: false,
+      lastResumeError: null,
+      lastKnownLogSize: null,
+      isCodexExec: false,
+      launchCommand: null,
+    })
+
+    // Create a new log file in the same project path
+    const logPath = path.join(logDir, 'session-new.jsonl')
+    const tokens = Array.from({ length: 60 }, (_, i) => `newt${i}`).join(' ')
+    const line = buildUserLogEntry(tokens, {
+      sessionId: 'claude-session-new',
+      cwd: projectPath,
+    })
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: tokens }] },
+    })
+    await fs.writeFile(logPath, `${line}\n${assistantLine}\n`)
+
+    const poller = new LogPoller(db, registry, {
+      matchWorkerClient: new InlineMatchWorkerClient(),
+    })
+
+    // Poll: despite booting window sharing project path, it's already claimed,
+    // so the new session should NOT be deferred — it should be inserted as orphan
+    const stats = await poller.pollOnce()
+    expect(stats.newSessions).toBe(1)
+
+    const record = db.getSessionByLogPath(logPath)
+    expect(record?.sessionId).toBe('claude-session-new')
+    // No window match since the terminal is empty, so it's orphaned
+    expect(record?.currentWindow).toBeNull()
+
+    db.close()
+  })
+})
+
+describe('LogPoller devin sync logging', () => {
+  const noChange = { sessions: 4, rewritten: 0, appended: 0, removed: 0 }
+  const changed = { sessions: 4, rewritten: 0, appended: 2, removed: 0 }
+
+  async function runSyncAndCapture(result: typeof noChange) {
+    const db = initDatabase({ path: ':memory:' })
+    const registry = new SessionRegistry()
+    const calls: Array<{ level: string; event: string }> = []
+    const originalInfo = logger.info
+    const originalDebug = logger.debug
+    logger.info = (event) => calls.push({ level: 'info', event })
+    logger.debug = (event) => calls.push({ level: 'debug', event })
+    try {
+      const poller = new LogPoller(db, registry, {
+        devinSyncClient: {
+          sync: async () => ({ result, durationMs: 3 }),
+          dispose: () => {},
+        },
+      })
+      ;(poller as unknown as { runDevinSync: () => void }).runDevinSync()
+      await Bun.sleep(0)
+      return calls.filter((c) => c.event === 'devin_sync')
+    } finally {
+      logger.info = originalInfo
+      logger.debug = originalDebug
+      db.close()
+    }
+  }
+
+  test('no-op sync cycles log at debug', async () => {
+    expect(await runSyncAndCapture(noChange)).toEqual([{ level: 'debug', event: 'devin_sync' }])
+  })
+
+  test('sync cycles that change mirrors log at info', async () => {
+    expect(await runSyncAndCapture(changed)).toEqual([{ level: 'info', event: 'devin_sync' }])
+  })
+})

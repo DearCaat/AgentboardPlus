@@ -1,0 +1,1118 @@
+import { applyPrStatus, fetchChecks, refreshPrStatus } from '../lib/prStatus'
+import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
+import TestRenderer, { act } from 'react-test-renderer'
+
+// Render portal children inline so the card is part of the test tree.
+mock.module('react-dom', () => ({
+  createPortal: (children: unknown) => children,
+}))
+
+const { PrChips } = await import('../components/PrChips')
+
+const PR = {
+  url: 'https://github.com/o/r/pull/1',
+  repo: 'o/r',
+  number: 1,
+}
+
+type Listener = (e: { target?: unknown; key?: string }) => void
+
+const globalAny = globalThis as unknown as Record<string, unknown>
+const originalWindow = globalAny.window
+const originalDocument = globalAny.document
+const originalGetComputedStyle = globalAny.getComputedStyle
+const originalFetch = globalThis.fetch
+
+let scrollListeners: Listener[] = []
+let resizeListeners: Listener[] = []
+let keydownListeners: Listener[] = []
+
+// Deterministic stand-in for window timers: hover-card open/close delays
+// are flushed explicitly instead of waiting on wall-clock time.
+let timers: { id: number; fn: () => void }[] = []
+let nextTimerId = 1
+function flushWindowTimers() {
+  const pending = timers
+  timers = []
+  for (const t of pending) t.fn()
+}
+
+const fakeWindow = {
+  innerWidth: 1000,
+  innerHeight: 800,
+  setTimeout: (fn: () => void, _ms?: number) => {
+    const id = nextTimerId++
+    timers.push({ id, fn })
+    return id
+  },
+  clearTimeout: (id: number) => {
+    timers = timers.filter((t) => t.id !== id)
+  },
+  addEventListener: (type: string, fn: Listener) => {
+    if (type === 'scroll') scrollListeners.push(fn)
+    else if (type === 'resize') resizeListeners.push(fn)
+    else if (type === 'keydown') keydownListeners.push(fn)
+  },
+  removeEventListener: (type: string, fn: Listener) => {
+    const arr =
+      type === 'scroll'
+        ? scrollListeners
+        : type === 'resize'
+          ? resizeListeners
+          : keydownListeners
+    const i = arr.indexOf(fn)
+    if (i >= 0) arr.splice(i, 1)
+  },
+}
+
+let chipRect = { top: 700, bottom: 720, left: 100, right: 140 }
+
+// Anchor spans read getBoundingClientRect; card divs read contains().
+const createNodeMock = () => ({
+  getBoundingClientRect: () => chipRect,
+  contains: (target: unknown) =>
+    !!(target && (target as { __inCard?: boolean }).__inCard),
+})
+
+function findCard(root: TestRenderer.ReactTestInstance) {
+  return root
+    .findAll(
+      (el) =>
+        typeof el.props.className === 'string' &&
+        el.props.className.includes('fixed')
+    )
+    .at(-1)
+}
+
+function chipEl(root: TestRenderer.ReactTestInstance) {
+  return root
+    .findAll(
+      (el) =>
+        typeof el.props.className === 'string' &&
+        el.props.className.startsWith('relative inline-flex') &&
+        typeof el.props.onMouseEnter === 'function'
+    )
+    .at(0)!
+}
+
+function openCard(root: TestRenderer.ReactTestInstance) {
+  const chip = chipEl(root)
+  act(() => chip.props.onMouseEnter())
+  // Open is delayed for hover intent — elapse the timer.
+  act(flushWindowTimers)
+}
+
+describe('PrChips hover card', () => {
+  beforeEach(() => {
+    scrollListeners = []
+    resizeListeners = []
+    keydownListeners = []
+    timers = []
+    chipRect = { top: 700, bottom: 720, left: 100, right: 140 }
+    globalAny.window = fakeWindow
+    globalAny.document = { body: {} }
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/pr-checks')) {
+        return new Response(
+          JSON.stringify({
+            url: PR.url,
+            state: 'OPEN',
+            title: 'My PR',
+            author: 'me',
+            checks: [
+              {
+                name: 'ci',
+                status: 'COMPLETED',
+                conclusion: 'SUCCESS',
+                link: 'https://github.com/o/r/actions/runs/1',
+              },
+            ],
+          })
+        )
+      }
+      return new Response(JSON.stringify([]))
+    }) as unknown as typeof fetch
+  })
+
+  afterAll(() => {
+    globalAny.window = originalWindow
+    globalAny.document = originalDocument
+    globalAny.getComputedStyle = originalGetComputedStyle
+    globalThis.fetch = originalFetch
+    mock.restore()
+  })
+
+  test('opens only after the hover delay; leaving early cancels the open', () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[PR]} />, {
+        createNodeMock,
+      })
+    })
+    const chip = chipEl(renderer.root)
+
+    // A passing hover doesn't open the card.
+    act(() => chip.props.onMouseEnter())
+    act(() => chip.props.onMouseLeave())
+    act(flushWindowTimers)
+    expect(findCard(renderer.root)).toBeUndefined()
+
+    // Resting past the delay opens it.
+    act(() => chip.props.onMouseEnter())
+    expect(findCard(renderer.root)).toBeUndefined()
+    act(flushWindowTimers)
+    expect(findCard(renderer.root)).toBeDefined()
+    act(() => renderer.unmount())
+  })
+
+  test('anchors above the chip when there is more room above', () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[PR]} />, {
+        createNodeMock,
+      })
+    })
+    act(() => openCard(renderer.root))
+    const card = findCard(renderer.root)!
+    expect(card.props.style.bottom).toBe(800 - 700 + 3)
+    expect(card.props.style.top).toBeUndefined()
+    expect(card.props.style.left).toBe(100)
+    expect(card.props.style.maxHeight).toBe(692 - 3)
+    act(() => renderer.unmount())
+  })
+
+  test('flips below the chip near the top edge and clamps left', () => {
+    chipRect = { top: 40, bottom: 60, left: 950, right: 990 }
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[PR]} />, {
+        createNodeMock,
+      })
+    })
+    act(() => openCard(renderer.root))
+    const card = findCard(renderer.root)!
+    expect(card.props.style.top).toBe(60 + 3)
+    expect(card.props.style.bottom).toBeUndefined()
+    // w-64 card: clamped to innerWidth - 256 - 8, never negative.
+    expect(card.props.style.left).toBe(1000 - 256 - 8)
+    expect(card.props.style.maxHeight).toBe(732 - 3)
+    act(() => renderer.unmount())
+  })
+
+  test('Escape closes the card', () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[PR]} />, {
+        createNodeMock,
+      })
+    })
+    act(() => openCard(renderer.root))
+    expect(findCard(renderer.root)).toBeDefined()
+    act(() => {
+      for (const fn of keydownListeners) fn({ key: 'Escape' })
+    })
+    expect(findCard(renderer.root)).toBeUndefined()
+    act(() => renderer.unmount())
+  })
+
+  test('scroll inside the card keeps it open; outside scroll closes it', async () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[PR]} />, {
+        createNodeMock,
+      })
+    })
+    act(() => openCard(renderer.root))
+    expect(scrollListeners.length).toBeGreaterThan(0)
+
+    act(() => {
+      for (const fn of scrollListeners) fn({ target: { __inCard: true } })
+    })
+    expect(findCard(renderer.root)).toBeDefined()
+
+    act(() => {
+      for (const fn of scrollListeners) fn({ target: {} })
+    })
+    expect(findCard(renderer.root)).toBeUndefined()
+    act(() => renderer.unmount())
+  })
+
+  test('header, title, and check rows link out', async () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[PR]} />, {
+        createNodeMock,
+      })
+    })
+    act(() => openCard(renderer.root))
+    // Let the lazy /api/pr-checks fetch resolve.
+    await act(async () => {})
+
+    const card = findCard(renderer.root)!
+    const links = card
+      .findAll((el) => el.type === 'a')
+      .map((el) => el.props.href)
+    // repo#number + title + one linked check row.
+    expect(links.filter((h) => h === PR.url).length).toBe(2)
+    expect(links).toContain('https://github.com/o/r/actions/runs/1')
+    act(() => renderer.unmount())
+  })
+
+  test('renders skipped checks as neutral, not failed', async () => {
+    // Distinct url: check results are cached module-wide per PR.
+    const pr2 = { ...PR, url: 'https://github.com/o/r/pull/2', number: 2 }
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/pr-checks')) {
+        return new Response(
+          JSON.stringify({
+            url: pr2.url,
+            state: 'OPEN',
+            title: 'My PR',
+            author: 'me',
+            checks: [
+              { name: 'CodeQL', status: 'COMPLETED', conclusion: 'SKIPPED' },
+            ],
+          })
+        )
+      }
+      return new Response(JSON.stringify([]))
+    }) as unknown as typeof fetch
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[pr2]} />, {
+        createNodeMock,
+      })
+    })
+    act(() => openCard(renderer.root))
+    await act(async () => {})
+
+    const card = findCard(renderer.root)!
+    const neutral = card.findAll(
+      (el) =>
+        el.props.children === '–' &&
+        typeof el.props.className === 'string' &&
+        el.props.className.includes('text-muted')
+    )
+    const failed = card.findAll((el) => el.props.children === '✗')
+    expect(neutral.length).toBe(1)
+    expect(failed.length).toBe(0)
+    act(() => renderer.unmount())
+  })
+})
+
+const PADDING_LEFT = 22
+const CHIP_W = 50
+const PLUS_W = 20 // "+"
+const PLUS_DIGIT_W = 26 // "+0" → digit width = 6
+
+let containerWidth = 0
+
+function textOf(el: TestRenderer.ReactTestInstance): string {
+  const c = el.props.children
+  return Array.isArray(c) ? c.join('') : String(c ?? '')
+}
+
+// Ref'd nodes: the container div reports clientWidth, the offscreen
+// measurer pills report offsetWidth by text content.
+const fitNodeMock = (el: { type: unknown; props: { children?: unknown } }) => {
+  if (el.type === 'div') {
+    return {
+      get clientWidth() {
+        return containerWidth
+      },
+      getBoundingClientRect: () => chipRect,
+      contains: (target: unknown) =>
+        !!(target && (target as { __inCard?: boolean }).__inCard),
+    }
+  }
+  const c = el.props.children
+  const flat = Array.isArray(c) ? c.join('') : String(c ?? '')
+  if (flat === '+') return { offsetWidth: PLUS_W }
+  if (flat === '+0') return { offsetWidth: PLUS_DIGIT_W }
+  // Chip/measurer pills hold [icon element, number] — a raw number child
+  // distinguishes them from the "+" and "+0" probes.
+  if (Array.isArray(c) && c.some((x) => typeof x === 'number'))
+    return { offsetWidth: CHIP_W }
+  return {
+    getBoundingClientRect: () => chipRect,
+    contains: () => false,
+  }
+}
+
+const makePrs = (n: number) =>
+  Array.from({ length: n }, (_, i) => ({
+    url: `https://github.com/o/r/pull/${i + 1}`,
+    repo: 'o/r',
+    number: i + 1,
+  }))
+
+const chipLinks = (root: TestRenderer.ReactTestInstance) =>
+  root.findAll((el) => el.type === 'a' && typeof el.props.href === 'string')
+
+const overflowText = (root: TestRenderer.ReactTestInstance) =>
+  root
+    .findAll((el) => /^\+[1-9]/.test(textOf(el)))
+    .map(textOf)
+    .at(-1)
+
+describe('PrChips single-row fit', () => {
+  beforeEach(() => {
+    globalAny.window = fakeWindow
+    globalAny.document = { body: {} }
+    globalAny.getComputedStyle = () => ({
+      paddingLeft: `${PADDING_LEFT}px`,
+      paddingRight: '0px',
+      columnGap: '4px',
+    })
+  })
+
+  afterAll(() => {
+    globalAny.window = originalWindow
+    globalAny.document = originalDocument
+    globalAny.getComputedStyle = originalGetComputedStyle
+  })
+
+  test('shows only the chips that fit and collapses the rest into +N', () => {
+    // avail = 222 - 22 = 200; chip=50, gap=4, "+N"=26, gap before "+N"=4.
+    // 3 chips cost 154 + 30 reserved = 184; a 4th would need 84 more.
+    containerWidth = 222
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock: fitNodeMock,
+      })
+    })
+    expect(chipLinks(renderer.root).length).toBe(3)
+    expect(overflowText(renderer.root)).toBe('+2')
+    act(() => renderer.unmount())
+  })
+
+  test('shows all chips and no +N when everything fits', () => {
+    containerWidth = 1000
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock: fitNodeMock,
+      })
+    })
+    expect(chipLinks(renderer.root).length).toBe(5)
+    expect(overflowText(renderer.root)).toBeUndefined()
+    act(() => renderer.unmount())
+  })
+
+  test('reflows on resize: narrowing the row folds chips into +N', () => {
+    containerWidth = 1000
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock: fitNodeMock,
+      })
+    })
+    expect(chipLinks(renderer.root).length).toBe(5)
+
+    // avail = 130 - 22 = 108: one chip (50) + gap (4) + "+4" (26) = 80 fits,
+    // a second chip would push past the edge.
+    containerWidth = 130
+    act(() => {
+      for (const fn of resizeListeners) fn({})
+    })
+    expect(chipLinks(renderer.root).length).toBe(1)
+    expect(overflowText(renderer.root)).toBe('+4')
+    act(() => renderer.unmount())
+  })
+
+  test('falls back to showing all chips when measurements are unavailable', () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock,
+      })
+    })
+    expect(chipLinks(renderer.root).length).toBe(5)
+    act(() => renderer.unmount())
+  })
+})
+
+describe('PrChips info fetch resilience', () => {
+  // Unique url space — module caches persist across tests in this file.
+  const prFor = (n: number) => ({
+    url: `https://github.com/o/r/pull/${100 + n}`,
+    repo: 'o/r',
+    number: 100 + n,
+  })
+
+  const infoResponse = (url: string, state: string) =>
+    new Response(
+      JSON.stringify([{ url, state, isDraft: false, title: 't', author: 'a' }])
+    )
+
+  let visListeners: (() => void)[] = []
+  let fetchImpl: () => Promise<Response>
+  let fetchMock: ReturnType<typeof mock>
+
+  // State color rides on the chip glyph's svg; the offscreen measurer
+  // icons always render the muted fallback.
+  const iconClasses = (root: TestRenderer.ReactTestInstance) =>
+    root
+      .findAll(
+        (el) =>
+          el.type === 'svg' &&
+          typeof el.props.className === 'string' &&
+          /text-(muted|pr-open|pr-merged|pr-closed|pr-pending)/.test(el.props.className)
+      )
+      .map((el) => el.props.className as string)
+
+  const hasIconColor = (root: TestRenderer.ReactTestInstance, cls: string) =>
+    iconClasses(root).some((c) => c.includes(cls))
+
+  beforeEach(() => {
+    visListeners = []
+    globalAny.window = fakeWindow
+    globalAny.document = {
+      body: {},
+      visibilityState: 'visible',
+      addEventListener: (type: string, fn: () => void) => {
+        if (type === 'visibilitychange') visListeners.push(fn)
+      },
+      removeEventListener: (type: string, fn: () => void) => {
+        if (type !== 'visibilitychange') return
+        const i = visListeners.indexOf(fn)
+        if (i >= 0) visListeners.splice(i, 1)
+      },
+    }
+    fetchImpl = async () => new Response(JSON.stringify([]))
+    fetchMock = mock((_input: RequestInfo | URL) => fetchImpl())
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+  })
+
+  afterAll(() => {
+    globalAny.window = originalWindow
+    globalAny.document = originalDocument
+    globalThis.fetch = originalFetch
+  })
+
+  test('many mounted rows share bounded batches and a late hover shares checks', async () => {
+    const prs = Array.from({ length: 18 }, (_, i) => prFor(200 + i))
+    const batches: string[][] = []
+    const release: (() => void)[] = []
+    let checkCalls = 0
+    let releaseChecks!: () => void
+    globalThis.fetch = mock((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith('/api/pr-checks')) {
+        checkCalls++
+        return new Promise<Response>(resolve => { releaseChecks = () => resolve(new Response(JSON.stringify({ url: prs[0].url, checks: [{ name: 'shared-check', status: 'COMPLETED', conclusion: 'SUCCESS' }] }))) })
+      }
+      const { urls } = JSON.parse(String(init?.body)) as { urls: string[] }
+      batches.push(urls)
+      return new Promise<Response>(resolve => { release.push(() => resolve(new Response(JSON.stringify(urls.map(url => ({ url, state: 'OPEN' })))))) })
+    }) as unknown as typeof fetch
+    const renderers: TestRenderer.ReactTestRenderer[] = []
+    act(() => {
+      for (const pr of prs) renderers.push(TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }))
+    })
+    await act(async () => {})
+    expect(batches).toHaveLength(1)
+    expect(batches[0]).toHaveLength(8)
+    openCard(renderers[0].root)
+    await act(async () => {})
+    expect(checkCalls).toBe(1)
+    // A second chip opens while the first hover's request is still pending.
+    let late!: TestRenderer.ReactTestRenderer
+    act(() => { late = TestRenderer.create(<PrChips prs={[prs[0]]} />, { createNodeMock }) })
+    openCard(late.root)
+    act(() => renderers[0].unmount())
+    releaseChecks()
+    await act(async () => {})
+    expect(checkCalls).toBe(1)
+    expect(JSON.stringify(late.toJSON())).toContain('shared-check')
+    for (let i = 0; i < 3; i++) {
+      release[i]()
+      await act(async () => {})
+    }
+    expect(batches.map(batch => batch.length)).toEqual([8, 8, 2])
+    expect(batches.flat()).toEqual(prs.map(pr => pr.url))
+    for (const renderer of renderers.slice(1)) act(() => renderer.unmount())
+    act(() => late.unmount())
+  })
+
+  test('error results are not cached — remount retries and colors the icon', async () => {
+    const pr = prFor(1)
+    fetchImpl = async () =>
+      new Response(JSON.stringify([{ url: pr.url, error: 'unavailable' }]))
+    let r1!: TestRenderer.ReactTestRenderer
+    act(() => {
+      r1 = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock })
+    })
+    await act(async () => {})
+    expect(hasIconColor(r1.root, 'text-muted')).toBe(true)
+    const calls = fetchMock.mock.calls.length
+    act(() => r1.unmount())
+
+    fetchImpl = async () => infoResponse(pr.url, 'OPEN')
+    let r2!: TestRenderer.ReactTestRenderer
+    act(() => {
+      r2 = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock })
+    })
+    await act(async () => {})
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(calls)
+    expect(hasIconColor(r2.root, 'text-pr-open')).toBe(true)
+    act(() => r2.unmount())
+  })
+
+  test('chip mounting while a fetch is in flight still gets the result', async () => {
+    const pr = prFor(2)
+    let resolveFetch!: (r: Response) => void
+    fetchImpl = () =>
+      new Promise<Response>((res) => {
+        resolveFetch = res
+      })
+    let r1!: TestRenderer.ReactTestRenderer
+    act(() => {
+      r1 = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock })
+    })
+    await act(async () => {}) // Same-mount calls coalesce before dispatch.
+    // First chip unmounts with the request still in flight; a fresh chip
+    // must subscribe to the shared promise rather than stay gray forever.
+    act(() => r1.unmount())
+    let r2!: TestRenderer.ReactTestRenderer
+    act(() => {
+      r2 = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock })
+    })
+    resolveFetch(infoResponse(pr.url, 'OPEN'))
+    await act(async () => {})
+    expect(fetchMock.mock.calls.length).toBe(1)
+    expect(hasIconColor(r2.root, 'text-pr-open')).toBe(true)
+    act(() => r2.unmount())
+  })
+
+  test('becoming visible refetches stale info', async () => {
+    const pr = prFor(3)
+    fetchImpl = async () => infoResponse(pr.url, 'OPEN')
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[pr]} />, {
+        createNodeMock,
+      })
+    })
+    await act(async () => {})
+    expect(hasIconColor(renderer.root, 'text-pr-open')).toBe(true)
+
+    // Age the cache past the 60s TTL, swap the response, then simulate
+    // the PWA resuming from suspension.
+    const realNow = Date.now
+    Date.now = () => realNow() + 61_000
+    fetchImpl = async () => infoResponse(pr.url, 'MERGED')
+    const calls = fetchMock.mock.calls.length
+    act(() => {
+      for (const fn of visListeners) fn()
+    })
+    await act(async () => {})
+    Date.now = realNow
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(calls)
+    expect(hasIconColor(renderer.root, 'text-pr-merged')).toBe(true)
+    act(() => renderer.unmount())
+  })
+
+  test('merged-after-hover flips the glyph: fresh info beats stale cached checks', async () => {
+    // Regression: detail used to prefer the permanently-cached checks
+    // response, pinning the glyph to whatever state held at first hover.
+    const pr = prFor(4)
+    let state = 'OPEN'
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/pr-checks'))
+        return new Response(
+          JSON.stringify({ url: pr.url, state, title: 't', author: 'a', checks: [] })
+        )
+      return new Response(
+        JSON.stringify([{ url: pr.url, state, isDraft: false, title: 't', author: 'a' }])
+      )
+    }) as unknown as typeof fetch
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[pr]} />, {
+        createNodeMock,
+      })
+    })
+    await act(async () => {})
+    act(() => openCard(renderer.root)) // caches checks with state=OPEN
+    await act(async () => {})
+    expect(hasIconColor(renderer.root, 'text-pr-open')).toBe(true)
+
+    // PR merges; the info cache ages out; a resume triggers a refetch.
+    state = 'MERGED'
+    const realNow = Date.now
+    Date.now = () => realNow() + 61_000
+    act(() => {
+      for (const fn of visListeners) fn()
+    })
+    await act(async () => {})
+    Date.now = realNow
+    expect(hasIconColor(renderer.root, 'text-pr-merged')).toBe(true)
+    expect(hasIconColor(renderer.root, 'text-pr-open')).toBe(false)
+    act(() => renderer.unmount())
+  })
+
+  test('a cached PR reopened after reconnect loads the current snapshot', async () => {
+    const pr = prFor(11)
+    fetchImpl = async () => infoResponse(pr.url, 'OPEN')
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => { renderer = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }) })
+    await act(async () => {})
+    expect(hasIconColor(renderer.root, 'text-pr-open')).toBe(true)
+    act(() => renderer.unmount())
+
+    const calls = fetchMock.mock.calls.length
+    fetchImpl = async () => infoResponse(pr.url, 'MERGED')
+    refreshPrStatus()
+    await act(async () => {})
+    expect(fetchMock.mock.calls.length).toBe(calls)
+
+    act(() => { renderer = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }) })
+    await act(async () => {})
+    expect(fetchMock.mock.calls.length).toBe(calls + 1)
+    expect(hasIconColor(renderer.root, 'text-pr-merged')).toBe(true)
+    act(() => renderer.unmount())
+  })
+
+  test('reconnect ignores a pre-reconnect HTTP response and requests a new snapshot', async () => {
+    const pr = prFor(12)
+    const requests: ((response: Response) => void)[] = []
+    fetchImpl = () => new Promise(resolve => { requests.push(resolve) })
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => { renderer = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }) })
+    await act(async () => {})
+    expect(requests).toHaveLength(1)
+
+    refreshPrStatus()
+    requests[0](infoResponse(pr.url, 'OPEN'))
+    await act(async () => {})
+    expect(requests).toHaveLength(2)
+    expect(hasIconColor(renderer.root, 'text-pr-open')).toBe(false)
+
+    requests[1](infoResponse(pr.url, 'MERGED'))
+    await act(async () => {})
+    expect(hasIconColor(renderer.root, 'text-pr-merged')).toBe(true)
+    act(() => renderer.unmount())
+  })
+
+  test('server updates recolor all mounted chips without an HTTP poll', async () => {
+    const pr = prFor(6)
+    fetchImpl = async () => infoResponse(pr.url, 'OPEN')
+    const renderers: TestRenderer.ReactTestRenderer[] = []
+    act(() => {
+      renderers.push(TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }))
+      renderers.push(TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }))
+    })
+    await act(async () => {})
+    for (const renderer of renderers) expect(hasIconColor(renderer.root, 'text-pr-open')).toBe(true)
+    const calls = fetchMock.mock.calls.length
+    act(() => applyPrStatus([{ url: pr.url.toUpperCase(), state: 'MERGED', lastConfirmedAt: Date.now() }]))
+    for (const renderer of renderers) {
+      expect(hasIconColor(renderer.root, 'text-pr-merged')).toBe(true)
+      expect(hasIconColor(renderer.root, 'text-pr-open')).toBe(false)
+      act(() => renderer.unmount())
+    }
+    expect(fetchMock.mock.calls.length).toBe(calls)
+  })
+
+  test('retry recovers from a failed snapshot for a zero-padded PR URL', async () => {
+    const pr = { url: 'https://github.com/Owner/Repo/pull/01', repo: 'Owner/Repo', number: 1 }
+    let attempts = 0
+    let settled!: () => void
+    const retried = new Promise<void>(resolve => { settled = resolve })
+    globalThis.fetch = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body)).urls).toEqual(['https://github.com/owner/repo/pull/1'])
+      if (++attempts === 1) throw new Error('network temporarily unavailable')
+      settled()
+      return infoResponse('https://github.com/owner/repo/pull/1', 'OPEN')
+    }) as unknown as typeof fetch
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => { renderer = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }) })
+    try {
+      await act(async () => { await retried })
+      expect(attempts).toBe(2)
+      expect(hasIconColor(renderer.root, 'text-pr-open')).toBe(true)
+    } finally {
+      act(() => renderer.unmount())
+    }
+  })
+
+  test('details show the newest confirmation and prefer pushed status on a tie', async () => {
+    const pr = prFor(10)
+    const fresh = Date.now()
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith('/api/pr-checks')) {
+        return new Response(JSON.stringify({ url: pr.url, state: 'OPEN', title: 'Fresh details', lastConfirmedAt: fresh }))
+      }
+      return new Response(JSON.stringify([{ url: pr.url, state: 'OPEN', title: 'Old snapshot', lastConfirmedAt: fresh - 3_600_000 }]))
+    }) as unknown as typeof fetch
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => { renderer = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }) })
+    await act(async () => {})
+    act(() => openCard(renderer.root))
+    await act(async () => {})
+    const card = renderer.root.findByProps({ 'data-testid': 'pr-hovercard' })
+    expect(card.findAllByType('div').some(div => div.children.join('') === 'Checked just now')).toBe(true)
+    expect(JSON.stringify(renderer.toJSON())).toContain('Fresh details')
+    act(() => applyPrStatus([{ url: pr.url, state: 'OPEN', title: 'Pushed details', lastConfirmedAt: fresh }]))
+    expect(JSON.stringify(renderer.toJSON())).toContain('Pushed details')
+    act(() => renderer.unmount())
+  })
+
+  test('a CI failure preserves last-known checks and displays a newer PR confirmation', async () => {
+    const pr = prFor(13)
+    const realNow = Date.now
+    const start = realNow()
+    let failed = false
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      if (!String(input).startsWith('/api/pr-checks')) {
+        return new Response(JSON.stringify([{ url: pr.url, state: 'OPEN', headSha: 'same', lastConfirmedAt: start - 3_600_000 }]))
+      }
+      return new Response(JSON.stringify({
+        url: pr.url, state: 'OPEN', headSha: 'same', lastConfirmedAt: failed ? Date.now() : start - 3_600_000,
+        ...(failed ? { error: 'unavailable' } : { checks: [{ name: 'Prior CI', status: 'COMPLETED', conclusion: 'SUCCESS' }] }),
+      }))
+    }) as unknown as typeof fetch
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => { renderer = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }) })
+    try {
+      await act(async () => {})
+      act(() => openCard(renderer.root))
+      await act(async () => {})
+      expect(JSON.stringify(renderer.toJSON())).toContain('Prior CI')
+
+      failed = true
+      Date.now = () => start + 61_000
+      await act(async () => { await fetchChecks(pr.url) })
+      const rendered = JSON.stringify(renderer.toJSON())
+      expect(rendered).toContain('Prior CI')
+      expect(rendered).toContain('Showing last known checks')
+      const card = renderer.root.findByProps({ 'data-testid': 'pr-hovercard' })
+      expect(card.findAllByType('div').some(div => div.children.join('') === 'Checked just now')).toBe(true)
+    } finally {
+      Date.now = realNow
+      act(() => renderer.unmount())
+    }
+  })
+
+  test('a head update refreshes an open card and removes outdated checks', async () => {
+    const pr = prFor(9)
+    let headSha = 'previous'
+    const checksResponse = () => new Response(JSON.stringify({
+      url: pr.url, state: 'OPEN', headSha,
+      checks: [{ name: `${headSha} CI`, status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    }))
+    let checkCalls = 0
+    globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith('/api/pr-checks')) {
+        checkCalls++
+        return checksResponse()
+      }
+      return new Response(JSON.stringify([{ url: pr.url, state: 'OPEN', headSha }]))
+    }) as unknown as typeof fetch
+
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => { renderer = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }) })
+    await act(async () => {})
+    act(() => openCard(renderer.root))
+    await act(async () => {})
+    expect(JSON.stringify(renderer.toJSON())).toContain('previous CI')
+
+    headSha = 'current'
+    act(() => applyPrStatus([{
+      url: pr.url, state: 'OPEN', headSha, stale: true, lastConfirmedAt: Date.now() - 120_000,
+    }]))
+    await act(async () => {})
+    const card = renderer.root.findByProps({ 'data-testid': 'pr-hovercard' })
+    const rendered = JSON.stringify(renderer.toJSON())
+    expect(checkCalls).toBe(2)
+    expect(rendered).toContain('current CI')
+    expect(rendered).not.toContain('previous CI')
+    expect(card.findAllByType('div').some(div => div.children.join('') === 'Last confirmed 2m ago')).toBe(true)
+    act(() => renderer.unmount())
+  })
+
+  test('an older initial snapshot cannot overwrite a pushed status', async () => {
+    const pr = prFor(8)
+    let resolveFetch!: (response: Response) => void
+    fetchImpl = () => new Promise(resolve => { resolveFetch = resolve })
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => { renderer = TestRenderer.create(<PrChips prs={[pr]} />, { createNodeMock }) })
+    await act(async () => {})
+    act(() => applyPrStatus([{ url: pr.url, state: 'MERGED', lastConfirmedAt: 50 }]))
+    resolveFetch(new Response(JSON.stringify([{ url: pr.url, state: 'OPEN', lastConfirmedAt: 40 }])))
+    await act(async () => {})
+    expect(hasIconColor(renderer.root, 'text-pr-merged')).toBe(true)
+    act(() => renderer.unmount())
+  })
+
+  test('closed PRs render the pull-request glyph with a red × overlay', async () => {
+    const pr = prFor(5)
+    fetchImpl = async () => infoResponse(pr.url, 'CLOSED')
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[pr]} />, {
+        createNodeMock,
+      })
+    })
+    await act(async () => {})
+    const chip = chipEl(renderer.root)
+    // Two svgs: the pull-request icon and the corner × — both red.
+    const svgs = chip.findAll(
+      (el) =>
+        el.type === 'svg' &&
+        typeof el.props.className === 'string' &&
+        el.props.className.includes('text-pr-closed')
+    )
+    expect(svgs.length).toBe(2)
+    // Strokes run heavier than the icon default (1.5) for legibility.
+    expect(svgs.map((el) => el.props.strokeWidth)).toEqual([2, 2.5])
+    act(() => renderer.unmount())
+  })
+
+  test('draft PRs render the pull-request glyph with a pencil badge', async () => {
+    const pr = prFor(7)
+    fetchImpl = async () =>
+      new Response(
+        JSON.stringify([
+          { url: pr.url, state: 'OPEN', isDraft: true, title: 't', author: 'a' },
+        ])
+      )
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={[pr]} />, {
+        createNodeMock,
+      })
+    })
+    await act(async () => {})
+    const chip = chipEl(renderer.root)
+    // Two muted svgs: the pull-request icon plus the corner pencil — the
+    // badge is what separates a draft from the plain muted fallback.
+    const svgs = chip.findAll(
+      (el) =>
+        el.type === 'svg' &&
+        typeof el.props.className === 'string' &&
+        el.props.className.includes('text-muted')
+    )
+    expect(svgs.length).toBe(2)
+    expect(
+      svgs.some((el) => el.props.className.includes('absolute'))
+    ).toBe(true)
+    expect(svgs.map((el) => el.props.strokeWidth)).toEqual([2, 2.5])
+    act(() => renderer.unmount())
+  })
+})
+
+describe('PrChips +N flyout strip', () => {
+  // The "+N" anchor is the last hover-target span in the row; spilled
+  // chips inside the strip match the same predicate, so query before open.
+  const overflowAnchor = (root: TestRenderer.ReactTestInstance) =>
+    root
+      .findAll(
+        (el) =>
+          typeof el.props.className === 'string' &&
+          el.props.className.startsWith('relative inline-flex') &&
+          typeof el.props.onMouseEnter === 'function'
+      )
+      .at(-1)!
+
+  const overflowButton = (root: TestRenderer.ReactTestInstance) =>
+    root.find((el) => el.type === 'button' && /^\+[1-9]/.test(textOf(el)))
+
+  const fixedEls = (root: TestRenderer.ReactTestInstance) =>
+    root.findAll(
+      (el) =>
+        typeof el.props.className === 'string' &&
+        el.props.className.includes('fixed')
+    )
+
+  const openStrip = (root: TestRenderer.ReactTestInstance) => {
+    act(() => overflowAnchor(root).props.onMouseEnter())
+    act(flushWindowTimers)
+  }
+
+  beforeEach(() => {
+    timers = []
+    scrollListeners = []
+    resizeListeners = []
+    keydownListeners = []
+    // avail = 222 - 22 = 200: 3 chips fit, 2 fold into "+2".
+    containerWidth = 222
+    chipRect = { top: 700, bottom: 720, left: 100, right: 140 }
+    globalAny.window = fakeWindow
+    globalAny.document = { body: {} }
+    globalAny.getComputedStyle = () => ({
+      paddingLeft: `${PADDING_LEFT}px`,
+      paddingRight: '0px',
+      columnGap: '4px',
+    })
+    globalThis.fetch = mock(
+      async () => new Response(JSON.stringify([]))
+    ) as unknown as typeof fetch
+  })
+
+  afterAll(() => {
+    globalAny.window = originalWindow
+    globalAny.document = originalDocument
+    globalAny.getComputedStyle = originalGetComputedStyle
+    globalThis.fetch = originalFetch
+  })
+
+  test('hovering +N spills the hidden PRs as chips on an opaque tray', () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock: fitNodeMock,
+      })
+    })
+    openStrip(renderer.root)
+
+    const strips = fixedEls(renderer.root)
+    expect(strips.length).toBe(1)
+    const strip = strips[0]
+    // Chip cluster on a tray: opaque so text can't bleed through the pill
+    // gaps, recessed (bg-surface) so the elevated pills stay visible.
+    expect(strip.props.className).toContain('flex-wrap')
+    expect(strip.props.className).toContain('border')
+    expect(strip.props.className).toContain('shadow')
+    expect(strip.props.className).toContain('bg-surface')
+    expect(strip.props.className).not.toContain('bg-elevated')
+
+    // Visible #5,#4,#3 + spilled #2,#1 — all are real chip links.
+    const hrefs = chipLinks(renderer.root).map((el) => el.props.href)
+    expect(hrefs.length).toBe(5)
+    expect(hrefs).toContain('https://github.com/o/r/pull/1')
+    expect(hrefs).toContain('https://github.com/o/r/pull/2')
+    act(() => renderer.unmount())
+  })
+
+  test('Enter opens the strip; right-edge +N clamps left to the viewport', () => {
+    chipRect = { top: 40, bottom: 60, left: 950, right: 990 }
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock: fitNodeMock,
+      })
+    })
+    act(() =>
+      overflowButton(renderer.root).props.onKeyDown({
+        key: 'Enter',
+        preventDefault: () => {},
+      })
+    )
+    const strip = fixedEls(renderer.root).at(-1)!
+    expect(strip.props.style.top).toBe(60 + 3)
+    // Strip width budget 288: clamped to innerWidth - 288 - margin.
+    expect(strip.props.style.left).toBe(1000 - 288 - 8)
+    act(() => renderer.unmount())
+  })
+
+  test('Escape closes the strip', () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock: fitNodeMock,
+      })
+    })
+    openStrip(renderer.root)
+    expect(fixedEls(renderer.root).length).toBe(1)
+    act(() => {
+      for (const fn of keydownListeners) fn({ key: 'Escape' })
+    })
+    expect(fixedEls(renderer.root).length).toBe(0)
+    act(() => renderer.unmount())
+  })
+
+  test('strip stays open while a nested chip detail card is hovered', () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock: fitNodeMock,
+      })
+    })
+    openStrip(renderer.root)
+    const strip = fixedEls(renderer.root)[0]
+
+    // Rest on a spilled chip — its own detail card opens.
+    const nestedAnchor = strip
+      .findAll(
+        (el) =>
+          typeof el.props.className === 'string' &&
+          el.props.className.startsWith('relative inline-flex') &&
+          typeof el.props.onMouseEnter === 'function'
+      )
+      .at(0)!
+    act(() => nestedAnchor.props.onMouseEnter())
+    act(flushWindowTimers)
+    expect(fixedEls(renderer.root).length).toBe(2)
+
+    // Leaving the strip while the nested card is open must not close it.
+    act(() => strip.props.onMouseLeave())
+    act(flushWindowTimers)
+    expect(fixedEls(renderer.root).length).toBe(2)
+
+    // Leaving the nested card closes it, then the strip follows.
+    const nestedCard = fixedEls(renderer.root).at(-1)!
+    act(() => nestedCard.props.onMouseLeave())
+    act(flushWindowTimers)
+    act(flushWindowTimers)
+    expect(fixedEls(renderer.root).length).toBe(0)
+    act(() => renderer.unmount())
+  })
+
+  test('a nested card closing does not drop the strip while focus is inside', () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock: fitNodeMock,
+      })
+    })
+    openStrip(renderer.root)
+    const strip = fixedEls(renderer.root)[0]
+
+    // Open a spilled chip's detail card, then park keyboard focus inside
+    // the strip (simulated: cardRef.contains(document.activeElement)).
+    const nestedAnchor = strip
+      .findAll(
+        (el) =>
+          typeof el.props.className === 'string' &&
+          el.props.className.startsWith('relative inline-flex') &&
+          typeof el.props.onMouseEnter === 'function'
+      )
+      .at(0)!
+    act(() => nestedAnchor.props.onMouseEnter())
+    act(flushWindowTimers)
+    expect(fixedEls(renderer.root).length).toBe(2)
+    ;(globalAny.document as { activeElement?: unknown }).activeElement = {
+      __inCard: true,
+    }
+
+    const nestedCard = fixedEls(renderer.root).at(-1)!
+    act(() => nestedCard.props.onMouseLeave())
+    act(flushWindowTimers)
+    act(flushWindowTimers)
+    // Nested card closed, but the focused strip stays.
+    expect(fixedEls(renderer.root).length).toBe(1)
+    act(() => renderer.unmount())
+  })
+
+  test('leaving +N before the delay never opens the strip', () => {
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(<PrChips prs={makePrs(5)} />, {
+        createNodeMock: fitNodeMock,
+      })
+    })
+    const anchor = overflowAnchor(renderer.root)
+    act(() => anchor.props.onMouseEnter())
+    act(() => anchor.props.onMouseLeave())
+    act(flushWindowTimers)
+    expect(fixedEls(renderer.root).length).toBe(0)
+    act(() => renderer.unmount())
+  })
+})

@@ -1,0 +1,1008 @@
+/**
+ * WebSocket recovery and terminal transport ownership.
+ *
+ * Visibility, pageshow, and elapsed-time gaps trigger a verification ping.
+ * A healthy socket stays open; a failed probe falls back to reconnect after
+ * the existing network-settle delay. Neither path permits terminal input
+ * until a fresh attachment is acknowledged and its screen has been parsed.
+ *
+ * A tab can reclaim its lease on reload. Connection epochs fence
+ * parser acknowledgments; attachment IDs fence terminal frames across
+ * selection changes, including A-B-A. Hidden pages stop timers and detach
+ * output. Server lease expiry bounds resources when lifecycle events never
+ * arrive. Input dispatch independently checks for missed suspension.
+ */
+import { useEffect, useMemo } from 'react'
+import type { ClientMessage, SendClientMessage, ServerMessage, ServerMessageWithDiagnostics } from '@shared/types'
+import type { ConnectionStatus } from '../stores/sessionStore'
+import { useSessionStore } from '../stores/sessionStore'
+import { clientLog } from '../utils/clientLog'
+import { CATALOG_VERSION, CATALOG_RELOAD_MESSAGE } from '@shared/catalogProtocol'
+
+type MessageListener = (message: ServerMessage) => void
+
+type StatusListener = (
+  status: ConnectionStatus,
+  error: string | null,
+  connectionEpoch: number
+) => void
+
+const WS_STATES = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'] as const
+
+/** How long to wait for a WebSocket to reach OPEN before giving up. */
+const CONNECT_TIMEOUT_MS = 3_000
+/** An OPEN old server may place a large legacy snapshot before its config. */
+const CATALOG_NEGOTIATION_TIMEOUT_MS = 30_000
+
+/**
+ * Longer timeout for the first connect attempt after a resume — Tailscale /
+ * VPN tunnels need extra time and packets may be silently dropped (no ICMP),
+ * so the standard 3 s timeout is too aggressive.
+ */
+const RESUME_CONNECT_TIMEOUT_MS = 8_000
+
+/**
+ * If the interval timer detects a time jump larger than this, the device
+ * likely slept or the PWA was suspended. Verify the transport before input.
+ */
+const WAKE_JUMP_MS = 15_000
+
+/** Tick interval for the time-jump detector. */
+const WAKE_CHECK_INTERVAL_MS = 5_000
+
+/** How often to send an application-level ping to detect dead sockets. */
+const HEARTBEAT_INTERVAL_MS = 20_000
+
+/** Reset overload retries only after an attached terminal stays usable. */
+const OVERLOAD_STABLE_MS = 30_000
+
+/** How long to wait for a pong before declaring the socket dead. */
+const PONG_TIMEOUT_MS = 10_000
+
+/**
+ * How long to wait for a verification pong on resume before concluding the
+ * socket is a zombie and falling back to force-reconnect.  1.5 s is enough
+ * for a round-trip on any reasonable network while being short enough that
+ * zombie detection feels responsive.
+ */
+const VERIFY_PONG_TIMEOUT_MS = 1_500
+
+/**
+ * After a successful verification, send the first heartbeat ping sooner than
+ * the normal 20 s interval to quickly catch sockets that pass verification
+ * but die shortly after (e.g. flaky post-resume network).
+ */
+const EARLY_HEARTBEAT_MS = 5_000
+
+/**
+ * Delay before the first reconnect attempt after a resume event.
+ * Gives iOS time to restore WiFi / VPN networking — visibilitychange fires
+ * before the network stack is ready (confirmed by Apple Developer Forums).
+ */
+const RESUME_SETTLE_MS = 750
+
+/**
+ * After this many consecutive failed connect attempts, insert an extra delay
+ * and aggressively clean up any leaked sockets.  Prevents a tight
+ * connect-timeout → reconnect loop from chewing resources.
+ */
+const STALL_THRESHOLD = 4
+const STALL_COOLDOWN_MS = 5_000
+
+const terminalLeaseKey = 'agentboard-terminal-lease'
+
+export class WebSocketManager {
+  private ws: WebSocket | null = null
+  private listeners = new Set<MessageListener>()
+  private statusListeners = new Set<StatusListener>()
+  private status: ConnectionStatus = 'connecting'
+  private error: string | null = null
+  private reconnectAttempts = 0
+  private overloadFailures = 0
+  private overloadRetryAt = 0
+  private overloadProgressSince: number | null = null
+  private reconnectTimer: number | null = null
+  private connectTimer: number | null = null
+  private manualClose = false
+  private protocolMismatch = false
+  private protocolReady = false
+  private lastTick = Date.now()
+  private wakeCheckInterval: number | null = null
+  private lifecycleStarted = false
+  private heartbeatTimer: number | null = null
+  private pongTimer: number | null = null
+  private lastForceReconnectTs = 0
+  private lastConnectTs = 0
+  private readonly traceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  private lastMessageAt: number | null = null
+  private lastPongSeq: number | null = null
+  private lastPingAt: number | null = null
+  private lastMessageType: string | null = null
+  private pingSeq = 0
+  private connectionEpoch = 0
+  /** Consecutive connect attempts that failed (timeout, error, close). */
+  private consecutiveFailures = 0
+  /** Number of stall cycles without a successful open — drives escalating cooldown. */
+  private stallCount = 0
+  /** Whether the current connect attempt is the first after a resume. */
+  private isResumeAttempt = false
+  /**
+   * Track pending opens and retired sockets awaiting a close event.
+   * The diagnostic count measures retained JS references, not live TCP sockets.
+   */
+  private leakedSockets = new Set<WebSocket>()
+  /** Pending verification timer — non-null while awaiting a verify pong. */
+  private verifyTimer: number | null = null
+  private pageSuspended = false
+  private resumeToken: string | undefined
+  private resumeClaim = 0
+  private checkedReload = false
+  private attachId = 0
+  private attachedSessionId: string | null = null
+  private readyAttachId: number | null = null
+  private lastResumeAt = 0
+
+  private wsSnap() {
+    return {
+      traceId: this.traceId,
+      clientTimeMs: Date.now(),
+      clientUptimeMs: Math.round(performance.now()),
+      epoch: this.connectionEpoch,
+      pingSeq: this.pingSeq,
+      lastPongSeq: this.lastPongSeq,
+      lastPingAgeMs: this.lastPingAt === null ? null : Date.now() - this.lastPingAt,
+      lastMessageType: this.lastMessageType,
+      lastMessageAgeMs: this.lastMessageAt === null ? null : Date.now() - this.lastMessageAt,
+      visibility: typeof document === 'undefined' ? undefined : document.visibilityState,
+      status: this.status,
+      ws: this.ws ? WS_STATES[this.ws.readyState] : null,
+      attempt: this.reconnectAttempts,
+      failures: this.consecutiveFailures,
+      stalls: this.stallCount,
+      overloads: this.overloadFailures,
+      overloadDelayMs: Math.max(0, this.overloadRetryAt - Date.now()),
+      leaked: this.leakedSockets.size,
+      online: typeof navigator !== 'undefined' ? navigator.onLine : undefined,
+      verifying: this.verifyTimer !== null,
+      buffered: this.ws ? this.ws.bufferedAmount : undefined,
+    }
+  }
+
+  connect() {
+    if (this.protocolMismatch || this.isHidden() || this.waitForOverloadCooldown()) return
+    // Clean up any zombie socket that never opened / already closed
+    if (this.ws) {
+      const isOpen = this.ws.readyState === WebSocket.OPEN
+      // Trust OPEN only when our own state machine also says connected.
+      if (isOpen && this.status === 'connected') {
+        clientLog('ws_connect_skip', { reason: 'already_open', ...this.wsSnap() })
+        return
+      }
+      // Don't destroy a socket that's still connecting if connect() was called
+      // very recently — prevents rapid connect-destroy-connect cycles that
+      // cause two onopen events and double terminal-attach.
+      const now = Date.now()
+      if (this.ws.readyState === WebSocket.CONNECTING && now - this.lastConnectTs < 200) {
+        clientLog('ws_connect_skip', { reason: 'already_connecting', ...this.wsSnap() })
+        return
+      }
+      clientLog('ws_connect_destroy_zombie', {
+        reason: isOpen ? 'open_desynced' : 'not_open',
+        ...this.wsSnap(),
+      })
+      this.destroySocket()
+    }
+
+    this.manualClose = false
+    this.clearConnectTimer()
+    this.setStatus('connecting')
+
+    const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    const wsUrl = `${scheme}://${window.location.host}/ws?catalog=${CATALOG_VERSION}`
+    clientLog('ws_connect', { url: wsUrl, resume: this.isResumeAttempt, ...this.wsSnap() }, 'info')
+
+    const ws = new WebSocket(wsUrl)
+    let overloaded = false
+    this.ws = ws
+    this.protocolReady = false
+    this.lastMessageAt = null
+    this.lastPongSeq = null
+    this.lastPingAt = null
+    this.lastMessageType = null
+    this.lastConnectTs = Date.now()
+    this.leakedSockets.add(ws)
+
+    // Use a longer timeout for the first attempt after resume — VPN tunnels
+    // need extra time and silently drop SYN packets with no error feedback.
+    const timeout = this.isResumeAttempt ? RESUME_CONNECT_TIMEOUT_MS : CONNECT_TIMEOUT_MS
+    this.isResumeAttempt = false
+
+    // Guard against connections that hang (common on iOS after background)
+    this.connectTimer = window.setTimeout(() => {
+      // Ignore stale timeout from an earlier socket that was already replaced.
+      if (this.ws !== ws) return
+      this.connectTimer = null
+      const isOpen = ws.readyState === WebSocket.OPEN
+      const isHealthyOpen = isOpen && this.status === 'connected'
+      if (!isHealthyOpen) {
+        clientLog('ws_connect_timeout', {
+          wsState: WS_STATES[ws.readyState],
+          managerStatus: this.status,
+          timeoutMs: timeout,
+          ...this.wsSnap(),
+        }, 'info')
+        this.consecutiveFailures += 1
+        this.destroySocket()
+        this.scheduleReconnect()
+      }
+    }, timeout)
+
+    ws.onopen = () => {
+      // Guard: ignore late events from a socket that was already replaced.
+      // iOS Safari can queue events during resume and dispatch them after
+      // a new socket has been created.
+      if (this.ws !== ws) {
+        clientLog('ws_onopen_stale', this.wsSnap(), 'info')
+        return
+      }
+      clientLog('ws_onopen', this.wsSnap(), 'info')
+      this.reconnectAttempts = 0
+      this.consecutiveFailures = 0
+      this.stallCount = 0
+      this.connectionEpoch += 1
+      // Socket opened successfully — remove from leaked tracking
+      this.leakedSockets.delete(ws)
+      // Keep input unavailable until the server confirms the negotiated catalog.
+      // OPEN does not prove protocol compatibility. Do not repeatedly download
+      // an old server's snapshot when its config is behind that large frame.
+      this.clearConnectTimer()
+      this.connectTimer = window.setTimeout(() => {
+        if (this.ws !== ws || this.protocolReady) return
+        this.connectTimer = null
+        this.consecutiveFailures += 1
+        this.destroySocket()
+        this.scheduleReconnect()
+        this.setStatus('reconnecting', 'Server handshake timed out. Retrying…')
+      }, CATALOG_NEGOTIATION_TIMEOUT_MS)
+    }
+
+    ws.onmessage = (event) => {
+      if (this.ws !== ws) return
+      this.lastMessageAt = Date.now()
+      this.lastMessageType = 'unparsed'
+      try {
+        const raw = event.data as string
+        const t0 = performance.now()
+        const parsed = JSON.parse(raw) as ServerMessage
+        this.lastMessageType = parsed.type
+        if (!this.protocolReady && parsed.type !== 'server-config') {
+          this.requireCatalogReload()
+          return
+        }
+        if (parsed.type === 'server-config') {
+          if (parsed.catalogVersion !== CATALOG_VERSION) {
+            this.requireCatalogReload()
+            return
+          }
+          if (!this.protocolReady) {
+            this.protocolReady = true
+            this.clearConnectTimer()
+            this.restoreReloadLease()
+            if (!this.send({ type: 'terminal-resume', token: this.resumeToken, claim: ++this.resumeClaim })) return
+            this.saveReloadLease()
+            this.lastTick = Date.now()
+            this.setStatus(this.isHidden() ? 'reconnecting' : 'connected')
+            if (!this.isHidden()) this.startHeartbeat()
+          }
+        }
+        const parseMs = performance.now() - t0
+        // Attach timing metadata for switch diagnostics (read by useTerminal)
+        const withDiag = parsed as ServerMessageWithDiagnostics
+        withDiag._parseMs = Math.round(parseMs)
+        withDiag._rawLength = raw.length
+        withDiag._connectionEpoch = this.connectionEpoch
+        if (parsed.type === 'terminal-lease') {
+          this.resumeToken = parsed.token
+          this.saveReloadLease()
+          return
+        }
+        if (parsed.type === 'terminal-overload') {
+          overloaded = true
+          this.stopHeartbeat()
+          this.cancelVerify()
+          this.setStatus('reconnecting')
+          // Application signaling survives browsers that strip the close code.
+          // Revoke input now; onclose records this socket's failure only once.
+          ws.close()
+          return
+        }
+        // Intercept pong — clear timeout only for the current seq.
+        if (parsed.type === 'pong') {
+          this.lastPongSeq = parsed.seq ?? null
+          clientLog('ws_pong_received', { receivedSeq: parsed.seq, matchesPendingPing: parsed.seq === this.pingSeq, ...this.wsSnap() })
+          if (parsed.seq === this.pingSeq) {
+            this.clearPongTimer()
+            // If we were waiting for a verification pong, the socket is
+            // confirmed alive — cancel the verify timeout and resume normal
+            // operation with an early heartbeat to catch post-resume flakiness.
+            if (this.verifyTimer !== null) {
+              this.cancelVerify()
+              clientLog('ws_verify_ok', this.wsSnap(), 'info')
+              if (this.isHidden()) return
+              // Even a surviving socket needs a new verified attachment:
+              // tmux focus or the target may have changed during suspension.
+              this.connectionEpoch += 1
+              this.setStatus('connected')
+              this.startHeartbeat(EARLY_HEARTBEAT_MS)
+            }
+            this.recordOverloadRecovery()
+          }
+          return
+        }
+        if (parsed.type === 'terminal-output' || parsed.type === 'terminal-ready' ||
+            parsed.type === 'tmux-copy-mode-status' || parsed.type === 'clipboard-offer' ||
+            parsed.type === 'terminal-error' || parsed.type === 'terminal-paste-result') {
+          const current = this.status === 'connected' && !this.isHidden() &&
+            (!parsed.sessionId || parsed.sessionId === this.attachedSessionId) &&
+            (parsed.attachId === this.attachId || (parsed.attachId === undefined && !this.resumeToken))
+          if (!current) {
+            // Discarded output is never replayed into a new attachment. Free
+            // its transport budget; recovery will request a fresh snapshot.
+            if (parsed.type === 'terminal-output' && parsed.outputSeq !== undefined) {
+              this.send({ type: 'terminal-ack', outputSeq: parsed.outputSeq })
+            }
+            return
+          }
+          if (parsed.type === 'terminal-ready') {
+            this.readyAttachId = this.attachId
+            this.recordOverloadRecovery()
+          }
+        }
+        this.listeners.forEach((listener) => listener(parsed))
+      } catch {
+        // Ignore malformed payloads
+      }
+    }
+
+    ws.onerror = () => {
+      if (this.ws !== ws) return
+      clientLog('ws_onerror', this.wsSnap(), 'info')
+      // Don't reconnect here — per the WHATWG spec, onclose always fires
+      // after onerror. Let onclose handle reconnection to avoid double-fire.
+      this.clearConnectTimer()
+    }
+
+    ws.onclose = (e) => {
+      this.leakedSockets.delete(ws)
+      // Guard: ignore close events from a socket that was already replaced.
+      if (this.ws !== ws) {
+        clientLog('ws_onclose_stale', { code: e.code, ...this.wsSnap() }, 'info')
+        return
+      }
+      clientLog('ws_onclose', { code: e.code, reason: e.reason, clean: e.wasClean, ...this.wsSnap() }, 'info')
+      this.clearConnectTimer()
+      this.cancelVerify()
+      this.consecutiveFailures += 1
+      this.overloadProgressSince = null
+      if (overloaded || e.code === 1013) {
+        this.overloadFailures = Math.min(this.overloadFailures + 1, 6)
+        this.overloadRetryAt = Date.now() + Math.min(1000 * 2 ** (this.overloadFailures - 1), 30_000)
+      }
+      this.ws = null
+      if (!this.manualClose) {
+        this.scheduleReconnect()
+      } else {
+        this.setStatus('disconnected')
+      }
+    }
+  }
+
+  private restoreReloadLease() {
+    if (this.checkedReload) return
+    this.checkedReload = true
+    try {
+      const storage = window.sessionStorage
+      const cached = storage.getItem(terminalLeaseKey)
+      storage.removeItem(terminalLeaseKey)
+      const navigation = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined
+      // Browsers can copy sessionStorage into a newly opened or duplicated tab.
+      // Only a reload of the existing document can claim the saved lease.
+      if (navigation?.type !== 'reload' || !cached) return
+      const value = JSON.parse(cached) as { token?: unknown; claim?: unknown } | null
+      if (typeof value?.token !== 'string' || typeof value.claim !== 'number' ||
+          !Number.isSafeInteger(value.claim) || value.claim < 1 || value.claim >= Number.MAX_SAFE_INTEGER) return
+      this.resumeToken = value.token
+      this.resumeClaim = value.claim
+    } catch {
+      // Same-document reconnects still work when storage is unavailable.
+    }
+  }
+
+  private saveReloadLease() {
+    if (!this.resumeToken) return
+    try {
+      window.sessionStorage.setItem(terminalLeaseKey, JSON.stringify({ token: this.resumeToken, claim: this.resumeClaim }))
+    } catch {
+      // Storage may be disabled by the browser.
+    }
+  }
+
+  private requireCatalogReload() {
+    this.protocolMismatch = true
+    this.disconnect()
+    this.setStatus('disconnected', CATALOG_RELOAD_MESSAGE)
+    this.listeners.forEach(listener => listener({ type: 'error', message: CATALOG_RELOAD_MESSAGE }))
+  }
+
+  disconnect() {
+    this.overloadFailures = 0
+    this.overloadRetryAt = 0
+    this.overloadProgressSince = null
+    this.manualClose = true
+    this.clearConnectTimer()
+    this.cancelVerify()
+    if (this.reconnectTimer) {
+      window.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.destroySocket()
+    this.setStatus('disconnected')
+  }
+
+  /**
+   * Start listening for page lifecycle events that indicate the app was
+   * backgrounded and resumed (iOS Safari PWA, Android Chrome, etc.).
+   * Idempotent — repeated calls are no-ops until stopLifecycleListeners().
+   */
+  startLifecycleListeners() {
+    if (this.lifecycleStarted) return
+    if (typeof document === 'undefined' || typeof window === 'undefined') return
+
+    this.lifecycleStarted = true
+    document.addEventListener('visibilitychange', this.onVisibilityChange)
+    window.addEventListener('pageshow', this.onPageShow)
+    window.addEventListener('pagehide', this.onPageHide)
+
+    // Time-jump detector catches cases where visibility events don't fire
+    // (e.g. iOS PWA suspended for a long period)
+    this.lastTick = Date.now()
+    this.wakeCheckInterval = window.setInterval(() => {
+      const now = Date.now()
+      const gap = now - this.lastTick
+      // Skip while hidden — browser timer clamping causes false positives
+      // (e.g. Chrome clamps hidden-tab timers to ~60s, exceeding WAKE_JUMP_MS).
+      // Do NOT update lastTick here — keep it frozen at the last visible time
+      // so visibilitychange correctly detects the real background duration.
+      if (this.isHidden()) {
+        return
+      }
+      if (gap > WAKE_JUMP_MS) {
+        clientLog('ws_time_jump', { gapMs: gap, ...this.wsSnap() }, 'info')
+        this.resumeConnection('time_jump')
+      }
+      this.lastTick = now
+    }, WAKE_CHECK_INTERVAL_MS)
+  }
+
+  stopLifecycleListeners() {
+    if (!this.lifecycleStarted) return
+
+    this.lifecycleStarted = false
+    document.removeEventListener('visibilitychange', this.onVisibilityChange)
+    window.removeEventListener('pageshow', this.onPageShow)
+    window.removeEventListener('pagehide', this.onPageHide)
+    if (this.wakeCheckInterval !== null) {
+      window.clearInterval(this.wakeCheckInterval)
+      this.wakeCheckInterval = null
+    }
+  }
+
+  send(message: ClientMessage): boolean {
+    if (this.protocolMismatch || !this.protocolReady) return false
+    if (this.ws?.readyState !== WebSocket.OPEN) return false
+    if (message.type === 'terminal-ack' && message.connectionEpoch !== undefined) {
+      if (message.connectionEpoch !== this.connectionEpoch) return false
+      message = { type: 'terminal-ack', outputSeq: message.outputSeq }
+    }
+
+    const terminalCommand = message.type.startsWith('terminal-') || message.type.startsWith('tmux-')
+    const lifecycleCommand = message.type === 'terminal-resume' || message.type === 'terminal-ack'
+    if (terminalCommand && !lifecycleCommand) {
+      if (message.type !== 'terminal-detach') {
+        if (this.isHidden()) return false
+        if (Date.now() - this.lastTick > WAKE_JUMP_MS) {
+          this.resumeConnection('input_time_jump')
+          return false
+        }
+        if (this.status !== 'connected') return false
+      }
+      if (message.type === 'terminal-attach') {
+        this.attachId += 1
+        this.attachedSessionId = message.sessionId
+        this.readyAttachId = null
+      } else if (message.type === 'terminal-input' || message.type === 'terminal-paste') {
+        if (this.readyAttachId !== this.attachId || message.sessionId !== this.attachedSessionId) return false
+      } else if (message.type === 'terminal-detach') {
+        this.readyAttachId = null
+        this.attachedSessionId = null
+      }
+      message = { ...message, attachId: this.attachId } as ClientMessage
+    }
+
+    try {
+      this.ws.send(JSON.stringify(message))
+      if (message.type === 'ping') {
+        this.lastPingAt = Date.now()
+        clientLog('ws_ping_sent', this.wsSnap())
+      }
+      if (message.type === 'terminal-ack') this.recordOverloadRecovery()
+      return true
+    } catch (error) {
+      clientLog('ws_send_error', {
+        messageType: message.type,
+        error: error instanceof Error ? error.message : String(error),
+        ...this.wsSnap(),
+      }, 'info')
+      this.destroySocket()
+      this.scheduleReconnect()
+      return false
+    }
+  }
+
+  subscribe(listener: MessageListener) {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  subscribeStatus(listener: StatusListener) {
+    this.statusListeners.add(listener)
+    listener(this.status, this.error, this.connectionEpoch)
+    return () => this.statusListeners.delete(listener)
+  }
+
+  getStatus() {
+    return this.status
+  }
+
+  getConnectionEpoch() {
+    return this.connectionEpoch
+  }
+
+  // ── Private ──────────────────────────────────────────────
+
+  private onVisibilityChange = () => {
+    clientLog('ws_visibility', { state: document.visibilityState, ...this.wsSnap() }, 'info')
+    if (document.visibilityState === 'visible') {
+      this.pageSuspended = false
+      this.resumeConnection('visibilitychange')
+    } else {
+      this.suspendConnection()
+    }
+  }
+
+  private onPageShow = (e: PageTransitionEvent) => {
+    clientLog('ws_pageshow', { persisted: e.persisted, ...this.wsSnap() }, 'info')
+    if (e.persisted) {
+      this.pageSuspended = false
+      this.resumeConnection('pageshow')
+    }
+  }
+
+  private onPageHide = () => {
+    this.pageSuspended = true
+    this.suspendConnection()
+  }
+
+  private suspendConnection() {
+    // Best-effort only: iOS may suspend without delivering this event. Stop
+    // rendering traffic when it does arrive; the relay retains the observer
+    // and a foreground attach reconstructs the current screen.
+    if (this.attachedSessionId) {
+      this.send({ type: 'terminal-detach', sessionId: this.attachedSessionId, attachId: this.attachId })
+    }
+    this.stopHeartbeat()
+    this.cancelVerify()
+    this.clearConnectTimer()
+    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    if (!this.manualClose) this.setStatus('reconnecting')
+  }
+
+  private resumeConnection(trigger: string) {
+    if (this.manualClose || this.isHidden()) return
+    const gap = Date.now() - this.lastTick
+    this.lastTick = Date.now()
+    clientLog('ws_resume', { trigger, gapMs: gap, ...this.wsSnap() }, 'info')
+    if (this.waitForOverloadCooldown()) return
+    // Reuse one pending probe/connect across visibility, pageshow and timer
+    // callbacks; none may tear down a replacement started by another signal.
+    if (this.verifyTimer !== null) return
+    if (Date.now() - this.lastResumeAt < 200 && this.reconnectTimer !== null) return
+    if (this.ws?.readyState === WebSocket.CONNECTING && this.connectTimer !== null && gap < WAKE_JUMP_MS) return
+    this.lastResumeAt = Date.now()
+    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    if (this.ws?.readyState === WebSocket.OPEN) this.verifyConnection()
+    else this.forceReconnect(trigger, true)
+  }
+
+  /**
+   * Send a verification ping on the existing socket to check if it's still
+   * alive after a background/foreground transition.  If the server responds
+   * with a matching pong within VERIFY_PONG_TIMEOUT_MS, the socket is
+   * confirmed healthy and we restart the heartbeat.  If no pong arrives in
+   * time, the socket is a zombie — fall back to forceReconnect.
+   *
+   * On zombie sockets, send() succeeds silently (data is buffered but never
+   * delivered, per WHATWG spec).  The timeout is the real detection mechanism.
+   */
+  private verifyConnection() {
+    this.cancelVerify()
+    // Stop heartbeat so an in-flight pong timeout can't race with verify.
+    // Both use pingSeq — advancing it here would orphan any pending heartbeat
+    // pong, causing pongTimer to fire and kill a healthy socket.
+    this.stopHeartbeat()
+    this.setStatus('reconnecting')
+    this.pingSeq += 1
+    const seq = this.pingSeq
+    const ws = this.ws
+    clientLog('ws_verify', { seq, ...this.wsSnap() }, 'info')
+
+    // send() checks readyState and wraps in try/catch.  If it fails, the
+    // socket is clearly dead — go straight to force-reconnect.
+    if (!this.send({ type: 'ping', seq })) {
+      clientLog('ws_verify_send_fail', this.wsSnap(), 'info')
+      this.forceReconnect('verify_send_fail', true)
+      return
+    }
+
+    this.verifyTimer = window.setTimeout(() => {
+      this.verifyTimer = null
+      // Guard: ignore stale timeout from a socket that was already replaced.
+      if (this.ws !== ws) return
+      clientLog('ws_verify_timeout', this.wsSnap(), 'info')
+      this.forceReconnect('verify_timeout', true)
+    }, VERIFY_PONG_TIMEOUT_MS)
+  }
+
+  private cancelVerify() {
+    if (this.verifyTimer !== null) {
+      window.clearTimeout(this.verifyTimer)
+      this.verifyTimer = null
+    }
+  }
+
+  /**
+   * If the socket isn't cleanly connected, tear it down and start fresh.
+   * Resets the backoff counter so the user doesn't wait up to 30s.
+   *
+   * When `force` is true (resume / suspension), we:
+   *   1. Purge all leaked sockets to free browser connection slots
+   *   2. Wait RESUME_SETTLE_MS for iOS to restore networking
+   *   3. Use a longer connect timeout for the first attempt
+   */
+  private forceReconnect(trigger: string = 'unknown', force = false) {
+    if (this.protocolMismatch) return
+    if (this.manualClose) {
+      clientLog('ws_force_skip', { trigger, reason: 'manual_close' })
+      return
+    }
+
+    if (this.waitForOverloadCooldown()) return
+
+    // Debounce rapid-fire triggers (e.g. visibilitychange + time-jump
+    // both firing on resume). Prevents double reconnection.
+    // Non-forced triggers use a 500ms debounce window.
+    // Forced triggers use a shorter 200ms window — they indicate the socket
+    // is definitely stale, but back-to-back forced events (e.g. pageshow +
+    // time-jump firing simultaneously) can still tear down a freshly-created
+    // socket if not guarded.
+    const now = Date.now()
+    const debounceMs = force ? 200 : 500
+    if (now - this.lastForceReconnectTs < debounceMs) {
+      clientLog('ws_force_skip', { trigger, reason: 'debounce', force })
+      return
+    }
+
+    // When not forced, trust readyState — rely on heartbeat for zombie
+    // detection (~30s). When forced (process was suspended), iOS lies
+    // about readyState so always tear down and start fresh.
+    if (!force &&
+        this.ws?.readyState === WebSocket.OPEN &&
+        this.status === 'connected') {
+      clientLog('ws_force_skip', { trigger, reason: 'already_connected' })
+      return
+    }
+
+    this.lastForceReconnectTs = now
+    clientLog('ws_force_reconnect', { trigger, force, ...this.wsSnap() }, 'info')
+    this.reconnectAttempts = 0
+    this.consecutiveFailures = 0
+    // A resume/visibility trigger starts a fresh recovery; without this a
+    // user returning after an outage would inherit the 30s stall cooldown.
+    this.stallCount = 0
+    if (this.reconnectTimer) {
+      window.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    this.destroySocket()
+
+    if (force) {
+      // Purge all leaked sockets — iOS Safari keeps zombie TCP connections
+      // alive even after ws.close(), which can exhaust the per-origin limit
+      // and prevent new connections from being established.
+      this.purgeLeakedSockets()
+
+      // Wait for iOS to restore networking before attempting to connect.
+      // visibilitychange fires before the network stack is ready (confirmed
+      // by WebKit and Apple Developer Forums).  Without this delay, the first
+      // connect attempt would hit a dead network and start the backoff loop.
+      this.isResumeAttempt = true
+      this.setStatus('reconnecting')
+      this.reconnectTimer = window.setTimeout(() => {
+        this.reconnectTimer = null
+        this.connect()
+      }, RESUME_SETTLE_MS)
+    } else {
+      this.connect()
+    }
+  }
+
+  /**
+   * Send periodic application-level pings to detect dead sockets.
+   * Bun's protocol-level pings (sendPings: true, idleTimeout: 40) keep the
+   * TCP/Tailscale tunnel warm. These application-level pings let the client
+   * proactively detect zombie sockets that protocol pings can't surface
+   * (browsers don't expose protocol-level pong events to JS).
+   *
+   * @param firstDelayMs — if provided, fire the first ping after this delay
+   *   instead of waiting the full HEARTBEAT_INTERVAL_MS.  Used after
+   *   verification to quickly catch flaky post-resume sockets.
+   */
+  private startHeartbeat(firstDelayMs?: number) {
+    this.stopHeartbeat()
+    if (this.isHidden()) return
+
+    const sendPing = () => {
+      if (this.isHidden()) return
+      if (this.ws?.readyState !== WebSocket.OPEN) return
+      this.pingSeq += 1
+      if (!this.send({ type: 'ping', seq: this.pingSeq })) return
+      // If no pong within timeout, the socket is dead
+      this.clearPongTimer()
+      this.pongTimer = window.setTimeout(() => {
+        this.pongTimer = null
+        clientLog('ws_pong_timeout', this.wsSnap(), 'info')
+        this.destroySocket()
+        this.scheduleReconnect()
+      }, PONG_TIMEOUT_MS)
+    }
+
+    if (firstDelayMs !== undefined && firstDelayMs < HEARTBEAT_INTERVAL_MS) {
+      // Fire one early ping, then switch to the normal interval.
+      this.heartbeatTimer = window.setTimeout(() => {
+        sendPing()
+        this.heartbeatTimer = window.setInterval(sendPing, HEARTBEAT_INTERVAL_MS)
+      }, firstDelayMs)
+    } else {
+      this.heartbeatTimer = window.setInterval(sendPing, HEARTBEAT_INTERVAL_MS)
+    }
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer !== null) {
+      // Could be either setTimeout (early ping) or setInterval — both
+      // use the same ID space and clearTimeout/clearInterval are
+      // interchangeable per the HTML spec.
+      window.clearTimeout(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+    this.clearPongTimer()
+  }
+
+  private clearPongTimer() {
+    if (this.pongTimer !== null) {
+      window.clearTimeout(this.pongTimer)
+      this.pongTimer = null
+    }
+  }
+
+  private setStatus(status: ConnectionStatus, error: string | null = null) {
+    if (this.protocolMismatch) { status = 'disconnected'; error = CATALOG_RELOAD_MESSAGE }
+    if (status !== 'connected') {
+      this.readyAttachId = null
+      this.overloadProgressSince = null
+    }
+    this.status = status
+    this.error = error
+    this.statusListeners.forEach((listener) => listener(status, error, this.connectionEpoch))
+  }
+
+  private recordOverloadRecovery() {
+    if (this.overloadFailures === 0 || this.status !== 'connected' || this.isHidden() ||
+        this.readyAttachId !== this.attachId) return
+    const now = Date.now()
+    if (now - this.lastTick > WAKE_JUMP_MS) this.overloadProgressSince = null
+    // Readiness starts the interval; a later ACK or matching heartbeat pong
+    // confirms recovery even when a healthy terminal has no new output.
+    this.overloadProgressSince ??= now
+    if (now - this.overloadProgressSince >= OVERLOAD_STABLE_MS) {
+      this.overloadFailures = 0
+      this.overloadRetryAt = 0
+      this.overloadProgressSince = null
+    }
+  }
+
+  /** Preserve the deadline across hide/show; lifecycle churn cannot skip it. */
+  private waitForOverloadCooldown(): boolean {
+    const remaining = this.overloadRetryAt - Date.now()
+    if (remaining <= 0) return false
+    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    this.setStatus('reconnecting')
+    if (!this.isHidden()) {
+      this.reconnectTimer = window.setTimeout(() => {
+        this.reconnectTimer = null
+        this.connect()
+      }, remaining)
+    }
+    return true
+  }
+
+  private scheduleReconnect() {
+    if (this.protocolMismatch) return
+    this.stopHeartbeat()
+    if (this.isHidden()) {
+      clientLog('ws_schedule_skip', { reason: 'hidden', ...this.wsSnap() })
+      // Don't reconnect in the background — forceReconnect() handles
+      // it when the page becomes visible again.
+      this.setStatus('reconnecting')
+      return
+    }
+
+    if (this.waitForOverloadCooldown()) return
+
+    // If we've hit the stall threshold, aggressively clean up and add extra
+    // cooldown time.  Leaked zombie sockets at the browser level may be
+    // exhausting per-origin connection slots, which would explain why
+    // force-closing the app (killing all TCP connections) fixes it instantly.
+    if (this.consecutiveFailures >= STALL_THRESHOLD) {
+      clientLog('ws_stall_detected', this.wsSnap(), 'info')
+      this.purgeLeakedSockets()
+      // Escalate the cooldown across consecutive stalls (5s → 10s → 20s → 30s
+      // cap) instead of resetting it — during a server freeze each connect
+      // attempt creates attach work exactly when the server can least afford
+      // it. stallCount resets on a successful open.
+      const cooldown = Math.min(STALL_COOLDOWN_MS * 2 ** this.stallCount, 30_000)
+      this.stallCount += 1
+      this.consecutiveFailures = 0
+      this.reconnectAttempts = 0
+      this.isResumeAttempt = true
+      this.setStatus('reconnecting')
+      this.reconnectTimer = window.setTimeout(() => {
+        this.reconnectTimer = null
+        this.connect()
+      }, cooldown)
+      return
+    }
+
+    this.reconnectAttempts += 1
+    const delay = Math.min(1000 * 2 ** (this.reconnectAttempts - 1), 30000)
+    clientLog('ws_schedule_reconnect', { delay, ...this.wsSnap() })
+    this.setStatus('reconnecting')
+    if (this.reconnectTimer) {
+      window.clearTimeout(this.reconnectTimer)
+    }
+
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null
+      this.connect()
+    }, delay)
+  }
+
+  private isHidden(): boolean {
+    return this.pageSuspended || (typeof document !== 'undefined' && document.visibilityState === 'hidden')
+  }
+
+  private clearConnectTimer() {
+    if (this.connectTimer) {
+      window.clearTimeout(this.connectTimer)
+      this.connectTimer = null
+    }
+  }
+
+  /** Forcefully close and null out the socket without triggering reconnect. */
+  private destroySocket() {
+    this.clearConnectTimer()
+    this.stopHeartbeat()
+    this.cancelVerify()
+    if (!this.ws) return
+    const ws = this.ws
+    this.ws = null
+    // Re-track as potentially leaked — even healthy sockets can become TCP
+    // zombies when destroyed after resume on iOS Safari.  This ensures
+    // purgeLeakedSockets() can attempt to close them.
+    this.leakedSockets.add(ws)
+    ws.onopen = null
+    ws.onmessage = null
+    ws.onerror = null
+    // Retired sockets must not reconnect or mutate the replacement socket.
+    // Keep only a close observer to release the reference when closure completes.
+    ws.onclose = () => {
+      this.leakedSockets.delete(ws)
+      ws.onclose = null
+    }
+    try {
+      ws.close()
+    } catch {
+      // Already closed / invalid state
+    }
+    if (ws.readyState === WebSocket.CLOSED) {
+      this.leakedSockets.delete(ws)
+      ws.onclose = null
+    }
+  }
+
+  /**
+   * Retry close and discard tracked references during forced recovery.
+   * The browser owns TCP teardown: close() is a no-op for CLOSING/CLOSED
+   * sockets, so this cannot guarantee that a stalled network connection ends.
+   */
+  private purgeLeakedSockets() {
+    if (this.leakedSockets.size === 0) return
+    clientLog('ws_purge_leaked', { count: this.leakedSockets.size }, 'info')
+    for (const leaked of this.leakedSockets) {
+      try {
+        // Null out handlers to prevent any late-firing events
+        leaked.onopen = null
+        leaked.onmessage = null
+        leaked.onerror = null
+        leaked.onclose = null
+        leaked.close()
+      } catch {
+        // Already closed / invalid state
+      }
+    }
+    this.leakedSockets.clear()
+  }
+}
+
+const manager = new WebSocketManager()
+
+export function useWebSocket() {
+  const setConnectionState = useSessionStore(
+    (state) => state.setConnectionState
+  )
+
+  useEffect(() => {
+    manager.connect()
+    manager.startLifecycleListeners()
+    const unsubscribe = manager.subscribeStatus((nextStatus, error, nextConnectionEpoch) => {
+      // Atomic Zustand update — connectionStatus and connectionEpoch land in the
+      // same store commit, so useTerminal sees both changes in a single render.
+      // Previously connectionEpoch was in React useState while connectionStatus
+      // was in Zustand, causing two renders and a double terminal-attach.
+      setConnectionState(nextStatus, error, nextConnectionEpoch)
+    })
+
+    return () => {
+      unsubscribe()
+      manager.stopLifecycleListeners()
+    }
+  }, [setConnectionState])
+
+  const sendMessage = useMemo<SendClientMessage>(
+    () => (message) => manager.send(message),
+    []
+  )
+  const subscribe = useMemo(() => manager.subscribe.bind(manager), [])
+  // Stable getter that reads the manager's epoch synchronously — safe to call
+  // inside subscription callbacks without waiting for a React re-render.
+  const getConnectionEpoch = useMemo(() => () => manager.getConnectionEpoch(), [])
+
+  return {
+    sendMessage,
+    subscribe,
+    getConnectionEpoch,
+  }
+}

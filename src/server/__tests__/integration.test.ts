@@ -1,0 +1,291 @@
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import fs from 'node:fs'
+import net from 'node:net'
+import path from 'node:path'
+import os from 'node:os'
+import {
+  canBindLocalhost,
+  createTmuxTmpDir,
+  isTmuxAvailable,
+  privateTmuxEnv,
+  privateTmuxSocket,
+} from './testEnvironment'
+
+const tmuxAvailable = isTmuxAvailable()
+const localhostBindable = canBindLocalhost()
+const testHost = '127.0.0.1'
+
+if (!tmuxAvailable || !localhostBindable) {
+  const reasons: string[] = []
+  if (!tmuxAvailable) reasons.push('tmux not available')
+  if (!localhostBindable) reasons.push('localhost sockets unavailable')
+  test.skip(`${reasons.join(' and ')} - skipping integration test`, () => {})
+} else {
+  describe('integration', () => {
+    const sessionName = `agentboard-test-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`
+    const dbPath = path.join(
+      os.tmpdir(),
+      `agentboard-integration-${process.pid}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}.db`
+    )
+    let serverProcess: ReturnType<typeof Bun.spawn> | null = null
+    let port = 0
+    // Private tmux server for this test. Without this, the spawned server
+    // inherits $TMUX (when the test process runs inside tmux) and every tmux
+    // call — session creation, kills, and the startup env scrub — lands on
+    // the user's LIVE tmux server. createTmuxTmpDir also deletes
+    // process.env.TMUX for the same reason.
+    let tmuxTmpDir: string | null = null
+
+    beforeAll(async () => {
+      tmuxTmpDir = createTmuxTmpDir()
+      port = await getFreePort()
+
+      serverProcess = Bun.spawn(['bun', 'src/server/index.ts'], {
+        cwd: process.cwd(),
+        env: {
+          ...privateTmuxEnv(tmuxTmpDir),
+          PORT: String(port),
+          TMUX_SESSION: sessionName,
+          DISCOVER_PREFIXES: '',
+          AGENTBOARD_LOG_POLL_MS: '0',
+          AGENTBOARD_DB_PATH: dbPath,
+          AGENTBOARD_PASTE_IMAGE_MAX_BYTES: '1024',
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+
+      drainStream(serverProcess.stdout)
+      drainStream(serverProcess.stderr)
+
+      await waitForHealth(port)
+    }, 60000)
+
+    afterAll(async () => {
+      if (serverProcess) {
+        try {
+          serverProcess.kill()
+          await serverProcess.exited
+        } catch {
+          // ignore shutdown errors
+        }
+      }
+
+      if (tmuxTmpDir) {
+        try {
+          Bun.spawnSync(['tmux', 'kill-session', '-t', sessionName], {
+            stdout: 'ignore',
+            stderr: 'ignore',
+            env: privateTmuxEnv(tmuxTmpDir),
+          })
+          // -S pins the private socket explicitly: tmux resolves $TMUX before
+          // TMUX_TMPDIR, so a leaked TMUX here would kill the LIVE server.
+          Bun.spawnSync(
+            ['tmux', '-S', privateTmuxSocket(tmuxTmpDir), 'kill-server'],
+            {
+              stdout: 'ignore',
+              stderr: 'ignore',
+              env: privateTmuxEnv(tmuxTmpDir),
+            }
+          )
+        } catch {
+          // ignore cleanup errors
+        }
+        try {
+          fs.rmSync(tmuxTmpDir, { recursive: true, force: true })
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+      try {
+        fs.unlinkSync(dbPath)
+      } catch {
+        // ignore cleanup errors
+      }
+    })
+
+    test('health endpoint responds', async () => {
+      const response = await fetch(`http://${testHost}:${port}/api/health`)
+      expect(response.ok).toBe(true)
+      const payload = (await response.json()) as { ok: boolean }
+      expect(payload.ok).toBe(true)
+    })
+
+    test('sessions endpoint has no orphan shell window from managed session', async () => {
+      const response = await fetch(`http://${testHost}:${port}/api/sessions`)
+      expect(response.ok).toBe(true)
+      const sessions = (await response.json()) as Array<{
+        tmuxWindow: string
+      }>
+      expect(Array.isArray(sessions)).toBe(true)
+      // No orphan shell window — session is only created when a window is explicitly added
+      const managedSessions = sessions.filter((s) =>
+        s.tmuxWindow.startsWith(`${sessionName}:`)
+      )
+      expect(managedSessions.length).toBe(0)
+    })
+
+    test('websocket emits sessions payload', async () => {
+      const message = await waitForWebSocketSessions(port)
+      expect(message.type).toBe('sessions')
+      expect(Array.isArray(message.sessions)).toBe(true)
+    })
+
+    test('paste-image endpoint stores uploads', async () => {
+      const formData = new FormData()
+      const blob = new Blob([new Uint8Array([0, 1, 2, 3])], {
+        type: 'image/png',
+      })
+      formData.append('image', blob, 'paste.png')
+
+      const response = await fetch(`http://${testHost}:${port}/api/paste-image`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      expect(response.ok).toBe(true)
+      const payload = (await response.json()) as { path: string }
+      expect(payload.path.startsWith('/tmp/paste-')).toBe(true)
+      expect(payload.path.endsWith('.png')).toBe(true)
+      expect(fs.existsSync(payload.path)).toBe(true)
+      fs.unlinkSync(payload.path)
+    })
+
+    test('paste-image endpoint rejects empty payloads', async () => {
+      const response = await fetch(`http://${testHost}:${port}/api/paste-image`, {
+        method: 'POST',
+        body: new FormData(),
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test('paste-image endpoint rejects unsupported types', async () => {
+      const formData = new FormData()
+      const blob = new Blob([new Uint8Array([0, 1, 2, 3])], {
+        type: 'text/plain',
+      })
+      formData.append('image', blob, 'paste.txt')
+
+      const response = await fetch(`http://${testHost}:${port}/api/paste-image`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      expect(response.status).toBe(415)
+      const payload = (await response.json()) as { error: string }
+      expect(payload.error).toBe('Unsupported image type')
+    })
+
+    test('paste-image endpoint rejects oversized uploads', async () => {
+      // Server is started with AGENTBOARD_PASTE_IMAGE_MAX_BYTES=1024
+      const formData = new FormData()
+      const blob = new Blob([new Uint8Array(2048)], { type: 'image/png' })
+      formData.append('image', blob, 'paste.png')
+
+      const response = await fetch(`http://${testHost}:${port}/api/paste-image`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      expect(response.status).toBe(413)
+      const payload = (await response.json()) as { error: string }
+      expect(payload.error).toBe('Image too large')
+    })
+  })
+}
+
+async function getFreePort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.unref()
+    server.once('error', reject)
+    server.listen({ port: 0, host: testHost }, () => {
+      const address = server.address()
+      if (address && typeof address === 'object') {
+        const { port } = address
+        server.close(() => resolve(port))
+      } else {
+        server.close(() => reject(new Error('Unable to allocate port')))
+      }
+    })
+  })
+}
+
+async function waitForHealth(port: number, timeoutMs = 60000): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const response = await fetch(`http://${testHost}:${port}/api/health`)
+      if (response.ok) {
+        return
+      }
+    } catch {
+      // retry
+    }
+    await delay(150)
+  }
+  throw new Error('Server did not become healthy in time')
+}
+
+async function waitForWebSocketSessions(
+  port: number,
+  timeoutMs = 5000
+): Promise<{ type: string; sessions: unknown[] }> {
+  return await new Promise((resolve, reject) => {
+    const socket = new WebSocket(`ws://${testHost}:${port}/ws?catalog=2`)
+    const timeout = setTimeout(() => {
+      socket.close()
+      reject(new Error('Timed out waiting for sessions message'))
+    }, timeoutMs)
+
+    socket.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(String(event.data)) as {
+          type?: string
+          sessions?: unknown[]
+        }
+        if (payload.type === 'sessions' && payload.sessions) {
+          clearTimeout(timeout)
+          socket.close()
+          resolve({ type: payload.type, sessions: payload.sessions })
+        }
+      } catch {
+        // ignore bad payloads
+      }
+    }
+
+    socket.onerror = () => {
+      clearTimeout(timeout)
+      socket.close()
+      reject(new Error('WebSocket error'))
+    }
+  })
+}
+
+function drainStream(
+  stream: ReadableStream<Uint8Array> | number | null | undefined
+) {
+  if (!stream || typeof stream === 'number') {
+    return
+  }
+
+  const reader = stream.getReader()
+  const pump = async () => {
+    while (true) {
+      const { done } = await reader.read()
+      if (done) {
+        break
+      }
+    }
+  }
+  void pump()
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}

@@ -1,0 +1,313 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import type { AgentSession, SessionMedia, SessionPullRequest } from '../shared/types'
+import { config } from './config'
+import type { AgentSessionRecord } from './db'
+import { getSessionPullRequests } from './prExtractor'
+import { getSessionMedia, type ScannedMedia } from './mediaExtractor'
+import { getSubagentLogPaths } from './subagentLogs'
+
+// PRs found by the last full scan per session, keyed with the log sizes the
+// scan saw (see `pullRequestScanKey`). Lets dormant lists be built without
+// touching any log file.
+const DEFAULT_MAX_SCANNED_ENTRIES = 5000
+let maxScannedEntries = DEFAULT_MAX_SCANNED_ENTRIES
+const scannedPrs = new Map<
+  string,
+  { key: string; prs: SessionPullRequest[] }
+>()
+const scannedMedia = new Map<
+  string,
+  { key: string; media: SessionMedia[] }
+>()
+
+/** Test hook: shrink the remembered-scan cap. Omit to restore the default. */
+export function setScannedPrCacheLimitForTests(limit?: number) {
+  maxScannedEntries = limit ?? DEFAULT_MAX_SCANNED_ENTRIES
+}
+
+function samePullRequests(a: SessionPullRequest[], b: SessionPullRequest[]) {
+  return a.length === b.length && a.every((pr, i) => pr.url === b[i].url)
+}
+
+/** Stores the scan; returns true when the PR list differs from the last one. */
+function rememberScan(
+  record: AgentSessionRecord,
+  key: string,
+  prs: SessionPullRequest[]
+): boolean {
+  const previous = scannedPrs.get(record.sessionId)?.prs ?? []
+  scannedPrs.delete(record.sessionId)
+  if (scannedPrs.size >= maxScannedEntries) {
+    const oldest = scannedPrs.keys().next().value
+    if (oldest !== undefined) scannedPrs.delete(oldest)
+  }
+  scannedPrs.set(record.sessionId, { key, prs })
+  return !samePullRequests(previous, prs)
+}
+
+function subagentPaths(record: AgentSessionRecord): string[] {
+  return getSubagentLogPaths(
+    record.logFilePath,
+    record.agentType,
+    record.sessionId
+  )
+}
+
+// --- session media ---------------------------------------------------------
+//
+// Media mirrors the PR scan: one incremental pass per log file, merged over
+// the main log plus subagent logs, remembered under the same freshness key.
+// Payload bytes stay in the log — descriptors carry a /api/session-media URL
+// that resolves them by (path, offset, index).
+
+function toSessionMedia(
+  record: AgentSessionRecord,
+  logPath: string,
+  media: ScannedMedia
+): SessionMedia {
+  const url =
+    (media.kind === 'html' || media.kind === 'localhost' || media.kind === 'visualization'
+      ? `/api/session-output/${encodeURIComponent(record.sessionId)}/open?ref=${encodeURIComponent(media.url ?? '')}`
+      : media.url) ??
+    `/api/session-media/${encodeURIComponent(record.sessionId)}` +
+      `?path=${encodeURIComponent(logPath)}&offset=${media.offset}&index=${media.index}` +
+      (media.bytes != null ? `&bytes=${media.bytes}` : '')
+  return {
+    kind: media.kind,
+    url,
+    ...(media.mediaType ? { mediaType: media.mediaType } : {}),
+    ...(media.bytes != null ? { bytes: media.bytes } : {}),
+    ...(media.label ? { label: media.label } : {}),
+    ...(media.width ? { width: media.width, height: media.height } : {}),
+  }
+}
+
+function sameMedia(a: SessionMedia[], b: SessionMedia[]) {
+  return a.length === b.length && a.every((m, i) => m.url === b[i].url && m.label === b[i].label)
+}
+
+function rememberMediaScan(
+  record: AgentSessionRecord,
+  key: string,
+  media: SessionMedia[]
+): boolean {
+  const previous = scannedMedia.get(record.sessionId)?.media ?? []
+  scannedMedia.delete(record.sessionId)
+  if (scannedMedia.size >= maxScannedEntries) {
+    const oldest = scannedMedia.keys().next().value
+    if (oldest !== undefined) scannedMedia.delete(oldest)
+  }
+  scannedMedia.set(record.sessionId, { key, media })
+  return !sameMedia(previous, media)
+}
+
+function scanMergedMedia(
+  record: AgentSessionRecord,
+  paths: string[]
+): SessionMedia[] {
+  const media: SessionMedia[] = []
+  for (const p of paths) {
+    for (const item of getSessionMedia(p)) {
+      media.push(toSessionMedia(record, p, item))
+    }
+  }
+  return [...new Map(media.map(item => [item.url, item])).values()]
+}
+
+/** Media found by the last scan of this session's logs. Never reads files. */
+export function getCachedMedia(record: AgentSessionRecord): SessionMedia[] {
+  return scannedMedia.get(record.sessionId)?.media ?? []
+}
+
+export function getMergedMedia(record: AgentSessionRecord): SessionMedia[] {
+  const subagents = subagentPaths(record)
+  // Key before reading: growth during the scan then shows up as a new key.
+  const key = keyFor(record, subagents)
+  const media = scanMergedMedia(record, [record.logFilePath, ...subagents])
+  rememberMediaScan(record, key, media)
+  return media
+}
+
+/** Reads one log's new bytes into the media extractor's per-file cache. */
+export function warmMediaScan(
+  _record: AgentSessionRecord,
+  logPath: string
+): void {
+  getSessionMedia(logPath)
+}
+
+/**
+ * Scans the plan's logs for media and remembers the result under its key.
+ * Returns true when the media list changed from the last remembered scan.
+ * Shares the PR plan: both extractors read the same logs.
+ */
+export function rescanMedia(
+  record: AgentSessionRecord,
+  plan: PullRequestScanPlan = pullRequestScanPlan(record)
+): boolean {
+  return rememberMediaScan(
+    record,
+    plan.key,
+    scanMergedMedia(record, plan.paths)
+  )
+}
+
+function keyFor(record: AgentSessionRecord, subagents: string[]): string {
+  let total = 0
+  for (const logPath of subagents) {
+    try {
+      total += fs.statSync(logPath).size
+    } catch {
+      // A missing subagent log contributes nothing.
+    }
+  }
+  return `${record.lastKnownLogSize ?? null}|${subagents.length}:${total}`
+}
+
+/** What a PR scan of one session reads, and the freshness key it stores. */
+export interface PullRequestScanPlan {
+  key: string
+  /** Main log first, then subagent logs. */
+  paths: string[]
+}
+
+/**
+ * Freshness key for a session's PR scan: the main log size plus the count and
+ * total size of its subagent logs. A codex subagent index that arrives after
+ * the first scan, or a subagent log that grows, changes the key. Stats the
+ * subagent logs; never reads their bodies.
+ */
+export function pullRequestScanKey(record: AgentSessionRecord): string {
+  return keyFor(record, subagentPaths(record))
+}
+
+/** Key and scan paths from a single subagent lookup. */
+export function pullRequestScanPlan(
+  record: AgentSessionRecord
+): PullRequestScanPlan {
+  const subagents = subagentPaths(record)
+  return {
+    key: keyFor(record, subagents),
+    paths: [record.logFilePath, ...subagents],
+  }
+}
+
+/** True when the last remembered scan did not see these log sizes. */
+export function needsPullRequestScan(
+  record: AgentSessionRecord,
+  key: string = pullRequestScanKey(record)
+): boolean {
+  return scannedPrs.get(record.sessionId)?.key !== key
+}
+
+/** Last scanned PRs for the session. Never reads a log file. */
+export function getCachedPullRequests(
+  record: AgentSessionRecord
+): SessionPullRequest[] {
+  return scannedPrs.get(record.sessionId)?.prs ?? []
+}
+
+export function getMergedPullRequests(
+  record: AgentSessionRecord
+): SessionPullRequest[] {
+  const subagents = subagentPaths(record)
+  // Key before reading: growth during the scan then shows up as a new key.
+  const key = keyFor(record, subagents)
+  const prs = scanMergedPullRequests(record, [record.logFilePath, ...subagents])
+  rememberScan(record, key, prs)
+  return prs
+}
+
+/**
+ * Scans the plan's logs and remembers the result under its key (computed
+ * before the scan). Returns true when the PR list changed from the last
+ * remembered scan (including becoming empty).
+ */
+export function rescanPullRequests(
+  record: AgentSessionRecord,
+  plan: PullRequestScanPlan = pullRequestScanPlan(record)
+): boolean {
+  return rememberScan(
+    record,
+    plan.key,
+    scanMergedPullRequests(record, plan.paths)
+  )
+}
+
+/** Reads one log's new bytes into the PR extractor's per-file cache. */
+export function warmPullRequestScan(
+  record: AgentSessionRecord,
+  logPath: string
+): void {
+  getSessionPullRequests(
+    logPath,
+    logPath === record.logFilePath ? record.lastKnownLogSize : undefined
+  )
+}
+
+function scanMergedPullRequests(
+  record: AgentSessionRecord,
+  paths: string[]
+): SessionPullRequest[] {
+  const seen = new Set<string>()
+  const prs: SessionPullRequest[] = []
+  for (let i = 0; i < paths.length; i++) {
+    // knownSize fast path applies only to the main log (index 0).
+    const found = getSessionPullRequests(
+      paths[i],
+      i === 0 ? record.lastKnownLogSize : undefined
+    )
+    for (const pr of found) {
+      if (seen.has(pr.url)) continue
+      seen.add(pr.url)
+      prs.push(pr)
+    }
+  }
+  return prs
+}
+
+export interface ToAgentSessionOptions {
+  /** Use last scanned PRs instead of reading log files (dormant lists). */
+  cachedPrsOnly?: boolean
+}
+
+export function toAgentSession(
+  record: AgentSessionRecord,
+  options?: ToAgentSessionOptions
+): AgentSession {
+  return {
+    sessionId: record.sessionId,
+    logFilePath: record.logFilePath,
+    projectPath: record.projectPath,
+    agentType: record.agentType,
+    displayName: record.displayName,
+    createdAt: record.createdAt,
+    lastActivityAt: record.lastActivityAt,
+    isActive: record.currentWindow !== null,
+    host: config.hostLabel,
+    lastUserMessage: record.lastUserMessage
+      ? record.lastUserMessage.slice(0, 250)
+      : undefined,
+    isHibernating: record.isHibernating,
+    lastResumeError: record.lastResumeError ?? undefined,
+    prs: options?.cachedPrsOnly
+      ? getCachedPullRequests(record)
+      : getMergedPullRequests(record),
+  }
+}
+
+export function deriveDisplayName(
+  projectPath: string,
+  sessionId: string,
+  fallback?: string
+): string {
+  if (fallback && fallback.trim()) {
+    return fallback.trim()
+  }
+  if (projectPath) {
+    const leaf = path.basename(projectPath)
+    if (leaf) return leaf
+  }
+  return sessionId.slice(0, 8)
+}

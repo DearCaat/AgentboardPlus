@@ -1,0 +1,3669 @@
+import { cleanUserImageAttachments, hasUserImageAttachment, hasUserImageMarkup, isContinuationSummary } from './userMessageAttachments'
+import fs from 'node:fs'
+import path from 'node:path'
+import { performance } from 'node:perf_hooks'
+import { antigravityBrain, isAntigravityAuxiliaryFile } from './antigravityLogs'
+import { inferSourceFamily, normalizeAgentLogEntry } from '../shared/eventTaxonomy'
+import type { AgentType, Session } from '../shared/types'
+import { agentFamily } from './agentDetection'
+import {
+  extractProjectPath,
+  inferAgentTypeFromPath,
+  isCodexSubagent,
+  isPiSubagent,
+  normalizeProjectPath,
+} from './logDiscovery'
+import {
+  cleanTmuxLine,
+  isMetadataLine,
+  stripAnsi,
+  TMUX_METADATA_STATUS_PATTERNS,
+  TMUX_PROMPT_PREFIX,
+  TMUX_UI_GLYPH_PATTERN,
+} from './terminal/tmuxText'
+import { logger } from './logger'
+import { timedSpawnSync } from './syncSpawnTiming'
+import { sanitizedTmuxEnv } from './tmuxEnv'
+import { withTmuxUtf8Flag } from './tmuxFormat'
+
+export type LogTextMode = 'all' | 'assistant' | 'user' | 'assistant-user'
+
+export interface LogReadOptions {
+  lineLimit: number
+  byteLimit: number
+  maxByteLimit?: number
+}
+
+export interface LogTextOptionsInput {
+  mode?: LogTextMode
+  logRead?: Partial<LogReadOptions>
+}
+
+export interface ExactMatchProfiler {
+  windowMatchRuns: number
+  windowMatchMs: number
+  tmuxCaptures: number
+  tmuxCaptureMs: number
+  messageExtractRuns: number
+  messageExtractMs: number
+  tailReads: number
+  tailReadMs: number
+  rgListRuns: number
+  rgListMs: number
+  rgJsonRuns: number
+  rgJsonMs: number
+  tailScoreRuns: number
+  tailScoreMs: number
+  rgScoreRuns: number
+  rgScoreMs: number
+  tieBreakRgRuns: number
+  tieBreakRgMs: number
+}
+
+export function createExactMatchProfiler(): ExactMatchProfiler {
+  return {
+    windowMatchRuns: 0,
+    windowMatchMs: 0,
+    tmuxCaptures: 0,
+    tmuxCaptureMs: 0,
+    messageExtractRuns: 0,
+    messageExtractMs: 0,
+    tailReads: 0,
+    tailReadMs: 0,
+    rgListRuns: 0,
+    rgListMs: 0,
+    rgJsonRuns: 0,
+    rgJsonMs: 0,
+    tailScoreRuns: 0,
+    tailScoreMs: 0,
+    rgScoreRuns: 0,
+    rgScoreMs: 0,
+    tieBreakRgRuns: 0,
+    tieBreakRgMs: 0,
+  }
+}
+
+interface SpawnResult {
+  exitCode: number
+  stdout: string
+  stderr: string
+}
+
+interface SpawnOptions {
+  timeoutMs?: number
+}
+
+const TMUX_CAPTURE_TIMEOUT_MS = 5000
+const RG_COMMAND_TIMEOUT_MS = 10000
+
+function runCommandSync(args: string[], options: SpawnOptions = {}): SpawnResult {
+  const result = timedSpawnSync(args, {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    ...(options.timeoutMs && options.timeoutMs > 0
+      ? { timeout: options.timeoutMs }
+      : {}),
+  })
+  return {
+    exitCode: result.exitCode,
+    stdout: result.stdout.toString(),
+    stderr: result.stderr.toString(),
+  }
+}
+
+async function runCommandAsync(
+  args: string[],
+  options: SpawnOptions = {}
+): Promise<SpawnResult> {
+  const proc = Bun.spawn(args, {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    // Explicit env: omitted, Bun hands the child the process-start environ —
+    // a stale $TMUX would send tmux calls (and Workers running this) to the
+    // live server instead of the isolated socket.
+    env: sanitizedTmuxEnv(),
+    ...(options.timeoutMs && options.timeoutMs > 0
+      ? { timeout: options.timeoutMs }
+      : {}),
+  })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    proc.stdout ? new Response(proc.stdout).text() : '',
+    proc.stderr ? new Response(proc.stderr).text() : '',
+  ])
+  return {
+    exitCode: typeof exitCode === 'number' ? exitCode : 1,
+    stdout,
+    stderr,
+  }
+}
+
+const DEFAULT_LOG_READ_OPTIONS: LogReadOptions = {
+  lineLimit: 2000,
+  byteLimit: 200 * 1024,
+}
+
+export const DEFAULT_SCROLLBACK_LINES = 10000
+const DEFAULT_LOG_TEXT_MODE: LogTextMode = 'assistant-user'
+const DEFAULT_LOG_TAIL_BYTES = 96 * 1024
+const MIN_TAIL_MATCH_COUNT = 2
+const MAX_RECENT_USER_MESSAGES = 25
+const MAX_RECENT_TRACE_LINES = 12
+
+// Minimum length for exact match search
+const MIN_EXACT_MATCH_LENGTH = 5
+const TRACE_EXCLUDE_PREFIXES = [
+  /^explored\b/i,
+  /^ran\b/i,
+  /^search\b/i,
+  /^read\b/i,
+  /^use\b/i,
+  /^⟦/,
+] as const
+const TRACE_STATUS_TRAILER = /\s*\(([^)]*)\)\s*$/
+const TRACE_STATUS_HINTS = [
+  /esc to interrupt/i,
+  /context left/i,
+  /for shortcuts/i,
+  /background terminal running/i,
+  /\b\d+\s*(?:ms|s|m|h|d)\b/i,
+] as const
+
+/**
+ * Escape special regex characters in a string.
+ */
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Convert a user message to a regex pattern that matches with flexible whitespace.
+ * This handles cases where tmux and log files have different whitespace representations.
+ * Also handles JSON-escaped quotes since logs store text in JSON format where " becomes \".
+ */
+function messageToFlexiblePattern(message: string): string {
+  // Normalize to single spaces first
+  const normalized = message.replace(/\s+/g, ' ').trim()
+  // Escape regex special chars, then replace spaces with \s+ for flexible matching
+  // Replace quotes with pattern matching: nothing, ", or \" (JSON-escaped)
+  return escapeRegex(normalized)
+    .replace(/ /g, '\\s+')
+    .replace(/"/g, '(?:\\\\?")?')
+}
+
+const MAX_MESSAGE_MATCH_PREFIX = 1000
+const TOOL_RESULT_TYPES = new Set(['tool_result', 'custom_tool_call_output'])
+const TOOL_RESULT_KEYS = new Set(['toolUseResult'])
+const MESSAGE_VALUE_KEYS = new Set(['text', 'message', 'content'])
+
+function matchesMessageWithPrefixLimit(text: string, pattern: RegExp): boolean {
+  const index = text.search(pattern)
+  return index >= 0 && index <= MAX_MESSAGE_MATCH_PREFIX
+}
+
+/**
+ * Compiled matchers for one user message. The fallback regexes reproduce the
+ * raw-line checks for lines that fail JSON.parse.
+ */
+interface MessageProbe {
+  baseRegex: RegExp
+  textFieldRegex: RegExp
+  contentFieldRegex: RegExp
+}
+
+function buildMessageProbe(userMessage: string): MessageProbe {
+  const basePattern = messageToFlexiblePattern(userMessage)
+  return {
+    baseRegex: new RegExp(basePattern, 'm'),
+    textFieldRegex: new RegExp(
+      `"(?:text|message)"\\s*:\\s*"[^"]{0,1000}?${basePattern}`,
+      'm'
+    ),
+    contentFieldRegex: new RegExp(
+      `"content"\\s*:\\s*"[^"]{0,1000}?${basePattern}`,
+      'm'
+    ),
+  }
+}
+
+/**
+ * Everything a log line can contribute to a valid-user-context match, computed
+ * once per line. Batch verification pays the JSON.parse cost once per file
+ * instead of once per file per message.
+ *
+ * - parsed lines: `userTexts`/`allTexts` are the strings a message may match —
+ *   the object-walk strings from hasMessageInParsedJson (role-agnostic, as in
+ *   the original) plus normalized event texts. `userTexts` additionally drops
+ *   non-user events (the `userOnly` filter).
+ * - unparseable lines: the raw line plus whether tool-result context blocks
+ *   the "content" fallback.
+ */
+type LogLineMatchSpace =
+  | { parsed: true; userTexts: string[]; allTexts: string[] }
+  | { parsed: false; raw: string; contentBlocked: boolean }
+
+function collectMessageValueStrings(value: unknown, out: string[]): void {
+  if (value === null || value === undefined) {
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectMessageValueStrings(item, out)
+    }
+    return
+  }
+  if (typeof value !== 'object') {
+    return
+  }
+  const record = value as Record<string, unknown>
+  const typeValue = record.type
+  if (typeof typeValue === 'string' && TOOL_RESULT_TYPES.has(typeValue)) {
+    return
+  }
+  for (const [key, child] of Object.entries(record)) {
+    if (TOOL_RESULT_KEYS.has(key)) continue
+    if (MESSAGE_VALUE_KEYS.has(key) && typeof child === 'string') {
+      out.push(child)
+      continue
+    }
+    if (child && typeof child === 'object') {
+      collectMessageValueStrings(child, out)
+    }
+  }
+}
+
+function lineMatchSpace(line: string): LogLineMatchSpace | null {
+  const trimmed = line.trim()
+  if (!trimmed) return null
+  try {
+    const parsed = JSON.parse(trimmed)
+    const walkTexts: string[] = []
+    if (typeof parsed?.step_index !== 'number' || inferSourceFamily(parsed) !== 'antigravity') {
+      collectMessageValueStrings(parsed, walkTexts)
+    }
+    const userTexts = [...walkTexts]
+    const allTexts = [...walkTexts]
+    for (const event of normalizeAgentLogEntry(parsed)) {
+      if (event.kind === 'tool_result') continue
+      if (!event.text) continue
+      allTexts.push(event.text)
+      if (event.role === 'user') userTexts.push(event.text)
+    }
+    return { parsed: true, userTexts, allTexts }
+  } catch {
+    return {
+      parsed: false,
+      raw: line,
+      contentBlocked:
+        /"type"\s*:\s*"tool_result"/.test(line) ||
+        /"type"\s*:\s*"custom_tool_call_output"/.test(line) ||
+        /"toolUseResult"\s*:/.test(line),
+    }
+  }
+}
+
+function lineSpaceMatches(
+  space: LogLineMatchSpace,
+  probe: MessageProbe,
+  userOnly: boolean
+): boolean {
+  if (space.parsed) {
+    const pool = userOnly ? space.userTexts : space.allTexts
+    for (const text of pool) {
+      if (matchesMessageWithPrefixLimit(text, probe.baseRegex)) return true
+    }
+    return false
+  }
+  if (probe.textFieldRegex.test(space.raw)) return true
+  return !space.contentBlocked && probe.contentFieldRegex.test(space.raw)
+}
+
+/**
+ * Check if log content has the message in a valid user message context.
+ *
+ * This filters out false positives where the message appears inside tool_result
+ * content (e.g., terminal captures from another session observing this window).
+ *
+ * Valid contexts:
+ *   - "text" field: {"type":"text","text":"user message"}
+ *   - "message" field: {"message":"user message"}
+ *   - "content" field NOT in tool_result: {"role":"user","content":"user message"}
+ *
+ * Invalid contexts:
+ *   - Tool result content: {"type":"tool_result","content":"❯ captured terminal"}
+ */
+export function hasMessageInValidUserContext(
+  logContent: string,
+  userMessage: string,
+  { userOnly = false }: { userOnly?: boolean } = {}
+): boolean {
+  const probe = buildMessageProbe(userMessage)
+  for (const line of logContent.split('\n')) {
+    const space = lineMatchSpace(line)
+    if (space && lineSpaceMatches(space, probe, userOnly)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Search for logs containing an exact user message using ripgrep.
+ * Searches both Claude and Codex log directories.
+ * Uses flexible whitespace matching to handle differences between tmux and log content.
+ * Returns list of matching log file paths.
+ */
+export interface ExactMatchSearchOptions {
+  logPaths?: string[]
+  tailBytes?: number
+  rgThreads?: number
+  profile?: ExactMatchProfiler
+  /** Log paths to exclude from matching (e.g., logs belonging to other active windows) */
+  excludeLogPaths?: string[]
+  /** When true, only match events with role === 'user' in the normalized path */
+  userOnly?: boolean
+}
+
+export interface ExactMessageSearchOptions extends ExactMatchSearchOptions {
+  minLength?: number
+}
+
+const TOOL_NOTIFICATION_MARKERS = [
+  '<task-notification>',
+  '<send_user_message_question_reply>',
+  '<task-id>',
+  '<output-file>',
+  '<status>',
+  '<summary>',
+  'read the output file to retrieve the result',
+  // Codex system messages
+  '<instructions>',
+  '# agents.md instructions',
+  '<environment_context>',
+  // Claude Code slash-command / auto-compact stdout/stderr (e.g. `<local-command-stdout>\x1b[2mCompacted...\x1b[22m</local-command-stdout>`)
+  '<local-command-stdout>',
+  '<local-command-stderr>',
+  // Raw slash-command invocations. Live extraction prefers the "/cmd args"
+  // form via extractCommandInvocation; this marker exists so the cache-refresh
+  // path in logPoller treats any pre-fix cached `<command-message>...` payload
+  // as stale and re-runs extraction.
+  '<command-message>',
+  // Grok prepends an environment block (<user_info>OS Version: ...</user_info>)
+  // as a user entry; it's harness context, not a real message.
+  '<user_info>',
+] as const
+
+
+
+/**
+ * Pattern for Codex CLI tool-use warnings injected as user messages.
+ * Example: "Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead."
+ */
+const CODEX_TOOL_WARNING_PATTERN = /^warning:\s+\w+\s+was\s+requested\s+via\s+exec_command/i
+
+export function isToolNotificationText(text: string): boolean {
+  const trimmed = text.trim()
+  if (!trimmed) return false
+  if (isContinuationSummary(trimmed) || hasUserImageMarkup(trimmed)) return true
+  // Claude reminders can carry IDs, including in cached, truncated previews.
+  if (/<system-reminder(?=[\s>]|$)/i.test(trimmed)) return true
+  const normalized = trimmed.toLowerCase()
+  if (normalized.startsWith('<task-notification>')) {
+    return true
+  }
+  // Filter Codex CLI tool-use warnings (e.g., "Warning: apply_patch was requested via exec_command")
+  if (normalized === 'tool loaded.' || CODEX_TOOL_WARNING_PATTERN.test(trimmed)) {
+    return true
+  }
+  return TOOL_NOTIFICATION_MARKERS.some((marker) => normalized.includes(marker))
+}
+
+/**
+ * Agent TUIs collapse a large paste into a bracketed placeholder — Claude
+ * Code renders "[Pasted text #1 +263 lines]" — so a terminal capture of such
+ * a prompt is lossy: only the JSONL log has the real content. Strips every
+ * placeholder and collapses the surrounding whitespace. The pattern demands
+ * a counter token (#N, +N lines, or N chars/lines) so legitimate bracketed
+ * prose like "[pasted from docs]" is left alone. Returns the input string
+ * unchanged (same reference) when no placeholder is present, so callers can
+ * detect placeholders via `stripPastePlaceholders(t) !== t`.
+ */
+const PASTE_PLACEHOLDER_PATTERN =
+  /\[\s*pasted(?:\s+text)?[^\]]*?(?:#\d+|\+\d+\s*lines?|\d+\s*(?:characters|chars?|lines?))[^\]]*\]/gi
+
+export function stripPastePlaceholders(text: string): string {
+  const stripped = text.replace(PASTE_PLACEHOLDER_PATTERN, ' ')
+  if (stripped === text) return text
+  return stripped.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Extract the action name from a <user_action> XML block.
+ * Returns the action (e.g., "review") or null if not a user_action block.
+ */
+export function extractActionFromUserAction(text: string): string | null {
+  const trimmed = text.trim()
+  if (!trimmed.toLowerCase().startsWith('<user_action>')) {
+    return null
+  }
+  const actionMatch = trimmed.match(/<action>\s*([^<]+)\s*<\/action>/i)
+  if (actionMatch?.[1]) {
+    return actionMatch[1].trim()
+  }
+  return null
+}
+
+/**
+ * Extract a human-readable slash command invocation from a Claude Code
+ * `<command-message>...</command-message><command-name>/cmd</command-name><command-args>args</command-args>`
+ * user message. Returns "/cmd args" (or "/cmd" with no args) or null if not a command invocation.
+ *
+ * To avoid false positives on user-authored prose containing `<command-name>` tags,
+ * we require the full Claude block shape (both `<command-message>` and `<command-name>`)
+ * and require the extracted name to be a slash command.
+ */
+export function extractCommandInvocation(text: string): string | null {
+  if (!text.includes('<command-message>') || !text.includes('<command-name>')) return null
+  const nameMatch = text.match(/<command-name>\s*([^<]+?)\s*<\/command-name>/i)
+  const name = nameMatch?.[1]?.trim()
+  if (!name || !name.startsWith('/')) return null
+  const argsMatch = text.match(/<command-args>\s*([\s\S]*?)\s*<\/command-args>/i)
+  const args = argsMatch?.[1]?.trim() ?? ''
+  return args ? `${name} ${args}` : name
+}
+
+function readLogTail(logPath: string, byteLimit = DEFAULT_LOG_TAIL_BYTES): string {
+  if (byteLimit <= 0) return ''
+  try {
+    const stats = fs.statSync(logPath)
+    const size = stats.size
+    if (size <= 0) return ''
+    const start = Math.max(0, size - byteLimit)
+    if (start === 0) {
+      return fs.readFileSync(logPath, 'utf8')
+    }
+
+    const fd = fs.openSync(logPath, 'r')
+    try {
+      const length = size - start
+      const buffer = Buffer.alloc(length)
+      fs.readSync(fd, buffer, 0, length, start)
+      let text = buffer.toString('utf8')
+      const firstNewline = text.indexOf('\n')
+      if (firstNewline >= 0) {
+        text = text.slice(firstNewline + 1)
+      }
+      return text
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return ''
+  }
+}
+
+const MAX_PROGRESSIVE_TAIL_BYTES = 2 * 1024 * 1024
+
+const BACKWARD_READ_CHUNK_BYTES = 64 * 1024
+// Safety valve for pathological files (e.g. a multi-GB line with no newlines).
+// A single log entry larger than this aborts the backward scan.
+const MAX_BACKWARD_LINE_BYTES = 16 * 1024 * 1024
+
+/**
+ * Iterate the complete lines of a file from the end toward the start (newest
+ * first). Reads fixed-size chunks backward from EOF and only assembles whole
+ * lines, so a jumbo line (a user message with a large paste can exceed 1MB as
+ * a single JSONL line) costs one pass over that line instead of repeated
+ * expanding tail reads that keep decapitating it at the tail boundary.
+ *
+ * `maxScanBytes` bounds how far back the scan goes, checked at line
+ * boundaries: a line that straddles the budget is still completed and
+ * yielded, so the budget caps scan depth without capping line size — the
+ * true worst-case read is maxScanBytes + maxLineBytes. Splitting on \n is
+ * UTF-8 safe (0x0A never appears inside a multi-byte sequence), so buffers
+ * are only decoded once a line is complete. An in-progress line is kept as
+ * a list of chunk slices and concatenated once at its newline, so assembling
+ * a jumbo line is linear, not quadratic. The scan aborts (stops yielding) on
+ * any line over maxLineBytes and on a short read (file changed underneath).
+ */
+export function* iterateLogLinesBackward(
+  logPath: string,
+  {
+    maxScanBytes = Number.POSITIVE_INFINITY,
+    chunkBytes = BACKWARD_READ_CHUNK_BYTES,
+    maxLineBytes = MAX_BACKWARD_LINE_BYTES,
+  }: { maxScanBytes?: number; chunkBytes?: number; maxLineBytes?: number } = {}
+): Generator<string> {
+  if (maxScanBytes <= 0) return
+  let fd: number
+  let size: number
+  try {
+    fd = fs.openSync(logPath, 'r')
+  } catch {
+    return
+  }
+  try {
+    try {
+      size = fs.fstatSync(fd).size
+    } catch {
+      return
+    }
+    if (size <= 0) return
+
+    let position = size
+    // Pieces of the in-progress line (file order); its earlier bytes live in
+    // chunks not yet read. Concatenated only once, at the line's newline.
+    let carry: Buffer[] = []
+    let carrySize = 0
+    let scanned = 0
+    let budgetExhausted = false
+
+    const finishLine = (piece: Buffer): string | null => {
+      const buf = carry.length > 0 ? Buffer.concat([piece, ...carry]) : piece
+      carry = []
+      carrySize = 0
+      if (buf.length > maxLineBytes) return null
+      return buf.toString('utf8').trim()
+    }
+
+    while (position > 0) {
+      // While budget remains, never read past it in one chunk — lines inside
+      // a chunk are emitted unconditionally, so an oversized read would leak
+      // lines from beyond the budget. Once exhausted (mid-line), full chunks
+      // are fine: emission stops at the first completed line.
+      const remaining = budgetExhausted
+        ? chunkBytes
+        : Math.max(1, Math.min(chunkBytes, maxScanBytes - scanned))
+      const readLength = Math.min(remaining, position)
+      const start = position - readLength
+      const chunk = Buffer.alloc(readLength)
+      const bytesRead = fs.readSync(fd, chunk, 0, readLength, start)
+      if (bytesRead !== readLength) return
+      position = start
+      scanned += readLength
+
+      // Walk newlines from the end of the chunk; the segment after each
+      // newline is a complete line. The first (newest) one also absorbs the
+      // carry accumulated from later chunks.
+      let end = chunk.length
+      let carryConsumed = false
+      for (let i = chunk.length - 1; i >= 0; i--) {
+        if (chunk[i] !== 0x0a) continue
+        const piece = chunk.subarray(i + 1, end)
+        end = i
+        let line: string | null
+        if (carryConsumed) {
+          line = piece.length > maxLineBytes ? null : piece.toString('utf8').trim()
+        } else {
+          line = finishLine(piece)
+          carryConsumed = true
+        }
+        if (line === null) return
+        if (line) {
+          yield line
+          // Once past the budget we only finish the straddling line.
+          if (budgetExhausted) return
+        }
+      }
+      if (end > 0) {
+        carry.unshift(chunk.subarray(0, end))
+        carrySize += end
+      }
+
+      if (carrySize > maxLineBytes) return
+      if (scanned >= maxScanBytes) {
+        // At a line boundary the budget is a clean stop; mid-line, keep
+        // reading just far enough to complete the line in progress.
+        if (carrySize === 0) return
+        budgetExhausted = true
+      }
+    }
+
+    if (carrySize > 0) {
+      const line = finishLine(Buffer.alloc(0))
+      if (line) yield line
+    }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
+ * Check if a log file contains a message in a valid user context, using progressive
+ * tail reading. Starts with a small tail and expands up to maxTailBytes if needed.
+ * This handles cases where logs have lots of assistant output after the last user message.
+ */
+function hasMessageInValidUserContextProgressive(
+  logPath: string,
+  userMessage: string,
+  initialTailBytes = DEFAULT_LOG_TAIL_BYTES,
+  maxTailBytes = MAX_PROGRESSIVE_TAIL_BYTES,
+  { userOnly = false }: { userOnly?: boolean } = {}
+): boolean {
+  let tailBytes = initialTailBytes
+  while (tailBytes <= maxTailBytes) {
+    const tail = readLogTail(logPath, tailBytes)
+    // An empty tail can mean the window landed entirely inside one jumbo
+    // line — keep expanding rather than concluding there is no match.
+    if (hasMessageInValidUserContext(tail, userMessage, { userOnly })) {
+      return true
+    }
+    if (tailBytes >= maxTailBytes) break
+    tailBytes = Math.min(tailBytes * 4, maxTailBytes)
+  }
+  return false
+}
+
+/**
+ * Grok session directories hold sibling telemetry files (events.jsonl,
+ * updates.jsonl, rewind_points.jsonl) that echo the prompt text; only
+ * chat_history.jsonl is a transcript.
+ */
+function isAuxiliaryLogFile(logPath: string): boolean {
+  if (isAntigravityAuxiliaryFile(logPath)) return true
+  if (path.basename(logPath) === 'chat_history.jsonl') return false
+  const normalized = logPath.replace(/\\/g, '/')
+  if (normalized.includes('/.grok/')) return true
+  const grokHome = process.env.GROK_HOME
+  return !!grokHome && normalized.startsWith(grokHome.replace(/\\/g, '/') + '/')
+}
+
+function logDirectoryArgs(dir: string): string[] {
+  return path.resolve(dir) === path.resolve(antigravityBrain())
+    ? ['--hidden', '--glob', '**/.system_generated/logs/transcript.jsonl', dir]
+    : ['--glob', '**/*.jsonl', dir]
+}
+
+export function findLogsWithExactMessage(
+  userMessage: string,
+  logDirs: string | string[],
+  {
+    minLength = MIN_EXACT_MATCH_LENGTH,
+    logPaths,
+    tailBytes,
+    rgThreads,
+    profile,
+    userOnly,
+  }: ExactMessageSearchOptions = {}
+): string[] {
+  if (!userMessage || userMessage.length < minLength) {
+    return []
+  }
+
+  const candidatePaths = (logPaths ?? []).filter(Boolean)
+  if (candidatePaths.length > 0) {
+    return findLogsWithExactMessageInPaths(userMessage, candidatePaths, {
+      minLength,
+      tailBytes,
+      rgThreads,
+      profile,
+      userOnly,
+    })
+  }
+
+  const dirs = Array.isArray(logDirs) ? logDirs : [logDirs]
+  const allMatches: string[] = []
+
+  // Convert to regex pattern with flexible whitespace for fast ripgrep
+  const flexiblePattern = messageToFlexiblePattern(userMessage)
+
+  for (const logDir of dirs) {
+    // Use **/*.jsonl to search nested directories (Codex uses YYYY/MM/DD structure)
+    // Use -e for regex pattern instead of --fixed-strings
+    const args = ['rg', '-l', '-e', flexiblePattern]
+    if (rgThreads && rgThreads > 0) {
+      args.push('--threads', String(rgThreads))
+    }
+    args.push(...logDirectoryArgs(logDir))
+    const start = performance.now()
+    const result = runCommandSync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+    if (profile) {
+      profile.rgListRuns += 1
+      profile.rgListMs += performance.now() - start
+    }
+
+    if (result.exitCode === 0) {
+      const matches = result.stdout.trim().split('\n').filter(Boolean)
+      allMatches.push(...matches)
+    }
+  }
+
+  const uniqueMatches = Array.from(new Set(allMatches)).filter(
+    (logPath) => !isAuxiliaryLogFile(logPath)
+  )
+
+  // Post-filter to exclude tool_result false positives
+  // Use progressive tail reading to handle large logs with lots of assistant output
+  const validMatches = uniqueMatches.filter((logPath) =>
+    hasMessageInValidUserContextProgressive(
+      logPath,
+      userMessage,
+      tailBytes ?? DEFAULT_LOG_TAIL_BYTES,
+      undefined,
+      { userOnly }
+    )
+  )
+
+  return validMatches.length > 0 ? validMatches : []
+}
+
+export async function findLogsWithExactMessageAsync(
+  userMessage: string,
+  logDirs: string | string[],
+  {
+    minLength = MIN_EXACT_MATCH_LENGTH,
+    logPaths,
+    tailBytes,
+    rgThreads,
+    profile,
+    userOnly,
+  }: ExactMessageSearchOptions = {}
+): Promise<string[]> {
+  if (!userMessage || userMessage.length < minLength) {
+    return []
+  }
+
+  const candidatePaths = (logPaths ?? []).filter(Boolean)
+  if (candidatePaths.length > 0) {
+    return findLogsWithExactMessageInPathsAsync(userMessage, candidatePaths, {
+      minLength,
+      tailBytes,
+      rgThreads,
+      profile,
+      userOnly,
+    })
+  }
+
+  const dirs = Array.isArray(logDirs) ? logDirs : [logDirs]
+  const allMatches: string[] = []
+  const flexiblePattern = messageToFlexiblePattern(userMessage)
+
+  for (const logDir of dirs) {
+    const args = ['rg', '-l', '-e', flexiblePattern]
+    if (rgThreads && rgThreads > 0) {
+      args.push('--threads', String(rgThreads))
+    }
+    args.push(...logDirectoryArgs(logDir))
+    const start = performance.now()
+    const result = await runCommandAsync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+    if (profile) {
+      profile.rgListRuns += 1
+      profile.rgListMs += performance.now() - start
+    }
+
+    if (result.exitCode === 0) {
+      const matches = result.stdout.trim().split('\n').filter(Boolean)
+      allMatches.push(...matches)
+    }
+  }
+
+  const uniqueMatches = Array.from(new Set(allMatches)).filter(
+    (logPath) => !isAuxiliaryLogFile(logPath)
+  )
+  const validMatches = uniqueMatches.filter((logPath) =>
+    hasMessageInValidUserContextProgressive(
+      logPath,
+      userMessage,
+      tailBytes ?? DEFAULT_LOG_TAIL_BYTES,
+      undefined,
+      { userOnly }
+    )
+  )
+
+  return validMatches.length > 0 ? validMatches : []
+}
+
+function findLogsWithExactMessageInPaths(
+  userMessage: string,
+  logPaths: string[],
+  {
+    minLength = MIN_EXACT_MATCH_LENGTH,
+    tailBytes = DEFAULT_LOG_TAIL_BYTES,
+    rgThreads,
+    profile,
+    userOnly,
+  }: ExactMessageSearchOptions = {}
+): string[] {
+  if (!userMessage || userMessage.length < minLength) {
+    return []
+  }
+  const uniquePaths = Array.from(new Set(logPaths)).filter(file => file && !isAuxiliaryLogFile(file))
+  if (uniquePaths.length === 0) return []
+
+  // Use flexible pattern for fast ripgrep search
+  const flexiblePattern = messageToFlexiblePattern(userMessage)
+
+  const tailMatches: string[] = []
+  if (tailBytes > 0) {
+    for (const logPath of uniquePaths) {
+      const start = performance.now()
+      const tail = readLogTail(logPath, tailBytes)
+      if (profile) {
+        profile.tailReads += 1
+        profile.tailReadMs += performance.now() - start
+      }
+      if (!tail) continue
+      // Use context validation to filter out tool_result false positives
+      if (hasMessageInValidUserContext(tail, userMessage, { userOnly })) {
+        tailMatches.push(logPath)
+      }
+    }
+  }
+
+  if (tailMatches.length === 1) {
+    return tailMatches
+  }
+
+  // Use flexible pattern for fast ripgrep (no PCRE2 needed)
+  const args = ['rg', '-l', '-e', flexiblePattern]
+  if (rgThreads && rgThreads > 0) {
+    args.push('--threads', String(rgThreads))
+  }
+  args.push(...uniquePaths)
+  const start = performance.now()
+  const result = runCommandSync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (profile) {
+    profile.rgListRuns += 1
+    profile.rgListMs += performance.now() - start
+  }
+  if (result.exitCode !== 0) {
+    return tailMatches.length > 0 ? tailMatches : []
+  }
+  const rgMatches = result.stdout.trim().split('\n').filter(Boolean)
+
+  // Post-filter ripgrep results to exclude tool_result false positives
+  // Use progressive tail reading to handle large logs with lots of assistant output
+  const validMatches = rgMatches.filter((logPath) =>
+    hasMessageInValidUserContextProgressive(logPath, userMessage, tailBytes, undefined, {
+      userOnly,
+    })
+  )
+
+  return validMatches.length > 0 ? validMatches : tailMatches
+}
+
+async function findLogsWithExactMessageInPathsAsync(
+  userMessage: string,
+  logPaths: string[],
+  {
+    minLength = MIN_EXACT_MATCH_LENGTH,
+    tailBytes = DEFAULT_LOG_TAIL_BYTES,
+    rgThreads,
+    profile,
+    userOnly,
+  }: ExactMessageSearchOptions = {}
+): Promise<string[]> {
+  if (!userMessage || userMessage.length < minLength) {
+    return []
+  }
+  const uniquePaths = Array.from(new Set(logPaths)).filter(file => file && !isAuxiliaryLogFile(file))
+  if (uniquePaths.length === 0) return []
+
+  const flexiblePattern = messageToFlexiblePattern(userMessage)
+
+  const tailMatches: string[] = []
+  if (tailBytes > 0) {
+    for (const logPath of uniquePaths) {
+      const start = performance.now()
+      const tail = readLogTail(logPath, tailBytes)
+      if (profile) {
+        profile.tailReads += 1
+        profile.tailReadMs += performance.now() - start
+      }
+      if (!tail) continue
+      if (hasMessageInValidUserContext(tail, userMessage, { userOnly })) {
+        tailMatches.push(logPath)
+      }
+    }
+  }
+
+  if (tailMatches.length === 1) {
+    return tailMatches
+  }
+
+  const args = ['rg', '-l', '-e', flexiblePattern]
+  if (rgThreads && rgThreads > 0) {
+    args.push('--threads', String(rgThreads))
+  }
+  args.push(...uniquePaths)
+  const start = performance.now()
+  const result = await runCommandAsync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (profile) {
+    profile.rgListRuns += 1
+    profile.rgListMs += performance.now() - start
+  }
+  if (result.exitCode !== 0) {
+    return tailMatches.length > 0 ? tailMatches : []
+  }
+  const rgMatches = result.stdout.trim().split('\n').filter(Boolean)
+  const validMatches = rgMatches.filter((logPath) =>
+    hasMessageInValidUserContextProgressive(logPath, userMessage, tailBytes, undefined, {
+      userOnly,
+    })
+  )
+
+  return validMatches.length > 0 ? validMatches : tailMatches
+}
+
+interface ConversationPair {
+  user: string
+  assistant: string
+}
+
+export function normalizeText(text: string): string {
+  const cleaned = stripAnsi(text)
+    // eslint-disable-next-line no-control-regex -- strip control characters
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    .toLowerCase()
+  return cleaned.replace(/\s+/g, ' ').trim()
+}
+
+function normalizePath(value: string): string {
+  if (!value) return ''
+  return normalizeProjectPath(value)
+}
+
+export function isSameOrChildPath(left: string, right: string): boolean {
+  if (!left || !right) return false
+  if (left === right) return true
+  return left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
+}
+
+function intersectCandidates(base: string[], next: string[]): string[] {
+  if (base.length === 0) return next
+  const nextSet = new Set(next)
+  return base.filter((item) => nextSet.has(item))
+}
+
+interface OrderedMatchScore {
+  matchedCount: number
+  matchedLength: number
+  source?: 'tail' | 'rg'
+}
+
+function getRgMatchLines(
+  pattern: string,
+  logPath: string,
+  search: ExactMatchSearchOptions = {}
+): number[] {
+  const args = ['rg', '--json', '-e', pattern]
+  if (search.rgThreads && search.rgThreads > 0) {
+    args.push('--threads', String(search.rgThreads))
+  }
+  args.push(logPath)
+  const start = performance.now()
+  const result = runCommandSync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (search.profile) {
+    search.profile.rgJsonRuns += 1
+    search.profile.rgJsonMs += performance.now() - start
+  }
+  if (result.exitCode !== 0 && result.exitCode !== 1) {
+    return []
+  }
+
+  return parseRgMatchLines(result.stdout)
+}
+
+async function getRgMatchLinesAsync(
+  pattern: string,
+  logPath: string,
+  search: ExactMatchSearchOptions = {}
+): Promise<number[]> {
+  const args = ['rg', '--json', '-e', pattern]
+  if (search.rgThreads && search.rgThreads > 0) {
+    args.push('--threads', String(search.rgThreads))
+  }
+  args.push(logPath)
+  const start = performance.now()
+  const result = await runCommandAsync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (search.profile) {
+    search.profile.rgJsonRuns += 1
+    search.profile.rgJsonMs += performance.now() - start
+  }
+  if (result.exitCode !== 0 && result.exitCode !== 1) {
+    return []
+  }
+
+  return parseRgMatchLines(result.stdout)
+}
+
+function parseRgMatchLines(output: string): number[] {
+  const lines: number[] = []
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let entry: unknown
+    try {
+      entry = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    const record = entry as { type?: string; data?: { line_number?: number } }
+    if (record.type !== 'match') continue
+    const lineNumber = record.data?.line_number
+    if (typeof lineNumber === 'number') {
+      lines.push(lineNumber)
+    }
+  }
+
+  return lines.toSorted((a, b) => a - b)
+}
+
+function scoreOrderedMessageMatchesInText(
+  text: string,
+  messages: string[]
+): OrderedMatchScore {
+  let matchedCount = 0
+  let matchedLength = 0
+  let cursor = 0
+
+  for (const message of messages) {
+    if (!message) continue
+    const pattern = messageToFlexiblePattern(message)
+    const regex = new RegExp(pattern, 'g')
+    regex.lastIndex = cursor
+    const match = regex.exec(text)
+    if (!match) {
+      continue
+    }
+    matchedCount += 1
+    matchedLength += message.length
+    cursor = match.index + match[0].length
+  }
+
+  return { matchedCount, matchedLength }
+}
+
+function scoreOrderedMessageMatchesWithRg(
+  logPath: string,
+  messages: string[],
+  search: ExactMatchSearchOptions = {}
+): OrderedMatchScore {
+  let matchedCount = 0
+  let matchedLength = 0
+  let lastLine = 0
+
+  for (const message of messages) {
+    if (!message) continue
+    const pattern = messageToFlexiblePattern(message)
+    const matchLines = getRgMatchLines(pattern, logPath, search)
+    if (matchLines.length === 0) {
+      continue
+    }
+    const nextLine = matchLines.find((line) => line > lastLine)
+    if (nextLine === undefined) {
+      continue
+    }
+    matchedCount += 1
+    matchedLength += message.length
+    lastLine = nextLine
+  }
+
+  return { matchedCount, matchedLength }
+}
+
+async function scoreOrderedMessageMatchesWithRgAsync(
+  logPath: string,
+  messages: string[],
+  search: ExactMatchSearchOptions = {}
+): Promise<OrderedMatchScore> {
+  let matchedCount = 0
+  let matchedLength = 0
+  let lastLine = 0
+
+  for (const message of messages) {
+    if (!message) continue
+    const pattern = messageToFlexiblePattern(message)
+    const matchLines = await getRgMatchLinesAsync(pattern, logPath, search)
+    if (matchLines.length === 0) {
+      continue
+    }
+    const nextLine = matchLines.find((line) => line > lastLine)
+    if (nextLine === undefined) {
+      continue
+    }
+    matchedCount += 1
+    matchedLength += message.length
+    lastLine = nextLine
+  }
+
+  return { matchedCount, matchedLength }
+}
+
+function scoreOrderedMessageMatches(
+  logPath: string,
+  messages: string[],
+  search: ExactMatchSearchOptions = {}
+): OrderedMatchScore {
+  const { tailBytes = DEFAULT_LOG_TAIL_BYTES, profile } = search
+  if (messages.length === 0) {
+    return { matchedCount: 0, matchedLength: 0, source: 'rg' }
+  }
+
+  if (tailBytes > 0) {
+    const tailStart = performance.now()
+    const tail = readLogTail(logPath, tailBytes)
+    if (profile) {
+      profile.tailReads += 1
+      profile.tailReadMs += performance.now() - tailStart
+    }
+    if (tail) {
+      const start = performance.now()
+      const tailScore = scoreOrderedMessageMatchesInText(tail, messages)
+      if (profile) {
+        profile.tailScoreRuns += 1
+        profile.tailScoreMs += performance.now() - start
+      }
+      const minTailMatches = Math.min(messages.length, MIN_TAIL_MATCH_COUNT)
+      if (tailScore.matchedCount >= minTailMatches) {
+        return { ...tailScore, source: 'tail' }
+      }
+    }
+  }
+
+  const rgStart = performance.now()
+  const fullScore = scoreOrderedMessageMatchesWithRg(logPath, messages, search)
+  if (profile) {
+    profile.rgScoreRuns += 1
+    profile.rgScoreMs += performance.now() - rgStart
+  }
+  return { ...fullScore, source: 'rg' }
+}
+
+async function scoreOrderedMessageMatchesAsync(
+  logPath: string,
+  messages: string[],
+  search: ExactMatchSearchOptions = {}
+): Promise<OrderedMatchScore> {
+  const { tailBytes = DEFAULT_LOG_TAIL_BYTES, profile } = search
+  if (messages.length === 0) {
+    return { matchedCount: 0, matchedLength: 0, source: 'rg' }
+  }
+
+  if (tailBytes > 0) {
+    const tailStart = performance.now()
+    const tail = readLogTail(logPath, tailBytes)
+    if (profile) {
+      profile.tailReads += 1
+      profile.tailReadMs += performance.now() - tailStart
+    }
+    if (tail) {
+      const start = performance.now()
+      const tailScore = scoreOrderedMessageMatchesInText(tail, messages)
+      if (profile) {
+        profile.tailScoreRuns += 1
+        profile.tailScoreMs += performance.now() - start
+      }
+      const minTailMatches = Math.min(messages.length, MIN_TAIL_MATCH_COUNT)
+      if (tailScore.matchedCount >= minTailMatches) {
+        return { ...tailScore, source: 'tail' }
+      }
+    }
+  }
+
+  const rgStart = performance.now()
+  const fullScore = await scoreOrderedMessageMatchesWithRgAsync(
+    logPath,
+    messages,
+    search
+  )
+  if (profile) {
+    profile.rgScoreRuns += 1
+    profile.rgScoreMs += performance.now() - rgStart
+  }
+  return { ...fullScore, source: 'rg' }
+}
+
+function compareOrderedScores(a: OrderedMatchScore, b: OrderedMatchScore): number {
+  if (a.matchedCount !== b.matchedCount) {
+    return b.matchedCount - a.matchedCount
+  }
+  return b.matchedLength - a.matchedLength
+}
+
+const TMUX_PROMPT_DETECT_PREFIX = /^[\s>*#$]+/
+
+function stripPromptPrefixForDetection(line: string): string {
+  return stripAnsi(line).trim().replace(TMUX_PROMPT_DETECT_PREFIX, '')
+}
+
+function isClaudePromptLine(line: string): boolean {
+  const cleaned = stripPromptPrefixForDetection(line)
+  if (!cleaned) return false
+  return cleaned.startsWith('❯')
+}
+
+function isCodexPromptLine(line: string): boolean {
+  const cleaned = stripPromptPrefixForDetection(line)
+  if (!cleaned) return false
+  return cleaned.startsWith('›')
+}
+
+function isPromptLine(line: string): boolean {
+  return isClaudePromptLine(line) || isCodexPromptLine(line)
+}
+
+// Pi TUI uses a specific background color (RGB 52,53,65) for user messages.
+// This color is defined in Pi's built-in "tokyo-night" theme (userMessageBg).
+// See: https://github.com/anthropics/pi/blob/main/src/themes/tokyo-night.ts
+// NOTE: If Pi changes this color or the user selects a different theme, detection will fail.
+// NOTE: Oh-my-pi is deliberately not covered here — its default "titanium" theme
+// shares userMessageBg (#0f1216) with tool pending/success rows and the status
+// line, so background-color extraction can't distinguish real user messages.
+// Pattern: \x1b[48;2;52;53;65m...message...\x1b[49m (or end of content)
+// eslint-disable-next-line no-control-regex
+const PI_USER_MESSAGE_BG_START = /\x1b\[48;2;52;53;65m/g
+// eslint-disable-next-line no-control-regex
+const PI_USER_MESSAGE_BG_END = /\x1b\[49m/
+
+/**
+ * Extract user messages from Pi's TUI by detecting the background color pattern.
+ * Pi uses RGB(52,53,65) background for user messages in the default tokyo-night theme.
+ * Returns empty array if no Pi-style messages are detected (e.g., different theme).
+ */
+export function extractPiUserMessagesFromAnsi(
+  ansiContent: string,
+  maxMessages = MAX_RECENT_USER_MESSAGES
+): string[] {
+  const messages: string[] = []
+  const matches = [...ansiContent.matchAll(PI_USER_MESSAGE_BG_START)]
+
+  // Process from end (most recent) to beginning
+  for (let i = matches.length - 1; i >= 0 && messages.length < maxMessages; i--) {
+    const match = matches[i]
+    if (!match || match.index === undefined) continue
+
+    const startIdx = match.index + match[0].length
+    const rest = ansiContent.slice(startIdx)
+    const endMatch = rest.match(PI_USER_MESSAGE_BG_END)
+    const endIdx = endMatch ? endMatch.index! : rest.length
+
+    const rawMessage = rest.slice(0, endIdx)
+    // Strip any remaining ANSI codes and clean up
+    const cleaned = stripAnsi(rawMessage).trim()
+
+    if (cleaned && cleaned.length > 0 && !messages.includes(cleaned)) {
+      messages.push(cleaned)
+    }
+  }
+
+  return messages
+}
+
+function extractUserFromPrompt(line: string): string {
+  let cleaned = stripAnsi(line).trim()
+  cleaned = cleaned.replace(TMUX_PROMPT_PREFIX, '').trim()
+  cleaned = cleaned.replace(/^›\s*/, '').trim()
+  // Grok's TUI renders a right-aligned clock on the submitted prompt line
+  // (e.g. "fix the bug         3:21 PM"). Require 2+ spaces of padding so a
+  // prompt that itself ends in a time ("remind me at 3:30 PM") survives.
+  cleaned = cleaned.replace(/[ \t]{2,}\d{1,2}:\d{2}\s*(?:AM|PM)\s*$/i, '').trim()
+  cleaned = cleaned.replace(/\s*↵\s*send\s*$/i, '').trim()
+  cleaned = cleaned.replace(TMUX_UI_GLYPH_PATTERN, ' ')
+  cleaned = cleaned.replace(/\s+/g, ' ').trim()
+  return cleaned
+}
+
+/**
+ * Detect a box-drawing horizontal separator line (e.g. ─────────).
+ * Claude Code draws these as the input field border using U+2500 (─),
+ * sometimes mixed with U+2501 (━) or U+2550 (═). A line of 20+ such
+ * characters is a reliable signal that we're inside the input box.
+ */
+const BOX_SEPARATOR_PATTERN = /^[─━═]{20,}$/
+
+/**
+ * Max distance from the bottom of the scrollback for the box separator
+ * check. The input field is always at the very bottom of the terminal,
+ * so we only trust the separator when the prompt is within this many
+ * lines of the end — avoids false positives from ─── in pasted content
+ * or markdown tables higher up in the scrollback.
+ */
+const BOX_SEPARATOR_BOTTOM_MARGIN = 8
+
+function isCurrentInputField(rawLines: string[], promptIdx: number): boolean {
+  const nearBottom = rawLines.length - promptIdx <= BOX_SEPARATOR_BOTTOM_MARGIN
+  for (let i = promptIdx + 1; i < Math.min(promptIdx + 4, rawLines.length); i++) {
+    const line = rawLines[i]?.trim() ?? ''
+    // Assistant output (⏺) below the prompt means it was submitted, not idle
+    if (/⏺/.test(line)) break
+    if (/\d+%\s*(?:context\s*)?left/i.test(line)) return true
+    if (/\[\d+%\]/.test(line)) return true
+    if (/\?\s*for\s*shortcuts/i.test(line)) return true
+    // Codex configurable status line: items joined by " · " (middle dot).
+    // Default items: model-with-reasoning, context-remaining, current-dir.
+    // context-remaining is caught by the "N% left" check above, but any
+    // other combination may omit it. Two patterns cover the remaining cases:
+    // 1. Any line with both ~/path and · (CurrentDir/ProjectRoot + anything)
+    if (/~\//.test(line) && /·/.test(line)) return true
+    // 2. Line starting with a known model prefix + · (ModelName + anything)
+    if (/^(?:gpt|o[1-4]|codex|claude)\S*\s.*·/.test(line)) return true
+    // Claude Code input box border — only trust near the bottom of scrollback
+    if (nearBottom && BOX_SEPARATOR_PATTERN.test(line)) return true
+  }
+  return false
+}
+
+/**
+ * Detect AskUserQuestion interactive selection lines.
+ * Claude Code's AskUserQuestion UI uses ❯ to mark the selected option,
+ * which collides with the ❯ prompt symbol for user messages.
+ *
+ * Detection requires TWO independent signals:
+ * 1. The text after ❯ starts with "N. " (numbered option pattern)
+ * 2. At least one corroborating indicator nearby:
+ *    a. "Enter to select" navigation hint below, with no structural
+ *       boundaries (⏺ assistant markers, other ❯ prompts) between
+ *    b. Sibling numbered options within a bounded block AND no ⏺
+ *       assistant output follows the block (distinguishes active
+ *       AskUserQuestion from submitted multi-line user messages)
+ */
+function isAskUserQuestionOption(rawLines: string[], promptIdx: number): boolean {
+  const line = rawLines[promptIdx] ?? ''
+  // Strip the prompt prefix (❯/›) and check if what remains is a numbered item
+  const afterPrompt = stripAnsi(line)
+    .replace(TMUX_PROMPT_PREFIX, '')
+    .replace(/^›\s*/, '')
+    .trim()
+
+  // Signal 1: the text after ❯/› starts with "N. ..."
+  if (!/^\d+\.\s/.test(afterPrompt)) {
+    return false
+  }
+
+  // Signal 2a: "Enter to select" navigation hint below, stopping at structural
+  // boundaries (assistant output ⏺, another prompt ❯/›) to avoid false positives
+  // from assistant text that happens to contain the phrase.
+  for (let i = promptIdx + 1; i < Math.min(promptIdx + 20, rawLines.length); i++) {
+    const below = rawLines[i] ?? ''
+    const trimmed = below.trim()
+    // Stop at structural boundaries — we've left the selector block
+    if (/⏺/.test(below) || isPromptLine(below)) break
+    // Claude: "Enter to select", Codex: "enter to submit answer"
+    if (/enter\s+to\s+(select|submit\s+answer)/i.test(trimmed)) return true
+  }
+
+  // Signal 2b: sibling numbered options within a bounded block.
+  // Scan both above and below, stopping at structural boundaries
+  // (⏺ markers, ❯/› prompts).
+  const hasSibling = (start: number, step: number, maxSteps: number): boolean => {
+    for (let n = 1; n <= maxSteps; n++) {
+      const idx = start + step * n
+      if (idx < 0 || idx >= rawLines.length) break
+      const raw = rawLines[idx] ?? ''
+      // Stop at structural boundaries
+      if (/⏺/.test(raw) || isPromptLine(raw)) break
+      const sibling = stripAnsi(raw).trim()
+      if (/^\d+\.\s/.test(sibling)) return true
+    }
+    return false
+  }
+
+  if (hasSibling(promptIdx, 1, 4) || hasSibling(promptIdx, -1, 4)) {
+    // Distinguish active AskUserQuestion from submitted multi-line user messages:
+    // a submitted message always has ⏺ assistant output after it, while an active
+    // AskUserQuestion card does not (it's waiting for user selection).
+    // Scan forward past the block to check.
+    for (let i = promptIdx + 1; i < Math.min(promptIdx + 10, rawLines.length); i++) {
+      const raw = rawLines[i] ?? ''
+      if (/⏺/.test(raw)) return false // assistant responded → submitted user message
+      if (isPromptLine(raw)) break // another prompt → stop
+    }
+    return true
+  }
+
+  return false
+}
+
+export function extractRecentUserMessagesFromTmux(
+  content: string,
+  maxMessages = MAX_RECENT_USER_MESSAGES,
+  agentType?: AgentType
+): string[] {
+  const rawLines = stripAnsi(content).split('\n')
+  while (rawLines.length > 0 && rawLines[rawLines.length - 1]?.trim() === '') {
+    rawLines.pop()
+  }
+
+  const messages: string[] = []
+  for (let i = rawLines.length - 1; i >= 0 && messages.length < maxMessages; i--) {
+    const line = rawLines[i] ?? ''
+    // Antigravity prints a submitted prompt below a divider. Its editor also
+    // has a bottom divider, and menu selections have no preceding divider.
+    const agyPrompt = agentType === 'antigravity' && /^>\s+\S/.test(line.trim()) &&
+      BOX_SEPARATOR_PATTERN.test(rawLines[i - 1]?.trim() ?? '')
+    if (agyPrompt) {
+      if (BOX_SEPARATOR_PATTERN.test(rawLines[i + 1]?.trim() ?? '')) continue
+    } else if (!isPromptLine(line) || isCurrentInputField(rawLines, i)) {
+      continue
+    }
+    if (isAskUserQuestionOption(rawLines, i)) continue
+    if (line.includes('↵')) continue
+    const message = extractUserFromPrompt(line)
+    if (!message) continue
+    if (!messages.includes(message)) {
+      messages.push(message)
+    }
+  }
+
+  return messages
+}
+
+export interface AskUserQuestionAnswer {
+  question: string
+  answer: string
+}
+
+// Require the ⎿ detail prefix — a bare `· x → y` line could be stray content,
+// and a false pair would mark a genuinely-booting window as having content.
+const ASK_ANSWER_LINE = /^\s*⎿\s*·\s+(.+?)\s*→\s*(.+?)\s*$/
+
+/**
+ * Submitted AskUserQuestion cards render recap lines like
+ *   ⎿  · <question> → <answer>
+ * These never produce a ❯ prompt line, so a session parked on (or full of)
+ * question cards is invisible to prompt-based matching. Extract the pairs so
+ * they can be matched against the tool_result envelopes the answers land in.
+ */
+export function extractAskUserQuestionAnswers(
+  content: string,
+  maxAnswers = MAX_RECENT_USER_MESSAGES
+): AskUserQuestionAnswer[] {
+  const rawLines = stripAnsi(content).split('\n')
+  const answers: AskUserQuestionAnswer[] = []
+  const seen = new Set<string>()
+  for (let i = rawLines.length - 1; i >= 0 && answers.length < maxAnswers; i--) {
+    const match = rawLines[i]?.match(ASK_ANSWER_LINE)
+    if (!match) continue
+    const question = (match[1] ?? '').replace(/\s+/g, ' ').trim()
+    const answer = (match[2] ?? '').replace(/\s+/g, ' ').trim()
+    if (!question || !answer) continue
+    const key = `${question}→${answer}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    answers.push({ question, answer })
+  }
+  return answers
+}
+
+function stripTraceStatusSuffix(line: string): string {
+  const match = line.match(TRACE_STATUS_TRAILER)
+  if (!match) return line
+  const inner = match[1] ?? ''
+  if (!TRACE_STATUS_HINTS.some((pattern) => pattern.test(inner))) {
+    return line
+  }
+  return line.slice(0, match.index).trim()
+}
+
+export function extractRecentTraceLinesFromTmux(
+  content: string,
+  maxLines = MAX_RECENT_TRACE_LINES
+): string[] {
+  const rawLines = stripAnsi(content).split('\n')
+  while (rawLines.length > 0 && rawLines[rawLines.length - 1]?.trim() === '') {
+    rawLines.pop()
+  }
+
+  const traces: string[] = []
+  for (let i = rawLines.length - 1; i >= 0 && traces.length < maxLines; i--) {
+    const raw = rawLines[i] ?? ''
+    const trimmed = raw.trim()
+    const isBullet = trimmed.startsWith('•')
+    const isBoxRow = trimmed.startsWith('│')
+    const isCheckRow = trimmed.startsWith('✔')
+    if (!isBullet && !isBoxRow && !isCheckRow) continue
+    let cleaned = cleanTmuxLine(raw)
+    if (!cleaned) continue
+    if (isBoxRow) {
+      // Oh-my-pi renders tool calls as box rows: `│ $ <cmd>` / `│ <output>`.
+      // Strip the borders and the shell '$' prompt so the interior text can be
+      // exact-matched against tool call args/results in the session JSONL.
+      cleaned = cleaned
+        .replace(/^│/, '')
+        .replace(/│$/, '')
+        .replace(/^\s*\$\s+/, '')
+        .trim()
+      // Multi-column rows (startup card etc.) still contain a border char —
+      // they never produce searchable text.
+      if (!cleaned || cleaned.includes('│')) continue
+    } else if (isCheckRow) {
+      // Oh-my-pi flat tool rows: `✔ <Tool> <arg>`. The arg is the searchable
+      // needle (tool call args appear verbatim in the JSONL); the tool name
+      // alone is too generic to match on.
+      const body = cleaned.replace(/^✔\s*/, '')
+      const spaceIdx = body.indexOf(' ')
+      cleaned = spaceIdx > 0 ? body.slice(spaceIdx + 1).trim() : ''
+      if (!cleaned) continue
+    }
+    cleaned = stripTraceStatusSuffix(cleaned)
+    if (!cleaned) continue
+    if (TRACE_EXCLUDE_PREFIXES.some((prefix) => prefix.test(cleaned))) continue
+    if (isMetadataLine(cleaned, TMUX_METADATA_STATUS_PATTERNS)) continue
+    if (cleaned.length < MIN_EXACT_MATCH_LENGTH) continue
+    if (!traces.includes(cleaned)) {
+      traces.push(cleaned)
+    }
+  }
+
+  return traces
+}
+
+function resolveLogReadOptions(
+  overrides: Partial<LogReadOptions> = {}
+): LogReadOptions {
+  return {
+    lineLimit: overrides.lineLimit ?? DEFAULT_LOG_READ_OPTIONS.lineLimit,
+    byteLimit: overrides.byteLimit ?? DEFAULT_LOG_READ_OPTIONS.byteLimit,
+  }
+}
+
+export function getTerminalScrollback(
+  tmuxWindow: string,
+  lines = DEFAULT_SCROLLBACK_LINES
+): string {
+  return captureTerminalScrollback(tmuxWindow, lines).content
+}
+
+/** Capture terminal scrollback with success/failure indicator. */
+export function captureTerminalScrollback(
+  tmuxWindow: string,
+  lines = DEFAULT_SCROLLBACK_LINES
+): { ok: boolean; content: string } {
+  const safeLines = Math.max(1, lines)
+  const result = runCommandSync(
+    ['tmux', ...withTmuxUtf8Flag([
+      'capture-pane',
+      '-t',
+      tmuxWindow,
+      '-p',
+      '-J',
+      '-S',
+      `-${safeLines}`,
+    ])],
+    { timeoutMs: TMUX_CAPTURE_TIMEOUT_MS }
+  )
+  if (result.exitCode !== 0) {
+    return { ok: false, content: '' }
+  }
+  return { ok: true, content: result.stdout }
+}
+
+export async function getTerminalScrollbackAsync(
+  tmuxWindow: string,
+  lines = DEFAULT_SCROLLBACK_LINES
+): Promise<string> {
+  return (await captureTerminalScrollbackAsync(tmuxWindow, lines)).content
+}
+
+/** Async capture terminal scrollback with success/failure indicator. */
+export async function captureTerminalScrollbackAsync(
+  tmuxWindow: string,
+  lines = DEFAULT_SCROLLBACK_LINES
+): Promise<{ ok: boolean; content: string }> {
+  const safeLines = Math.max(1, lines)
+  const result = await runCommandAsync(
+    ['tmux', ...withTmuxUtf8Flag([
+      'capture-pane',
+      '-t',
+      tmuxWindow,
+      '-p',
+      '-J',
+      '-S',
+      `-${safeLines}`,
+    ])],
+    { timeoutMs: TMUX_CAPTURE_TIMEOUT_MS }
+  )
+  if (result.exitCode !== 0) {
+    return { ok: false, content: '' }
+  }
+  return { ok: true, content: result.stdout }
+}
+
+/**
+ * Get terminal scrollback with ANSI escape codes preserved.
+ * Used for detecting pi's TUI which uses background colors for user messages.
+ */
+export function getTerminalScrollbackWithAnsi(
+  tmuxWindow: string,
+  lines = DEFAULT_SCROLLBACK_LINES
+): string {
+  const safeLines = Math.max(1, lines)
+  const result = runCommandSync(
+    ['tmux', ...withTmuxUtf8Flag([
+      'capture-pane',
+      '-t',
+      tmuxWindow,
+      '-p',
+      '-J',
+      '-e',
+      '-S',
+      `-${safeLines}`,
+    ])],
+    { timeoutMs: TMUX_CAPTURE_TIMEOUT_MS }
+  )
+  if (result.exitCode !== 0) {
+    return ''
+  }
+  return result.stdout
+}
+
+export async function getTerminalScrollbackWithAnsiAsync(
+  tmuxWindow: string,
+  lines = DEFAULT_SCROLLBACK_LINES
+): Promise<string> {
+  const safeLines = Math.max(1, lines)
+  const result = await runCommandAsync(
+    ['tmux', ...withTmuxUtf8Flag([
+      'capture-pane',
+      '-t',
+      tmuxWindow,
+      '-p',
+      '-J',
+      '-e',
+      '-S',
+      `-${safeLines}`,
+    ])],
+    { timeoutMs: TMUX_CAPTURE_TIMEOUT_MS }
+  )
+  if (result.exitCode !== 0) {
+    return ''
+  }
+  return result.stdout
+}
+
+export function readLogContent(
+  logPath: string,
+  { lineLimit, byteLimit }: LogReadOptions = DEFAULT_LOG_READ_OPTIONS
+): string {
+  try {
+    const buffer = fs.readFileSync(logPath)
+    return applyReadLimits(buffer.toString('utf8'), { lineLimit, byteLimit })
+  } catch {
+    return ''
+  }
+}
+
+// Reads only the last byteLimit bytes of a file. The JSONL tail can start
+// mid-line; the partial first line is skipped by the parser either way.
+function readFileTail(
+  logPath: string,
+  byteLimit: number,
+  fileSize: number
+): string {
+  let fd: number | null = null
+  try {
+    fd = fs.openSync(logPath, 'r')
+    const start = Math.max(0, fileSize - byteLimit)
+    const length = fileSize - start
+    if (length <= 0) return ''
+    const buffer = Buffer.alloc(length)
+    const bytesRead = fs.readSync(fd, buffer, 0, length, start)
+    return buffer.subarray(0, bytesRead).toString('utf8')
+  } catch {
+    return ''
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd)
+      } catch {
+        // best effort
+      }
+    }
+  }
+}
+
+export function extractLogText(
+  logPath: string,
+  { mode = DEFAULT_LOG_TEXT_MODE, logRead }: LogTextOptionsInput = {}
+): string {
+  const resolvedRead = resolveLogReadOptions(logRead)
+  const raw = readLogContent(logPath, resolvedRead)
+  return extractTextFromRaw(raw, mode)
+}
+
+function extractTextFromRaw(raw: string, mode: LogTextMode): string {
+  if (!raw || mode === 'all') {
+    return raw
+  }
+
+  const chunks: string[] = []
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) {
+      continue
+    }
+    let entry: unknown
+    try {
+      entry = JSON.parse(trimmed)
+    } catch {
+      continue
+    }
+    const extracted = extractTextFromEntry(entry, mode)
+    if (extracted.length > 0) {
+      chunks.push(...extracted)
+    }
+  }
+
+  return chunks.join('\n')
+}
+
+// Logs that yielded zero tokens, keyed by path -> byte length at that time.
+// Enrichment recounts every unknown log each poll, so without this a
+// message-free log would be fully re-parsed on every cycle.
+const zeroTokenLogCache = new Map<string, number>()
+
+export function getLogTokenCount(
+  logPath: string,
+  { mode = DEFAULT_LOG_TEXT_MODE, logRead }: LogTextOptionsInput = {}
+): number {
+  const resolvedRead = resolveLogReadOptions(logRead)
+  let fileSize: number | null = null
+  try {
+    fileSize = fs.statSync(logPath).size
+  } catch {
+    return 0
+  }
+  if (zeroTokenLogCache.get(logPath) === fileSize) {
+    return 0
+  }
+
+  // Read only the tail when the file exceeds the tail window — the limits
+  // slice to the tail anyway, so a full read is wasted IO on multi-MB logs
+  // (this runs once per dormant session at startup rematch).
+  const tailOnly = resolvedRead.byteLimit > 0 && fileSize > resolvedRead.byteLimit
+  let raw = tailOnly
+    ? readFileTail(logPath, resolvedRead.byteLimit, fileSize)
+    : readLogContent(logPath, { lineLimit: 0, byteLimit: 0 })
+  const tail = applyReadLimits(raw, resolvedRead)
+  const count = countTokens(extractTextFromRaw(tail, mode))
+  if (count > 0 || mode === 'all') return count
+  // The byte-limited tail can start mid-way through a single huge line
+  // (e.g. a 150KB pasted message), leaving only unparseable fragments and
+  // tool/echo events in the window. Callers only gate on "any message text
+  // at all", so confirm with a head-first scan before reporting empty.
+  if (tailOnly) {
+    raw = readLogContent(logPath, { lineLimit: 0, byteLimit: 0 })
+  }
+  const fromHead = findFirstMessageTokenCount(raw, mode)
+  if (fromHead === 0) {
+    zeroTokenLogCache.set(logPath, fileSize)
+  }
+  return fromHead
+}
+
+function applyReadLimits(
+  content: string,
+  { lineLimit, byteLimit }: LogReadOptions
+): string {
+  let result = content
+  if (byteLimit > 0 && result.length > byteLimit) {
+    result = result.slice(-byteLimit)
+  }
+  if (lineLimit > 0) {
+    const lines = result.split('\n')
+    if (lines.length > lineLimit) {
+      result = lines.slice(-lineLimit).join('\n')
+    }
+  }
+  return result
+}
+
+function findFirstMessageTokenCount(raw: string, mode: LogTextMode): number {
+  if (!raw) return 0
+  let start = 0
+  while (start < raw.length) {
+    const end = raw.indexOf('\n', start)
+    const line = (end === -1 ? raw.slice(start) : raw.slice(start, end)).trim()
+    start = end === -1 ? raw.length : end + 1
+    if (!line) continue
+    let entry: unknown
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      continue
+    }
+    const tokens = countTokens(extractTextFromEntry(entry, mode).join('\n'))
+    if (tokens > 0) return tokens
+  }
+  return 0
+}
+function countTokens(text: string): number {
+  const normalized = normalizeText(text)
+  if (!normalized) return 0
+  return normalized.split(/\s+/).filter(Boolean).length
+}
+
+function extractTextFromEntry(entry: unknown, mode: LogTextMode): string[] {
+  const roleText = extractRoleTextFromEntry(entry)
+  return roleText
+    .filter(({ role }) => shouldIncludeRole(role, mode))
+    .map(({ text }) => text)
+    .filter((chunk) => chunk.trim().length > 0)
+}
+
+function shouldIncludeRole(role: string, mode: LogTextMode): boolean {
+  if (mode === 'all') {
+    return true
+  }
+  if (!role) {
+    return false
+  }
+  if (mode === 'assistant-user') {
+    return role === 'assistant' || role === 'user'
+  }
+  return role === mode
+}
+
+/**
+ * Process user message text - filters tool notifications and extracts actions from user_action blocks.
+ * Returns the processed text or null if it should be skipped.
+ */
+function processUserMessageText(text: string): string | null {
+  // Strip ANSI first so marker checks see clean text — guards against future
+  // log entries that wrap markers in ANSI (e.g., `\x1b[2m<task-notification>...`).
+  const cleaned = cleanUserImageAttachments(stripAnsi(text)
+    .replace(/<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder\b[^>]*>/gi, ' ')
+    .trim())
+  if (!cleaned) return null
+  // Codex question replies contain genuine user input inside a JSON envelope.
+  // Skip malformed envelopes; the marker filter also catches truncated ones.
+  const reply = cleaned.match(/^<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>$/i)
+  if (reply) {
+    try {
+      const answers: unknown = JSON.parse(reply[1]!)
+      if (Array.isArray(answers)) {
+        const text = answers
+          .flatMap((item: unknown) =>
+            item && typeof item === 'object' && 'answer' in item && typeof item.answer === 'string'
+              ? [item.answer.trim()]
+              : []
+          )
+          .filter(Boolean)
+          .join(' · ')
+        if (text) return text
+      }
+    } catch {
+      // Ignore harness payloads that do not contain readable user answers.
+    }
+    return null
+  }
+  // Slash-command invocations come through as user messages wrapped in
+  // <command-message>/<command-name>/<command-args>. Extract a readable
+  // "/cmd args" form before the generic marker filter would discard them.
+  const invocation = extractCommandInvocation(cleaned)
+  if (invocation) return invocation
+  // Grok wraps real user prompts in <user_query>...</user_query>.
+  const userQuery = cleaned.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/i)?.[1]?.trim()
+  if (userQuery) return userQuery
+  if (isToolNotificationText(cleaned)) return null
+  const action = extractActionFromUserAction(cleaned)
+  if (action) return action
+  return cleaned
+}
+
+function extractRoleTextFromEntry(
+  entry: unknown
+): Array<{ role: string; text: string }> {
+  const normalized = normalizeAgentLogEntry(entry)
+  const chunks: Array<{ role: string; text: string }> = []
+
+  // A single prompt can contain an image label followed by separate text blocks.
+  const userText = normalized
+    .filter(item => item.kind === 'message' && item.role === 'user')
+    .map(item => item.text)
+    .join('\n')
+  const processedUser = !userText.trim() && hasUserImageAttachment(entry)
+    ? 'Image attached'
+    : processUserMessageText(userText)
+  if (processedUser) chunks.push({ role: 'user', text: processedUser })
+
+  for (const item of normalized) {
+    if (item.kind !== 'message') {
+      continue
+    }
+    if (item.role !== 'user' && item.role !== 'assistant' && item.role !== 'system') {
+      continue
+    }
+    if (item.role !== 'user' && item.text.trim()) {
+      chunks.push({ role: item.role, text: item.text })
+    }
+  }
+
+  return chunks
+}
+
+/**
+ * Claude Code mirrors each submitted prompt into a tiny `last-prompt` entry
+ * (~200 chars, pre-truncated) written right after the full user entry. It is
+ * the cheap fallback when the real user entry cannot be recovered — larger
+ * than the line-size cap, or beyond the scan budget. Codex has no equivalent.
+ */
+function extractLastPromptText(entry: unknown): string | null {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+  const record = entry as Record<string, unknown>
+  if (record.type !== 'last-prompt') return null
+  if (typeof record.lastPrompt !== 'string') return null
+  return processUserMessageText(record.lastPrompt)
+}
+
+function extractLastConversationFromLog(
+  logPath: string,
+  logRead: Partial<LogReadOptions> = {}
+): ConversationPair {
+  const resolvedRead = resolveLogReadOptions(logRead)
+  const initialByteLimit = Math.max(0, resolvedRead.byteLimit)
+  if (initialByteLimit <= 0) {
+    return { user: '', assistant: '' }
+  }
+  const maxScanBytes = Math.max(
+    initialByteLimit,
+    typeof logRead.maxByteLimit === 'number' ? logRead.maxByteLimit : initialByteLimit
+  )
+  const lineLimit = resolvedRead.lineLimit
+
+  let lastUser = ''
+  let lastAssistant = ''
+  let lastPromptFallback = ''
+  let linesScanned = 0
+
+  for (const line of iterateLogLinesBackward(logPath, { maxScanBytes })) {
+    if (lineLimit > 0 && ++linesScanned > lineLimit) break
+    let entry: unknown
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (!lastPromptFallback) {
+      lastPromptFallback = extractLastPromptText(entry) ?? ''
+    }
+    const roleText = extractRoleTextFromEntry(entry)
+    for (const { role, text } of roleText) {
+      if (!lastAssistant && role === 'assistant' && text.trim()) {
+        lastAssistant = text.trim()
+      }
+      if (!lastUser && role === 'user' && text.trim()) {
+        lastUser = text.trim()
+      }
+    }
+    if (lastUser && lastAssistant) break
+  }
+
+  if (!lastUser && lastPromptFallback) {
+    lastUser = lastPromptFallback
+  }
+  return { user: lastUser, assistant: lastAssistant }
+}
+
+export function extractLastUserMessageFromLog(
+  logPath: string,
+  logRead: Partial<LogReadOptions> = {}
+): string | null {
+  const { user } = extractLastConversationFromLog(logPath, logRead)
+  return user && user.trim() ? user.trim() : null
+}
+
+/** Read the latest user-facing reply, independent of prompts, tools and log metadata. */
+export function extractLastResponseTimestamp(logPath: string, harness: string | null): string | undefined {
+  if (harness !== 'codex' && harness !== 'claude' && harness !== 'claude-rp') return
+  for (const line of iterateLogLinesBackward(logPath, { maxScanBytes: 2 * 1024 * 1024 })) {
+    try {
+      const entry = JSON.parse(line)
+      if (entry?.isSidechain || (harness === 'codex' && (entry?.type !== 'response_item' || entry?.payload?.phase === 'commentary')) ||
+          typeof entry?.timestamp !== 'string' || !Number.isFinite(Date.parse(entry.timestamp))) continue
+      if (normalizeAgentLogEntry(entry).some(event =>
+        event.kind === 'message' && event.role === 'assistant' && event.text.trim())) return entry.timestamp
+    } catch {
+      // Incomplete and malformed entries provide no response timestamp.
+    }
+  }
+}
+
+/**
+ * Extract the timestamp from the last entry in a log file.
+ * Returns an ISO timestamp string, or null if not found.
+ */
+export function extractLastEntryTimestamp(
+  logPath: string,
+  tailBytes = 32 * 1024
+): string | null {
+  const raw = readLogTail(logPath, tailBytes)
+  if (!raw) return null
+
+  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean)
+  // Iterate from the end to find the last entry with a timestamp
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i])
+      const ts = [entry?.timestamp, entry?.ts, entry?.created_at].find(value => typeof value === 'string')
+      if (typeof ts === 'string' && !Number.isNaN(Date.parse(ts))) {
+        return ts
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+  return null
+}
+
+// AskUserQuestion answers land in the log as tool_result content with one of
+// two envelopes:
+//   The user answered: "Q"="A". Read the answers carefully — …
+//   Your questions have been answered: "Q"="A". You can now continue …
+// Only count a hit when the pair sits inside one of these envelopes — arbitrary
+// tool_result content stays excluded for the same reason userOnly matching
+// excludes it (terminal-capture tools echo screen text).
+const ASK_ANSWER_ENVELOPE =
+  /The user answered:|Your questions have been answered:/
+
+/**
+ * The `"Q"="A` fragment as it appears inside the envelope. Deliberately omits
+ * the closing quote — Claude may pad the answer with a trailing space before
+ * the quote (e.g. custom "Type something" answers).
+ */
+function askAnswerNeedle(question: string, answer: string): string {
+  return `"${question}"="${answer}`
+}
+
+function toolResultTexts(entry: unknown): string[] {
+  if (!entry || typeof entry !== 'object') return []
+  const record = entry as Record<string, unknown>
+  const message = record.message as Record<string, unknown> | undefined
+  const content = message?.content
+  if (!Array.isArray(content)) return []
+  const texts: string[] = []
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue
+    const itemRecord = item as Record<string, unknown>
+    if (itemRecord.type !== 'tool_result') continue
+    const itemContent = itemRecord.content
+    if (typeof itemContent === 'string') {
+      texts.push(itemContent)
+    } else if (Array.isArray(itemContent)) {
+      for (const chunk of itemContent) {
+        const text = (chunk as Record<string, unknown>)?.text
+        if (typeof text === 'string') texts.push(text)
+      }
+    }
+  }
+  return texts
+}
+
+/**
+ * A matched line only counts when it parses as an entry whose tool_result
+ * content carries the envelope and the exact pair — guards against the
+ * envelope text being quoted elsewhere (assistant narration, pasted content).
+ */
+function isAskAnswerLine(line: string, needle: string): boolean {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(line)
+  } catch {
+    return false
+  }
+  return toolResultTexts(parsed).some(
+    (text) =>
+      ASK_ANSWER_ENVELOPE.test(text) &&
+      text.replace(/\s+/g, ' ').includes(needle)
+  )
+}
+
+function rgArgs(pattern: string, search: ExactMatchSearchOptions): string[] {
+  const args = ['rg', '-e', pattern]
+  if (search.rgThreads && search.rgThreads > 0) {
+    args.push('--threads', String(search.rgThreads))
+  }
+  return args
+}
+
+function rgListFiles(
+  pattern: string,
+  targets: string[],
+  search: ExactMatchSearchOptions
+): string[] {
+  const args = rgArgs(pattern, search)
+  args.splice(1, 0, '-l')
+  args.push(...targets)
+  const result = runCommandSync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (result.exitCode !== 0) return []
+  return result.stdout.trim().split('\n').filter(Boolean)
+}
+
+async function rgListFilesAsync(
+  pattern: string,
+  targets: string[],
+  search: ExactMatchSearchOptions
+): Promise<string[]> {
+  const args = rgArgs(pattern, search)
+  args.splice(1, 0, '-l')
+  args.push(...targets)
+  const result = await runCommandAsync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (result.exitCode !== 0) return []
+  return result.stdout.trim().split('\n').filter(Boolean)
+}
+
+/**
+ * A -l hit only proves the pattern text exists on some line. Re-run rg in
+ * content mode on that one file and confirm a matched line is a real
+ * tool_result envelope carrying this pair.
+ */
+function askAnswerHitIsValid(
+  logPath: string,
+  pattern: string,
+  needle: string,
+  search: ExactMatchSearchOptions
+): boolean {
+  const args = rgArgs(pattern, search)
+  args.splice(1, 0, '-n')
+  args.push(logPath)
+  const result = runCommandSync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (result.exitCode !== 0) return false
+  for (const line of result.stdout.split('\n')) {
+    const content = line.slice(line.indexOf(':') + 1)
+    if (isAskAnswerLine(content, needle)) return true
+  }
+  return false
+}
+
+async function askAnswerHitIsValidAsync(
+  logPath: string,
+  pattern: string,
+  needle: string,
+  search: ExactMatchSearchOptions
+): Promise<boolean> {
+  const args = rgArgs(pattern, search)
+  args.splice(1, 0, '-n')
+  args.push(logPath)
+  const result = await runCommandAsync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (result.exitCode !== 0) return false
+  for (const line of result.stdout.split('\n')) {
+    const content = line.slice(line.indexOf(':') + 1)
+    if (isAskAnswerLine(content, needle)) return true
+  }
+  return false
+}
+
+/**
+ * rg prefilter for the envelope + `"Q"="A` needle on the same JSONL line, then
+ * confirm each hit's matched lines parse as a real tool_result envelope.
+ */
+function findLogsWithAskAnswerPair(
+  question: string,
+  answer: string,
+  logDirs: string | string[],
+  search: ExactMatchSearchOptions = {}
+): string[] {
+  const needle = askAnswerNeedle(question, answer)
+  if (needle.length < MIN_EXACT_MATCH_LENGTH) return []
+  const pattern =
+    '(?:The user answered|Your questions have been answered):\\s*' +
+    messageToFlexiblePattern(needle)
+  const logPaths = (search.logPaths ?? []).filter(Boolean)
+  const hits =
+    logPaths.length > 0
+      ? rgListFiles(pattern, Array.from(new Set(logPaths)), search)
+      : (Array.isArray(logDirs) ? logDirs : [logDirs]).flatMap((dir) =>
+          rgListFiles(pattern, logDirectoryArgs(dir), search)
+        )
+  return hits.filter(
+    (logPath) =>
+      !isAuxiliaryLogFile(logPath) &&
+      askAnswerHitIsValid(logPath, pattern, needle, search)
+  )
+}
+
+async function findLogsWithAskAnswerPairAsync(
+  question: string,
+  answer: string,
+  logDirs: string | string[],
+  search: ExactMatchSearchOptions = {}
+): Promise<string[]> {
+  const needle = askAnswerNeedle(question, answer)
+  if (needle.length < MIN_EXACT_MATCH_LENGTH) return []
+  const pattern =
+    '(?:The user answered|Your questions have been answered):\\s*' +
+    messageToFlexiblePattern(needle)
+  const logPaths = (search.logPaths ?? []).filter(Boolean)
+  const hits =
+    logPaths.length > 0
+      ? await rgListFilesAsync(pattern, Array.from(new Set(logPaths)), search)
+      : (
+          await Promise.all(
+            (Array.isArray(logDirs) ? logDirs : [logDirs]).map((dir) =>
+              rgListFilesAsync(pattern, logDirectoryArgs(dir), search)
+            )
+          )
+        ).flat()
+  const valid = await Promise.all(
+    hits.map(async (logPath) =>
+      !isAuxiliaryLogFile(logPath) &&
+      (await askAnswerHitIsValidAsync(logPath, pattern, needle, search))
+        ? logPath
+        : null
+    )
+  )
+  return valid.filter((logPath): logPath is string => logPath !== null)
+}
+
+function filterAskAnswerCandidates(
+  candidates: string[],
+  context: ExactMatchContext,
+  search: ExactMatchSearchOptions
+): string[] {
+  let filtered = filterCandidatesByAgentType(candidates, context.agentType)
+  if (filtered.length === 0) return []
+
+  if (context.projectPath) {
+    const target = normalizePath(context.projectPath)
+    const narrowed = filtered.filter((candidate) => {
+      const projectPath = extractProjectPath(candidate)
+      if (!projectPath) return false
+      return isSameOrChildPath(normalizePath(projectPath), target)
+    })
+    if (narrowed.length > 0) filtered = narrowed
+  }
+
+  if (search.excludeLogPaths && search.excludeLogPaths.length > 0) {
+    const excludeSet = new Set(search.excludeLogPaths)
+    const narrowed = filtered.filter(
+      (candidate) => !excludeSet.has(candidate)
+    )
+    if (narrowed.length > 0) filtered = narrowed
+  }
+  return filtered
+}
+
+/**
+ * Every envelope line in the candidate log, normalized. One rg pass streams
+ * the whole file — the pair on screen may sit far back in a large log, so a
+ * tail read would undercount.
+ */
+function askAnswerEnvelopeTexts(
+  logPath: string,
+  search: ExactMatchSearchOptions
+): string[] {
+  const args = rgArgs(ASK_ANSWER_ENVELOPE.source, search)
+  args.splice(1, 0, '-n')
+  args.push(logPath)
+  const result = runCommandSync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (result.exitCode !== 0) return []
+  const texts: string[] = []
+  for (const line of result.stdout.split('\n')) {
+    const content = line.slice(line.indexOf(':') + 1)
+    if (!content.startsWith('{')) continue
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(content)
+    } catch {
+      continue
+    }
+    for (const text of toolResultTexts(parsed)) {
+      if (ASK_ANSWER_ENVELOPE.test(text)) {
+        texts.push(text.replace(/\s+/g, ' '))
+      }
+    }
+  }
+  return texts
+}
+
+async function askAnswerEnvelopeTextsAsync(
+  logPath: string,
+  search: ExactMatchSearchOptions
+): Promise<string[]> {
+  const args = rgArgs(ASK_ANSWER_ENVELOPE.source, search)
+  args.splice(1, 0, '-n')
+  args.push(logPath)
+  const result = await runCommandAsync(args, { timeoutMs: RG_COMMAND_TIMEOUT_MS })
+  if (result.exitCode !== 0) return []
+  const texts: string[] = []
+  for (const line of result.stdout.split('\n')) {
+    const content = line.slice(line.indexOf(':') + 1)
+    if (!content.startsWith('{')) continue
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(content)
+    } catch {
+      continue
+    }
+    for (const text of toolResultTexts(parsed)) {
+      if (ASK_ANSWER_ENVELOPE.test(text)) {
+        texts.push(text.replace(/\s+/g, ' '))
+      }
+    }
+  }
+  return texts
+}
+
+function scoreAskAnswerTexts(
+  answers: AskUserQuestionAnswer[],
+  texts: string[]
+): OrderedMatchScore {
+  let matchedCount = 0
+  let matchedLength = 0
+  for (const { question, answer } of answers) {
+    const needle = askAnswerNeedle(question, answer)
+    if (texts.some((text) => text.includes(needle))) {
+      matchedCount += 1
+      matchedLength += needle.length
+    }
+  }
+  return { matchedCount, matchedLength }
+}
+
+function askAnswerResult(
+  answers: AskUserQuestionAnswer[],
+  scored: { logPath: string; score: OrderedMatchScore }[]
+): ExactMatchResult | null {
+  const best = scored[0]
+  const second = scored[1]
+  if (!best || best.score.matchedCount === 0) return null
+  if (second && compareOrderedScores(best.score, second.score) === 0) return null
+  const first = answers[0]
+  return {
+    logPath: best.logPath,
+    userMessage: first ? `· ${first.question} → ${first.answer}` : '',
+    matchedCount: best.score.matchedCount,
+    matchedLength: best.score.matchedLength,
+  }
+}
+
+/**
+ * Match a window whose screen shows AskUserQuestion recaps but no ❯ prompt.
+ * Union rather than intersect: recaps on screen can span a /clear boundary, so
+ * pairs may legitimately live in different files — score each candidate by how
+ * many pairs it contains and reject ties like the main path.
+ */
+function matchWindowByAskAnswers(
+  answers: AskUserQuestionAnswer[],
+  logDirs: string | string[],
+  context: ExactMatchContext,
+  search: ExactMatchSearchOptions
+): ExactMatchResult | null {
+  // The answer envelopes are a Claude log format — skip the rg work entirely
+  // for windows known to be a different agent.
+  const windowFamily = agentFamily(context.agentType)
+  if (windowFamily && windowFamily !== 'claude') return null
+  const hitPaths = new Set<string>()
+  for (const pair of answers) {
+    for (const hit of findLogsWithAskAnswerPair(
+      pair.question,
+      pair.answer,
+      logDirs,
+      search
+    )) {
+      hitPaths.add(hit)
+    }
+  }
+  const candidates = filterAskAnswerCandidates([...hitPaths], context, search)
+  if (candidates.length === 0) return null
+  const scored = candidates
+    .map((logPath) => ({
+      logPath,
+      score: scoreAskAnswerTexts(answers, askAnswerEnvelopeTexts(logPath, search)),
+    }))
+    .sort((left, right) => compareOrderedScores(left.score, right.score))
+  return askAnswerResult(answers, scored)
+}
+
+async function matchWindowByAskAnswersAsync(
+  answers: AskUserQuestionAnswer[],
+  logDirs: string | string[],
+  context: ExactMatchContext,
+  search: ExactMatchSearchOptions
+): Promise<ExactMatchResult | null> {
+  const windowFamily = agentFamily(context.agentType)
+  if (windowFamily && windowFamily !== 'claude') return null
+  const hitPaths = new Set<string>()
+  for (const pair of answers) {
+    for (const hit of await findLogsWithAskAnswerPairAsync(
+      pair.question,
+      pair.answer,
+      logDirs,
+      search
+    )) {
+      hitPaths.add(hit)
+    }
+  }
+  const candidates = filterAskAnswerCandidates([...hitPaths], context, search)
+  if (candidates.length === 0) return null
+  const textsByPath = await Promise.all(
+    candidates.map(async (logPath) => ({
+      logPath,
+      texts: await askAnswerEnvelopeTextsAsync(logPath, search),
+    }))
+  )
+  const scored = textsByPath
+    .map(({ logPath, texts }) => ({
+      logPath,
+      score: scoreAskAnswerTexts(answers, texts),
+    }))
+    .sort((left, right) => compareOrderedScores(left.score, right.score))
+  return askAnswerResult(answers, scored)
+}
+
+export interface ExactMatchContext {
+  agentType?: AgentType
+  projectPath?: string
+}
+
+/**
+ * Hard agent-type gate. When the window's agent type is known, a log of a
+ * different type can never be the right match — even if it is the only log
+ * containing the pane's text (e.g. the same prompt pasted into a claude and a
+ * codex window seconds apart, where one log flushes first). Returning an empty
+ * list defers the match until the right-typed log appears. Fails open when the
+ * window type or a log's type is unknown.
+ */
+export function filterCandidatesByAgentType(
+  candidates: string[],
+  agentType: AgentType | undefined
+): string[] {
+  const windowFamily = agentFamily(agentType)
+  if (!windowFamily) return candidates
+  return candidates.filter((candidate) => {
+    const logType = inferAgentTypeFromPath(candidate)
+    return logType === null || logType === windowFamily
+  })
+}
+
+export interface ExactMatchResult {
+  logPath: string
+  userMessage: string
+  matchedCount: number
+  matchedLength: number
+}
+
+/**
+ * Try to find a log file that matches a window's content.
+ * Strategy:
+ * 1. Extract recent user messages from tmux
+ * 2. rg search for the longest messages → get candidate logs
+ * 3. Narrow down with agent type/project path if available
+ * 4. Break ties by ordered user-message matches in the log
+ *
+ * @param noMessageWindows Optional set to track windows that returned null because
+ *   the terminal had no extractable messages (empty or still booting). Windows that
+ *   have messages but fail matching for other reasons (short messages without
+ *   disambiguators, no candidates, tie, score=0) are NOT added to this set.
+ */
+export function tryExactMatchWindowToLog(
+  tmuxWindow: string,
+  logDirs: string | string[],
+  scrollbackLines = DEFAULT_SCROLLBACK_LINES,
+  context: ExactMatchContext = {},
+  search: ExactMatchSearchOptions = {},
+  noMessageWindows?: Set<string>
+): ExactMatchResult | null {
+  const profile = search.profile
+  const tmuxStart = performance.now()
+  const captureResult = captureTerminalScrollback(tmuxWindow, scrollbackLines)
+  const scrollback = captureResult.content
+  if (profile) {
+    profile.tmuxCaptures += 1
+    profile.tmuxCaptureMs += performance.now() - tmuxStart
+  }
+  const extractStart = performance.now()
+  let userMessages = extractRecentUserMessagesFromTmux(scrollback, undefined, context.agentType)
+
+  // If no Claude/Codex prompts found, try pi TUI detection (uses ANSI background colors)
+  if (userMessages.length === 0) {
+    const ansiScrollback = getTerminalScrollbackWithAnsi(tmuxWindow, scrollbackLines)
+    userMessages = extractPiUserMessagesFromAnsi(ansiScrollback)
+  }
+
+  if (profile) {
+    profile.messageExtractRuns += 1
+    profile.messageExtractMs += performance.now() - extractStart
+  }
+
+  let messages = userMessages
+  let usingTraceFallback = false
+  if (messages.length === 0) {
+    // AskUserQuestion recaps carry real user input without any ❯ prompt line.
+    const askAnswers = extractAskUserQuestionAnswers(scrollback)
+    if (askAnswers.length > 0) {
+      const answerMatch = matchWindowByAskAnswers(
+        askAnswers,
+        logDirs,
+        context,
+        search
+      )
+      if (answerMatch) return answerMatch
+    }
+    const traces = extractRecentTraceLinesFromTmux(scrollback)
+    if (traces.length === 0) {
+      // Only mark as "no messages" if the capture succeeded — a capture failure
+      // (stale/invalid tmux target) should not trigger deferral. A window that
+      // yielded question answers had extractable content, just no match.
+      if (captureResult.ok && askAnswers.length === 0)
+        noMessageWindows?.add(tmuxWindow)
+      return null
+    }
+    messages = traces
+    usingTraceFallback = true
+  }
+
+  return resolveExactMatch(
+    messages,
+    usingTraceFallback,
+    context,
+    search,
+    (message, userOnly) =>
+      findLogsWithExactMessage(message, logDirs, {
+        minLength:
+          message.length >= MIN_EXACT_MATCH_LENGTH ? MIN_EXACT_MATCH_LENGTH : 1,
+        logPaths: search.logPaths,
+        tailBytes: search.tailBytes,
+        rgThreads: search.rgThreads,
+        profile: search.profile,
+        userOnly,
+      })
+  )
+}
+
+/**
+ * The messages a window search may use: long ones preferred; short ones only
+ * when disambiguators or the trace fallback allow them. Shared by
+ * resolveExactMatch and the batch scan's query collection so both admit the
+ * same set.
+ */
+function selectSearchMessages(
+  messages: string[],
+  allowShortMessages: boolean
+): string[] {
+  const longMessages = messages.filter(
+    (message) => message.length >= MIN_EXACT_MATCH_LENGTH
+  )
+  return longMessages.length > 0 ? longMessages : allowShortMessages ? messages : []
+}
+
+/**
+ * Narrow the candidate set for one window's extracted messages and score the
+ * survivors. Shared by the per-window paths (rg lookup per message) and the
+ * startup batch scan (precomputed match sets).
+ *
+ * `findMatches(message, userOnly)` must return exactly what
+ * findLogsWithExactMessage would: files containing the message in a valid
+ * user context.
+ */
+function resolveExactMatch(
+  messages: string[],
+  usingTraceFallback: boolean,
+  context: ExactMatchContext,
+  search: ExactMatchSearchOptions,
+  findMatches: (message: string, userOnly: boolean) => string[]
+): ExactMatchResult | null {
+  const hasDisambiguators = Boolean(context.agentType || context.projectPath)
+  const allowShortMessages = hasDisambiguators || usingTraceFallback
+  const messagesToSearch = selectSearchMessages(messages, allowShortMessages)
+  if (messagesToSearch.length === 0) return null  // has messages, but too short — not booting
+
+  const sortedMessages = messagesToSearch.toSorted((a, b) => b.length - a.length)
+  let candidates: string[] = []
+
+  for (const message of sortedMessages) {
+    const matches = findMatches(message, !usingTraceFallback)
+    if (matches.length === 0) continue
+    candidates = intersectCandidates(candidates, matches)
+    if (candidates.length <= 1) break
+  }
+
+  if (candidates.length === 0) {
+    return null
+  }
+
+  if (usingTraceFallback) {
+    const filtered = candidates.filter(
+      (candidate) => !isCodexSubagent(candidate) && !isPiSubagent(candidate)
+    )
+    if (filtered.length === 0) {
+      return null
+    }
+    candidates = filtered
+  }
+
+  candidates = filterCandidatesByAgentType(candidates, context.agentType)
+  if (candidates.length === 0) {
+    return null
+  }
+
+  if (context.projectPath) {
+    const target = normalizePath(context.projectPath)
+    const filtered = candidates.filter((candidate) => {
+      const projectPath = extractProjectPath(candidate)
+      if (!projectPath) return false
+      const normalized = normalizePath(projectPath)
+      return isSameOrChildPath(normalized, target)
+    })
+    if (filtered.length > 0) {
+      candidates = filtered
+    }
+  }
+
+  // Filter out explicitly excluded log paths (e.g., logs belonging to other active windows)
+  if (search.excludeLogPaths && search.excludeLogPaths.length > 0) {
+    const excludeSet = new Set(search.excludeLogPaths)
+    const filtered = candidates.filter((candidate) => !excludeSet.has(candidate))
+    if (filtered.length > 0) {
+      candidates = filtered
+    }
+  }
+
+  const orderedMessages = messages
+    .filter((message: string) => message.length >= MIN_EXACT_MATCH_LENGTH)
+    .toReversed()
+
+  if (orderedMessages.length === 0) {
+    return null
+  }
+
+  const profile = search.profile
+  if (candidates.length === 1) {
+    const score = scoreOrderedMessageMatches(candidates[0], orderedMessages, search)
+    if (score.matchedCount === 0) {
+      return null
+    }
+    return {
+      logPath: candidates[0],
+      userMessage: messages[0] ?? '',
+      matchedCount: score.matchedCount,
+      matchedLength: score.matchedLength,
+    }
+  }
+
+  let scored = candidates.map((logPath) => ({
+    logPath,
+    score: scoreOrderedMessageMatches(logPath, orderedMessages, search),
+  }))
+
+  scored.sort((left, right) => compareOrderedScores(left.score, right.score))
+  let best = scored[0]
+  let second = scored[1]
+
+  if (!best || best.score.matchedCount === 0) {
+    return null
+  }
+
+  if (second) {
+    const isTied =
+      best.score.matchedCount === second.score.matchedCount &&
+      best.score.matchedLength === second.score.matchedLength
+    if (isTied) {
+      const tied = scored.filter(
+        (entry) => compareOrderedScores(entry.score, best.score) === 0
+      )
+      const needsFull = tied.some((entry) => entry.score.source === 'tail')
+      if (needsFull) {
+        const tieStart = performance.now()
+        const updatedScores = new Map(
+          tied.map((entry) => [
+            entry.logPath,
+            {
+              ...scoreOrderedMessageMatchesWithRg(
+                entry.logPath,
+                orderedMessages,
+                search
+              ),
+              source: 'rg' as const,
+            },
+          ])
+        )
+        if (profile) {
+          profile.tieBreakRgRuns += tied.length
+          profile.tieBreakRgMs += performance.now() - tieStart
+        }
+        scored = scored.map((entry) => {
+          const updated = updatedScores.get(entry.logPath)
+          if (!updated) return entry
+          return { ...entry, score: updated }
+        })
+        scored.sort((left, right) => compareOrderedScores(left.score, right.score))
+        best = scored[0]
+        second = scored[1]
+      }
+    }
+  }
+
+  if (
+    second &&
+    best.score.matchedCount === second.score.matchedCount &&
+    best.score.matchedLength === second.score.matchedLength
+  ) {
+    return null
+  }
+
+  return {
+    logPath: best.logPath,
+    userMessage: messages[0] ?? '',
+    matchedCount: best.score.matchedCount,
+    matchedLength: best.score.matchedLength,
+  }
+}
+
+export async function tryExactMatchWindowToLogAsync(
+  tmuxWindow: string,
+  logDirs: string | string[],
+  scrollbackLines = DEFAULT_SCROLLBACK_LINES,
+  context: ExactMatchContext = {},
+  search: ExactMatchSearchOptions = {},
+  noMessageWindows?: Set<string>
+): Promise<ExactMatchResult | null> {
+  const profile = search.profile
+  const tmuxStart = performance.now()
+  const captureResult = await captureTerminalScrollbackAsync(tmuxWindow, scrollbackLines)
+  const scrollback = captureResult.content
+  if (profile) {
+    profile.tmuxCaptures += 1
+    profile.tmuxCaptureMs += performance.now() - tmuxStart
+  }
+  const extractStart = performance.now()
+  let userMessages = extractRecentUserMessagesFromTmux(scrollback, undefined, context.agentType)
+
+  if (userMessages.length === 0) {
+    const ansiScrollback = await getTerminalScrollbackWithAnsiAsync(
+      tmuxWindow,
+      scrollbackLines
+    )
+    userMessages = extractPiUserMessagesFromAnsi(ansiScrollback)
+  }
+
+  if (profile) {
+    profile.messageExtractRuns += 1
+    profile.messageExtractMs += performance.now() - extractStart
+  }
+
+  let messages = userMessages
+  let usingTraceFallback = false
+  if (messages.length === 0) {
+    // AskUserQuestion recaps carry real user input without any ❯ prompt line.
+    const askAnswers = extractAskUserQuestionAnswers(scrollback)
+    if (askAnswers.length > 0) {
+      const answerMatch = await matchWindowByAskAnswersAsync(
+        askAnswers,
+        logDirs,
+        context,
+        search
+      )
+      if (answerMatch) return answerMatch
+    }
+    const traces = extractRecentTraceLinesFromTmux(scrollback)
+    if (traces.length === 0) {
+      if (captureResult.ok && askAnswers.length === 0)
+        noMessageWindows?.add(tmuxWindow)
+      return null
+    }
+    messages = traces
+    usingTraceFallback = true
+  }
+
+  const hasDisambiguators = Boolean(context.agentType || context.projectPath)
+  const longMessages = messages.filter(
+    (message) => message.length >= MIN_EXACT_MATCH_LENGTH
+  )
+  const allowShortMessages = hasDisambiguators || usingTraceFallback
+  const messagesToSearch =
+    longMessages.length > 0 ? longMessages : allowShortMessages ? messages : []
+  if (messagesToSearch.length === 0) return null
+
+  const sortedMessages = messagesToSearch.toSorted((a, b) => b.length - a.length)
+  let candidates: string[] = []
+
+  for (const message of sortedMessages) {
+    const minLength =
+      message.length >= MIN_EXACT_MATCH_LENGTH ? MIN_EXACT_MATCH_LENGTH : 1
+    const matches = await findLogsWithExactMessageAsync(message, logDirs, {
+      minLength,
+      logPaths: search.logPaths,
+      tailBytes: search.tailBytes,
+      rgThreads: search.rgThreads,
+      profile: search.profile,
+      userOnly: !usingTraceFallback,
+    })
+    if (matches.length === 0) continue
+    candidates = intersectCandidates(candidates, matches)
+    if (candidates.length <= 1) break
+  }
+
+  if (candidates.length === 0) {
+    return null
+  }
+
+  if (usingTraceFallback) {
+    const filtered = candidates.filter(
+      (candidate) => !isCodexSubagent(candidate) && !isPiSubagent(candidate)
+    )
+    if (filtered.length === 0) {
+      return null
+    }
+    candidates = filtered
+  }
+
+  candidates = filterCandidatesByAgentType(candidates, context.agentType)
+  if (candidates.length === 0) {
+    return null
+  }
+
+  if (context.projectPath) {
+    const target = normalizePath(context.projectPath)
+    const filtered = candidates.filter((candidate) => {
+      const projectPath = extractProjectPath(candidate)
+      if (!projectPath) return false
+      const normalized = normalizePath(projectPath)
+      return isSameOrChildPath(normalized, target)
+    })
+    if (filtered.length > 0) {
+      candidates = filtered
+    }
+  }
+
+  if (search.excludeLogPaths && search.excludeLogPaths.length > 0) {
+    const excludeSet = new Set(search.excludeLogPaths)
+    const filtered = candidates.filter((candidate) => !excludeSet.has(candidate))
+    if (filtered.length > 0) {
+      candidates = filtered
+    }
+  }
+
+  const orderedMessages = messages
+    .filter((message: string) => message.length >= MIN_EXACT_MATCH_LENGTH)
+    .toReversed()
+
+  if (orderedMessages.length === 0) {
+    return null
+  }
+
+  if (candidates.length === 1) {
+    const score = await scoreOrderedMessageMatchesAsync(
+      candidates[0],
+      orderedMessages,
+      search
+    )
+    if (score.matchedCount === 0) {
+      return null
+    }
+    return {
+      logPath: candidates[0],
+      userMessage: messages[0] ?? '',
+      matchedCount: score.matchedCount,
+      matchedLength: score.matchedLength,
+    }
+  }
+
+  let scored = await Promise.all(
+    candidates.map(async (logPath) => ({
+      logPath,
+      score: await scoreOrderedMessageMatchesAsync(logPath, orderedMessages, search),
+    }))
+  )
+
+  scored.sort((left, right) => compareOrderedScores(left.score, right.score))
+  let best = scored[0]
+  let second = scored[1]
+
+  if (!best || best.score.matchedCount === 0) {
+    return null
+  }
+
+  if (second) {
+    const isTied =
+      best.score.matchedCount === second.score.matchedCount &&
+      best.score.matchedLength === second.score.matchedLength
+    if (isTied) {
+      const tied = scored.filter(
+        (entry) => compareOrderedScores(entry.score, best.score) === 0
+      )
+      const needsFull = tied.some((entry) => entry.score.source === 'tail')
+      if (needsFull) {
+        const tieStart = performance.now()
+        const updatedScores = new Map<string, OrderedMatchScore>(
+          await Promise.all(
+            tied.map(async (entry): Promise<[string, OrderedMatchScore]> => {
+              const rgScore = await scoreOrderedMessageMatchesWithRgAsync(
+                entry.logPath,
+                orderedMessages,
+                search
+              )
+              return [
+                entry.logPath,
+                {
+                  ...rgScore,
+                  source: 'rg' as const,
+                },
+              ]
+            })
+          )
+        )
+        if (profile) {
+          profile.tieBreakRgRuns += tied.length
+          profile.tieBreakRgMs += performance.now() - tieStart
+        }
+        scored = scored.map((entry) => {
+          const updated = updatedScores.get(entry.logPath)
+          if (!updated) return entry
+          return { ...entry, score: updated }
+        })
+        scored.sort((left, right) => compareOrderedScores(left.score, right.score))
+        best = scored[0]
+        second = scored[1]
+      }
+    }
+  }
+
+  if (
+    second &&
+    best.score.matchedCount === second.score.matchedCount &&
+    best.score.matchedLength === second.score.matchedLength
+  ) {
+    return null
+  }
+
+  return {
+    logPath: best.logPath,
+    userMessage: messages[0] ?? '',
+    matchedCount: best.score.matchedCount,
+    matchedLength: best.score.matchedLength,
+  }
+}
+
+export interface ExactMatchRgResult {
+  matches: Map<string, Session>
+  /** Windows where tryExactMatchWindowToLog returned null due to no extractable messages */
+  noMessageWindows: Set<string>
+}
+
+export function matchWindowsToLogsByExactRg(
+  windows: Session[],
+  logDirs: string | string[],
+  scrollbackLines = DEFAULT_SCROLLBACK_LINES,
+  search: ExactMatchSearchOptions = {}
+): ExactMatchRgResult {
+  const matches = new Map<
+    string,
+    { window: Session; score: OrderedMatchScore }
+  >()
+  const blocked = new Set<string>()
+  const noMessageWindows = new Set<string>()
+  const profile = search.profile
+
+  for (const window of windows) {
+    const start = performance.now()
+    const result = tryExactMatchWindowToLog(
+      window.tmuxWindow,
+      logDirs,
+      scrollbackLines,
+      { agentType: window.agentType, projectPath: window.projectPath },
+      search,
+      noMessageWindows
+    )
+    if (profile) {
+      profile.windowMatchRuns += 1
+      profile.windowMatchMs += performance.now() - start
+    }
+    if (!result) continue
+
+    const score = {
+      matchedCount: result.matchedCount,
+      matchedLength: result.matchedLength,
+    }
+    const existing = matches.get(result.logPath)
+
+    if (blocked.has(result.logPath)) {
+      continue
+    }
+    if (!existing) {
+      matches.set(result.logPath, { window, score })
+      continue
+    }
+
+    const comparison = compareOrderedScores(score, existing.score)
+    if (comparison === 0) {
+      matches.delete(result.logPath)
+      blocked.add(result.logPath)
+      continue
+    }
+    if (comparison < 0) {
+      matches.set(result.logPath, { window, score })
+    }
+  }
+
+  const resolved = new Map<string, Session>()
+  for (const [logPath, entry] of matches) {
+    resolved.set(logPath, entry.window)
+  }
+
+  return { matches: resolved, noMessageWindows }
+}
+
+export async function matchWindowsToLogsByExactRgAsync(
+  windows: Session[],
+  logDirs: string | string[],
+  scrollbackLines = DEFAULT_SCROLLBACK_LINES,
+  search: ExactMatchSearchOptions = {}
+): Promise<ExactMatchRgResult> {
+  const matches = new Map<string, { window: Session; score: OrderedMatchScore }>()
+  const blocked = new Set<string>()
+  const noMessageWindows = new Set<string>()
+  const profile = search.profile
+
+  const windowResults = await Promise.all(
+    windows.map(async (window) => {
+      const start = performance.now()
+      const result = await tryExactMatchWindowToLogAsync(
+        window.tmuxWindow,
+        logDirs,
+        scrollbackLines,
+        { agentType: window.agentType, projectPath: window.projectPath },
+        search,
+        noMessageWindows
+      )
+      return {
+        window,
+        result,
+        elapsedMs: performance.now() - start,
+      }
+    })
+  )
+
+  for (const entry of windowResults) {
+    if (profile) {
+      profile.windowMatchRuns += 1
+      profile.windowMatchMs += entry.elapsedMs
+    }
+    if (!entry.result) continue
+
+    const score = {
+      matchedCount: entry.result.matchedCount,
+      matchedLength: entry.result.matchedLength,
+    }
+    const existing = matches.get(entry.result.logPath)
+
+    if (blocked.has(entry.result.logPath)) {
+      continue
+    }
+    if (!existing) {
+      matches.set(entry.result.logPath, { window: entry.window, score })
+      continue
+    }
+
+    const comparison = compareOrderedScores(score, existing.score)
+    if (comparison === 0) {
+      matches.delete(entry.result.logPath)
+      blocked.add(entry.result.logPath)
+      continue
+    }
+    if (comparison < 0) {
+      matches.set(entry.result.logPath, { window: entry.window, score })
+    }
+  }
+
+  const resolved = new Map<string, Session>()
+  for (const [logPath, entry] of matches) {
+    resolved.set(logPath, entry.window)
+  }
+
+  return { matches: resolved, noMessageWindows }
+}
+
+export interface VerifyWindowLogOptions {
+  context?: ExactMatchContext
+  scrollbackLines?: number
+  /** Log paths to exclude from consideration (e.g., logs belonging to other active windows) */
+  excludeLogPaths?: string[]
+}
+
+/**
+ * Verify that a window's terminal content matches a specific log file.
+ * Used on startup to validate stored currentWindow associations before trusting them.
+ * Returns true if the window content matches the log AND this log is the best match
+ * for the window (not just any match).
+ */
+export function verifyWindowLogAssociation(
+  tmuxWindow: string,
+  logPath: string,
+  logDirs: string[],
+  options: VerifyWindowLogOptions = {}
+): boolean {
+  const {
+    context = {},
+    scrollbackLines = DEFAULT_SCROLLBACK_LINES,
+    excludeLogPaths = [],
+  } = options
+
+  // Build list of logs to exclude, but always include the log we're verifying
+  const excludeSet = new Set(excludeLogPaths)
+  excludeSet.delete(logPath)
+
+  // Check if the window matches any log (searching all logs except excluded ones)
+  const bestMatch = tryExactMatchWindowToLog(
+    tmuxWindow,
+    logDirs,
+    scrollbackLines,
+    context,
+    { excludeLogPaths: excludeSet.size > 0 ? [...excludeSet] : undefined }
+  )
+  // Verify this log is actually the best match for the window
+  // This prevents stale associations where shared content (like /plugin)
+  // causes a weak match to pass verification
+  return bestMatch !== null && bestMatch.logPath === logPath
+}
+
+export async function verifyWindowLogAssociationAsync(
+  tmuxWindow: string,
+  logPath: string,
+  logDirs: string[],
+  options: VerifyWindowLogOptions = {}
+): Promise<boolean> {
+  const {
+    context = {},
+    scrollbackLines = DEFAULT_SCROLLBACK_LINES,
+    excludeLogPaths = [],
+  } = options
+
+  const excludeSet = new Set(excludeLogPaths)
+  excludeSet.delete(logPath)
+
+  const bestMatch = await tryExactMatchWindowToLogAsync(
+    tmuxWindow,
+    logDirs,
+    scrollbackLines,
+    context,
+    { excludeLogPaths: excludeSet.size > 0 ? [...excludeSet] : undefined }
+  )
+  return bestMatch !== null && bestMatch.logPath === logPath
+}
+
+// Tri-state verification types for hybrid session matching
+export type WindowLogVerificationStatus = 'verified' | 'mismatch' | 'inconclusive'
+
+export interface WindowLogVerificationResult {
+  status: WindowLogVerificationStatus
+  /** The best match found, if any */
+  bestMatch: ExactMatchResult | null
+  /** Why inconclusive (for debugging) */
+  reason?: 'no_match' | 'error'
+}
+
+/**
+ * Verify that a window's terminal content matches a specific log file.
+ *
+ * Returns detailed result with tri-state status:
+ * - 'verified': Window content matches the expected log (this log is the best match)
+ * - 'mismatch': Window content matches a DIFFERENT log (strong evidence of wrong association)
+ * - 'inconclusive': No confident match (empty scrollback, tie between logs, or error)
+ */
+export function verifyWindowLogAssociationDetailed(
+  tmuxWindow: string,
+  logPath: string,
+  logDirs: string[],
+  options: VerifyWindowLogOptions = {}
+): WindowLogVerificationResult {
+  const {
+    context = {},
+    scrollbackLines = DEFAULT_SCROLLBACK_LINES,
+    excludeLogPaths = [],
+  } = options
+
+  const excludeSet = new Set(excludeLogPaths)
+  excludeSet.delete(logPath)
+
+  try {
+    const bestMatch = tryExactMatchWindowToLog(
+      tmuxWindow,
+      logDirs,
+      scrollbackLines,
+      context,
+      { excludeLogPaths: excludeSet.size > 0 ? [...excludeSet] : undefined }
+    )
+
+    if (bestMatch === null) {
+      // null means no match or tie - treat as inconclusive
+      return { status: 'inconclusive', bestMatch: null, reason: 'no_match' }
+    }
+
+    if (bestMatch.logPath === logPath) {
+      return { status: 'verified', bestMatch }
+    }
+
+    return { status: 'mismatch', bestMatch }
+  } catch (error) {
+    // IO errors, parse errors, etc. - treat as inconclusive
+    logger.warn('verify_window_log_error', {
+      tmuxWindow,
+      logPath,
+      error: String(error),
+    })
+    return { status: 'inconclusive', bestMatch: null, reason: 'error' }
+  }
+}
+
+export async function verifyWindowLogAssociationDetailedAsync(
+  tmuxWindow: string,
+  logPath: string,
+  logDirs: string[],
+  options: VerifyWindowLogOptions = {}
+): Promise<WindowLogVerificationResult> {
+  const {
+    context = {},
+    scrollbackLines = DEFAULT_SCROLLBACK_LINES,
+    excludeLogPaths = [],
+  } = options
+
+  const excludeSet = new Set(excludeLogPaths)
+  excludeSet.delete(logPath)
+
+  try {
+    const bestMatch = await tryExactMatchWindowToLogAsync(
+      tmuxWindow,
+      logDirs,
+      scrollbackLines,
+      context,
+      { excludeLogPaths: excludeSet.size > 0 ? [...excludeSet] : undefined }
+    )
+
+    if (bestMatch === null) {
+      return { status: 'inconclusive', bestMatch: null, reason: 'no_match' }
+    }
+
+    if (bestMatch.logPath === logPath) {
+      return { status: 'verified', bestMatch }
+    }
+
+    return { status: 'mismatch', bestMatch }
+  } catch (error) {
+    logger.warn('verify_window_log_error', {
+      tmuxWindow,
+      logPath,
+      error: String(error),
+    })
+    return { status: 'inconclusive', bestMatch: null, reason: 'error' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Batch startup verification
+//
+// verifyAllSessions used to run tryExactMatchWindowToLog per window: each
+// window re-scanned every log directory with rg once per message, and each
+// match's tail validation re-read and re-parsed the same files. On a large
+// corpus (10+ GB per dir) that was minutes of full-corpus scans.
+//
+// The batch path shares the scan: one rg -l pass per directory per pattern
+// chunk over the union of all windows' messages, then per candidate file a
+// single rg pass recovers per-message attribution and a single tail read +
+// line index validates every query. Results are identical to per-window
+// findLogsWithExactMessage calls by construction: a file is a candidate for
+// a message iff some raw line matches its pattern (reproduced per line) and
+// the same user-context predicate holds in the last
+// MAX_PROGRESSIVE_TAIL_BYTES.
+
+export interface WindowVerifyJob {
+  sessionId: string
+  tmuxWindow: string
+  /** The log path this window is expected to map to */
+  expectedLogPath: string
+  context: ExactMatchContext
+  excludeLogPaths: string[]
+}
+
+interface SharedScanQuery {
+  key: string
+  message: string
+  userOnly: boolean
+  probe: MessageProbe
+}
+
+function sharedQueryKey(message: string, userOnly: boolean): string {
+  return `${userOnly ? 'u' : 'a'}:${message}`
+}
+
+// One rg pass carries many -e patterns; bound each pass so argv stays well
+// under ARG_MAX even with hundreds of long messages.
+const SHARED_RG_MAX_PATTERNS_PER_PASS = 128
+const SHARED_RG_MAX_PATTERN_BYTES = 96 * 1024
+// A union pass scans each directory once; give it more headroom than the
+// per-message scans (10s) since a timeout here degrades every window at once.
+const SHARED_RG_TIMEOUT_MS = 60000
+// Cap matched-line output per attribution pass; files past this get a
+// per-pattern rg -l recheck for queries the pass did not resolve.
+const SHARED_ATTRIBUTION_MAX_LINES = 8192
+
+interface PreparedVerifyJob {
+  job: WindowVerifyJob
+  messages: string[]
+  usingTraceFallback: boolean
+}
+
+/**
+ * rg for a batch of messages, shared across windows. Returns, per
+ * (message, userOnly) query, the files where the message validates in a user
+ * context — identical to calling findLogsWithExactMessage per query.
+ *
+ * Two stages keep it exact:
+ * 1. `rg -l` once per directory per pattern chunk → union candidate files.
+ *    The union is a superset of every per-message hit set, so nothing a
+ *    per-message scan would find is missed.
+ * 2. Per union file, one 2MB tail read validates every query through a
+ *    shared line index (most union files validate for nothing and are
+ *    skipped early). Files with a validating query get a bounded matched-
+ *    lines `rg` pass that reproduces rg's per-message raw-hit semantics
+ *    exactly; truncated or failed passes fall back to per-pattern `rg -l`
+ *    rechecks so errors never become silent negative evidence.
+ */
+export function findLogsWithExactMessagesBatch(
+  queries: Array<{ message: string; userOnly: boolean }>,
+  logDirs: string[],
+  search: ExactMatchSearchOptions = {}
+): Map<string, Set<string>> {
+  const profile = search.profile
+  const unique = new Map<string, SharedScanQuery>()
+  for (const { message, userOnly } of queries) {
+    // Same floor as findLogsWithExactMessage — short messages return no
+    // matches there, so they must produce no set here either.
+    if (message.length < MIN_EXACT_MATCH_LENGTH) continue
+    const key = sharedQueryKey(message, userOnly)
+    if (!unique.has(key)) {
+      unique.set(key, {
+        key,
+        message,
+        userOnly,
+        probe: buildMessageProbe(message),
+      })
+    }
+  }
+  const matched = new Map<string, Set<string>>()
+  for (const key of unique.keys()) matched.set(key, new Set())
+  if (unique.size === 0) return matched
+
+  // rg pattern (filesystem scan) is userOnly-agnostic — the flag only affects
+  // tail validation. Dedupe the union patterns by message text.
+  const patternsByMessage = new Map<string, string>()
+  for (const query of unique.values()) {
+    if (!patternsByMessage.has(query.message)) {
+      patternsByMessage.set(
+        query.message,
+        messageToFlexiblePattern(query.message)
+      )
+    }
+  }
+  // Chunk the union patterns once — the same chunks serve the directory
+  // scans and the per-file attribution passes, and let each query be mapped
+  // back to the chunk that carries its pattern.
+  const unionChunks: string[][] = []
+  const chunkOfMessage = new Map<string, number>()
+  {
+    let chunk: string[] = []
+    let chunkBytes = 0
+    for (const [message, pattern] of patternsByMessage) {
+      chunk.push(pattern)
+      chunkOfMessage.set(message, unionChunks.length)
+      chunkBytes += pattern.length
+      if (
+        chunk.length >= SHARED_RG_MAX_PATTERNS_PER_PASS ||
+        chunkBytes >= SHARED_RG_MAX_PATTERN_BYTES
+      ) {
+        unionChunks.push(chunk)
+        chunk = []
+        chunkBytes = 0
+      }
+    }
+    if (chunk.length > 0) unionChunks.push(chunk)
+  }
+
+  const candidateFiles = new Set<string>()
+  for (const logDir of logDirs) {
+    for (const chunk of unionChunks) {
+      const args = ['rg', '-l']
+      for (const pattern of chunk) args.push('-e', pattern)
+      if (search.rgThreads && search.rgThreads > 0) {
+        args.push('--threads', String(search.rgThreads))
+      }
+      args.push(...logDirectoryArgs(logDir))
+      const start = performance.now()
+      const result = runCommandSync(args, { timeoutMs: SHARED_RG_TIMEOUT_MS })
+      if (profile) {
+        profile.rgListRuns += 1
+        profile.rgListMs += performance.now() - start
+      }
+      if (result.exitCode === 0) {
+        for (const line of result.stdout.trim().split('\n')) {
+          if (line) candidateFiles.add(line)
+        }
+      }
+    }
+  }
+
+  const queryList = [...unique.values()]
+  const queryChunkIndex = new Map<number, number>()
+  for (let qi = 0; qi < queryList.length; qi++) {
+    const message = (queryList[qi] as SharedScanQuery).message
+    queryChunkIndex.set(qi, chunkOfMessage.get(message) ?? 0)
+  }
+  for (const logPath of candidateFiles) {
+    if (isAuxiliaryLogFile(logPath)) continue
+
+    // Tail validation first: read the last MAX_PROGRESSIVE_TAIL_BYTES once
+    // and test every query against each line's match space — same predicate
+    // as hasMessageInValidUserContext, shared across messages. Most union
+    // files match some other window's pattern and validate for nothing;
+    // skipping them avoids a whole-file rg pass each.
+    const start = performance.now()
+    const tail = readLogTail(logPath, MAX_PROGRESSIVE_TAIL_BYTES)
+    if (profile) {
+      profile.tailReads += 1
+      profile.tailReadMs += performance.now() - start
+    }
+    if (!tail) continue
+
+    const validated = new Set<number>()
+    for (const line of tail.split('\n')) {
+      const space = lineMatchSpace(line)
+      if (!space) continue
+      for (let qi = 0; qi < queryList.length; qi++) {
+        if (validated.has(qi)) continue
+        const query = queryList[qi] as SharedScanQuery
+        if (lineSpaceMatches(space, query.probe, query.userOnly)) {
+          validated.add(qi)
+        }
+      }
+      if (validated.size === queryList.length) break
+    }
+    if (validated.size === 0) continue
+
+    // rg-hit attribution, only for validated queries: a candidate must also
+    // match its pattern in raw line bytes somewhere in the file (per-window
+    // findLogsWithExactMessage requires the rg -l hit before the tail is even
+    // read). Patterns are chunked like the directory pass to stay under
+    // ARG_MAX, and output is capped — queries left ambiguous by a truncated
+    // or failed pass get an exact per-pattern rg -l recheck instead of being
+    // silently dropped.
+    const rgHit = new Set<number>()
+    const ambiguous = new Set<number>()
+    for (let ci = 0; ci < unionChunks.length; ci++) {
+      const chunk = unionChunks[ci] as string[]
+      const hitArgs = ['rg']
+      for (const pattern of chunk) hitArgs.push('-e', pattern)
+      hitArgs.push('-m', String(SHARED_ATTRIBUTION_MAX_LINES), logPath)
+      const hitResult = runCommandSync(hitArgs, {
+        timeoutMs: SHARED_RG_TIMEOUT_MS,
+      })
+      if (hitResult.exitCode === 0) {
+        const hitLines = hitResult.stdout.split('\n').filter(Boolean)
+        for (const rawLine of hitLines) {
+          for (const qi of validated) {
+            if (rgHit.has(qi)) continue
+            if (
+              (queryList[qi] as SharedScanQuery).probe.baseRegex.test(rawLine)
+            ) {
+              rgHit.add(qi)
+            }
+          }
+        }
+        if (hitLines.length >= SHARED_ATTRIBUTION_MAX_LINES) {
+          for (const qi of validated) {
+            if (!rgHit.has(qi) && queryChunkIndex.get(qi) === ci) {
+              ambiguous.add(qi)
+            }
+          }
+        }
+      } else if (hitResult.exitCode !== 1) {
+        // Error/timeout — treat the chunk's queries as unknown rather than no
+        // hit (mirroring the per-message path dropping that query's results
+        // would change verdicts; a targeted recheck preserves them).
+        for (const qi of validated) {
+          if (!rgHit.has(qi) && queryChunkIndex.get(qi) === ci) {
+            ambiguous.add(qi)
+          }
+        }
+      }
+    }
+    for (const qi of ambiguous) {
+      if (rgHit.has(qi)) continue
+      const result = runCommandSync(
+        ['rg', '-l', '-e', (queryList[qi] as SharedScanQuery).probe.baseRegex.source, logPath],
+        { timeoutMs: SHARED_RG_TIMEOUT_MS }
+      )
+      if (result.exitCode === 0) rgHit.add(qi)
+    }
+
+    for (const qi of rgHit) {
+      const key = (queryList[qi] as SharedScanQuery).key
+      ;(matched.get(key) as Set<string>).add(logPath)
+    }
+  }
+  return matched
+}
+
+/**
+ * Verify a batch of windows against their expected log paths. Equivalent to
+ * verifyWindowLogAssociationDetailed per job, but shares the rg directory
+ * scans and per-file tail reads across all jobs. Runs synchronously — meant
+ * for the log-match worker, not the main thread.
+ */
+export function verifyWindowsBatch(
+  jobs: WindowVerifyJob[],
+  logDirs: string[],
+  scrollbackLines = DEFAULT_SCROLLBACK_LINES,
+  search: ExactMatchSearchOptions = {}
+): Map<string, WindowLogVerificationResult> {
+  const results = new Map<string, WindowLogVerificationResult>()
+  const shared: PreparedVerifyJob[] = []
+
+  for (const job of jobs) {
+    try {
+      const captureResult = captureTerminalScrollback(
+        job.tmuxWindow,
+        scrollbackLines
+      )
+      const scrollback = captureResult.content
+      let messages = extractRecentUserMessagesFromTmux(scrollback, undefined, job.context.agentType)
+      if (messages.length === 0) {
+        const ansiScrollback = getTerminalScrollbackWithAnsi(
+          job.tmuxWindow,
+          scrollbackLines
+        )
+        messages = extractPiUserMessagesFromAnsi(ansiScrollback)
+      }
+
+      if (messages.length === 0) {
+        const askAnswers = extractAskUserQuestionAnswers(scrollback)
+        const traces = extractRecentTraceLinesFromTmux(scrollback)
+        if (askAnswers.length === 0 && traces.length === 0) {
+          results.set(job.sessionId, {
+            status: 'inconclusive',
+            bestMatch: null,
+            reason: 'no_match',
+          })
+          continue
+        }
+        if (askAnswers.length > 0) {
+          // The Q→A path is its own matching routine; keep the per-window call.
+          const verification = verifyWindowLogAssociationDetailed(
+            job.tmuxWindow,
+            job.expectedLogPath,
+            logDirs,
+            {
+              context: job.context,
+              scrollbackLines,
+              excludeLogPaths: job.excludeLogPaths,
+            }
+          )
+          results.set(job.sessionId, verification)
+          continue
+        }
+        shared.push({ job, messages: traces, usingTraceFallback: true })
+        continue
+      }
+      shared.push({ job, messages, usingTraceFallback: false })
+    } catch (error) {
+      logger.warn('verify_window_log_error', {
+        tmuxWindow: job.tmuxWindow,
+        logPath: job.expectedLogPath,
+        error: String(error),
+      })
+      results.set(job.sessionId, {
+        status: 'inconclusive',
+        bestMatch: null,
+        reason: 'error',
+      })
+    }
+  }
+
+  const queries: Array<{ message: string; userOnly: boolean }> = []
+  for (const prepared of shared) {
+    const { job, messages, usingTraceFallback } = prepared
+    const allowShort =
+      Boolean(job.context.agentType || job.context.projectPath) ||
+      usingTraceFallback
+    for (const message of selectSearchMessages(messages, allowShort)) {
+      queries.push({ message, userOnly: !usingTraceFallback })
+    }
+  }
+  const messageFiles = findLogsWithExactMessagesBatch(queries, logDirs, search)
+
+  for (const prepared of shared) {
+    const { job, messages, usingTraceFallback } = prepared
+    try {
+      const excludeSet = new Set(job.excludeLogPaths)
+      excludeSet.delete(job.expectedLogPath)
+      const jobSearch: ExactMatchSearchOptions = {
+        ...search,
+        excludeLogPaths: excludeSet.size > 0 ? [...excludeSet] : undefined,
+      }
+      const bestMatch = resolveExactMatch(
+        messages,
+        usingTraceFallback,
+        job.context,
+        jobSearch,
+        (message, userOnly) =>
+          Array.from(
+            messageFiles.get(sharedQueryKey(message, userOnly)) ?? []
+          )
+      )
+      if (bestMatch === null) {
+        results.set(job.sessionId, {
+          status: 'inconclusive',
+          bestMatch: null,
+          reason: 'no_match',
+        })
+      } else if (bestMatch.logPath === job.expectedLogPath) {
+        results.set(job.sessionId, { status: 'verified', bestMatch })
+      } else {
+        results.set(job.sessionId, { status: 'mismatch', bestMatch })
+      }
+    } catch (error) {
+      logger.warn('verify_window_log_error', {
+        tmuxWindow: job.tmuxWindow,
+        logPath: job.expectedLogPath,
+        error: String(error),
+      })
+      results.set(job.sessionId, {
+        status: 'inconclusive',
+        bestMatch: null,
+        reason: 'error',
+      })
+    }
+  }
+
+  return results
+}

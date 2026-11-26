@@ -1,0 +1,258 @@
+// History sessions lookback limits (in hours)
+import type { SyncedSettings } from './syncedSettings'
+import type { SessionActivity } from './activity'
+import type { PrInfo } from './prStatus'
+import type { MediaSummary } from './media'
+
+export const HISTORY_MAX_AGE_MIN_HOURS = 1
+export const HISTORY_MAX_AGE_MAX_HOURS = 168 // 7 days
+
+export interface SessionPullRequest {
+  url: string
+  repo: string // "owner/name"
+  number: number
+}
+
+/**
+ * One media payload discovered in a session's JSONL log — an image the agent
+ * pasted or read, a document, or a published artifact link. Descriptors only;
+ * the bytes stay in the log and are served by /api/session-media.
+ */
+export interface SessionMedia {
+  kind: 'image' | 'document' | 'link' | 'html' | 'localhost' | 'visualization'
+  /** Fetch URL for extracted payloads; external href for links. */
+  url: string
+  /** Bounded external destination for display/search; open through url. */
+  externalUrl?: string
+  /** Plain-text excerpt from the assistant reply, never rendered as HTML. */
+  sourceText?: string
+  mediaType?: string
+  /** Decoded payload size in bytes. */
+  bytes?: number
+  /** Caption, e.g. "Read · hero.png" or a frame's title. */
+  label?: string
+  width?: number
+  height?: number
+}
+
+export type SessionStatus = 'working' | 'waiting' | 'permission' | 'unknown'
+
+export type SessionSource = 'managed' | 'external'
+export type AgentType = 'claude' | 'claude-rp' | 'codex' | 'pi' | 'devin' | 'grok' | 'omp' | 'antigravity'
+export type ClipboardOfferSource = 'tmux-buffer' | 'osc52'
+export type SessionKillSource =
+  | 'keyboard_shortcut'
+  | 'session_list_context_menu'
+  | 'terminal_confirm_modal'
+  | 'unknown'
+export type TerminalErrorCode =
+  | 'ERR_INVALID_WINDOW'
+  | 'ERR_SESSION_CREATE_FAILED'
+  | 'ERR_START_TIMEOUT'
+  | 'ERR_TMUX_ATTACH_FAILED'
+  | 'ERR_TMUX_SWITCH_FAILED'
+  | 'ERR_TTY_DISCOVERY_TIMEOUT'
+  | 'ERR_NOT_READY'
+
+export interface Session {
+  boardSessionId?: string
+  /** Server-only ownership for a remote tmux session. */
+  boardGrantId?: string
+  remoteTmuxIdentity?: string
+  /** Server-only observation of the current Codex footer. */
+  codexFooterSessionId?: string
+  codexIdentityPane?: string
+  // tmux window identity captured during enumeration: the @agentboard-*
+  // window options plus the server pid (incarnation marker for the catalog's
+  // stored epoch). Absent when the server is too old to expand the fields.
+  agentboardTags?: { boardId: string; runId: string; serverPid: number }
+  id: string
+  name: string
+  tmuxWindow: string
+  projectPath: string
+  status: SessionStatus
+  lastActivity: string
+  /** Time of the last text reply from the associated transcript. */
+  lastResponseAt?: string
+  createdAt: string
+  agentType?: AgentType
+  source: SessionSource
+  host?: string
+  remote?: boolean
+  command?: string
+  agentSessionId?: string
+  agentSessionName?: string
+  logFilePath?: string
+  lastUserMessage?: string
+  isHibernating?: boolean
+  prs?: SessionPullRequest[]
+  mediaSummary?: MediaSummary
+  /** Legacy input only. Never included in catalog or lifecycle wire messages. */
+  media?: SessionMedia[]
+  activity?: SessionActivity
+}
+
+export interface AgentSession {
+  sessionId: string
+  logFilePath: string
+  projectPath: string
+  agentType: AgentType
+  displayName: string
+  createdAt: string
+  lastActivityAt: string
+  isActive: boolean
+  host?: string
+  lastUserMessage?: string
+  isHibernating?: boolean
+  lastResumeError?: string
+  prs?: SessionPullRequest[]
+  mediaSummary?: MediaSummary
+  /** Legacy input only. Never included in catalog or lifecycle wire messages. */
+  media?: SessionMedia[]
+}
+
+export interface HostStatus {
+  host: string
+  ok: boolean
+  lastUpdated: string
+  error?: string
+}
+
+// Directory browser types
+export interface DirectoryEntry {
+  name: string
+  path: string
+}
+
+export interface DirectoryListing {
+  path: string
+  parent: string | null
+  directories: DirectoryEntry[]
+  truncated: boolean
+}
+
+export interface DirectoryErrorResponse {
+  error: 'invalid_path' | 'forbidden' | 'not_found' | 'internal_error'
+  message: string
+}
+
+export type ServerMessage = (
+  | { type: 'terminal-lease'; token: string }
+  | { type: 'terminal-overload' }
+  | { type: 'library-changed' }
+  | { type: 'pr-status'; infos: PrInfo[] }
+  | { type: 'sessions'; sessions: Session[] }
+  | { type: 'session-update'; session: Session }
+  | { type: 'session-created'; session: Session }
+  | { type: 'session-removed'; sessionId: string }
+  | { type: 'host-status'; hosts: HostStatus[] }
+  | { type: 'agent-sessions'; active: AgentSession[]; hibernating: AgentSession[]; history: AgentSession[] }
+  | { type: 'agent-sessions-active'; active: AgentSession[] }
+  | { type: 'session-orphaned'; session: AgentSession; supersededBy?: string }
+  | { type: 'session-activated'; session: AgentSession; window: string }
+  | { type: 'session-wake-result'; sessionId: string; ok: boolean; session?: Session; error?: WakeError }
+  | {
+      type: 'session-hibernate-result'
+      sessionId: string
+      ok: boolean
+      session?: AgentSession
+      error?: string
+    }
+  | { type: 'session-move-to-history-result'; sessionId: string; ok: boolean; session?: AgentSession; error?: string }
+  | { type: 'terminal-output'; sessionId: string; data: string }
+  | {
+      type: 'terminal-error'
+      sessionId: string | null
+      code: TerminalErrorCode
+      message: string
+      retryable: boolean
+    }
+  | { type: 'terminal-ready'; sessionId: string }
+  | { type: 'terminal-paste-result'; sessionId: string; pasteId: number; ok: boolean }
+  | {
+      type: 'clipboard-offer'
+      sessionId: string
+      text: string
+      source: ClipboardOfferSource
+    }
+  | {
+      type: 'tmux-copy-mode-status'
+      sessionId: string
+      inCopyMode: boolean
+      // Fullscreen-app (Claude /tui no-flicker) detection, per-pane.
+      // altScreen: pane is showing the alternate screen buffer (#{alternate_on}).
+      // appMouse: the in-pane app has requested mouse tracking (#{mouse_any_flag}).
+      // When appMouse is true the app owns the mouse, so the client must NOT
+      // hijack wheel/clicks into tmux copy-mode. Optional for back-compat.
+      altScreen?: boolean
+      appMouse?: boolean
+      // Null means the pane is outside this client’s viewport. Omitted for clients without geometry.
+      wheelBounds?: { firstCol: number; firstRow: number; lastCol: number; lastRow: number } | null
+    }
+  | { type: 'server-config'; remoteAllowControl: boolean; remoteAllowAttach: boolean; hostLabel: string; preferWindowName: boolean; clientLogLevel?: string; catalogVersion?: number }
+  | { type: 'synced-settings'; settings: SyncedSettings }
+  | { type: 'pong'; seq?: number }
+  | { type: 'error'; message: string }
+  | { type: 'kill-failed'; sessionId: string; message: string }
+  // Reply to terminal-snapshot-request: plain joined pane text for the
+  // client's "Select text" layer (no ANSI). text is absent when ok is false.
+  | {
+      type: 'terminal-snapshot'
+      sessionId: string
+      requestId: number
+      ok: boolean
+      text?: string
+      historyLines?: number
+      scrollPosition?: number
+      altScreen?: boolean
+      captureMs?: number
+    }
+) & { attachId?: number; outputSeq?: number }
+
+export interface WakeError {
+  code: 'NOT_FOUND' | 'ALREADY_ACTIVE' | 'WAKE_FAILED' | 'WAKE_IN_PROGRESS'
+  message: string
+}
+
+export type ClientMessage = (
+  | { type: 'terminal-resume'; token?: string; claim: number }
+  | { type: 'terminal-ack'; outputSeq: number; connectionEpoch?: number }
+  | {
+      type: 'terminal-attach'
+      sessionId: string
+      tmuxTarget?: string
+      cols?: number
+      rows?: number
+    }
+  | { type: 'terminal-detach'; sessionId: string }
+  | { type: 'terminal-input'; sessionId: string; data: string }
+  // Pasted text delivered as a single bracketed paste (via tmux paste-buffer),
+  // so multi-line content isn't auto-submitted line-by-line by the pane's app.
+  | { type: 'terminal-paste'; sessionId: string; data: string; pasteId?: number }
+  | { type: 'terminal-resize'; sessionId: string; cols: number; rows: number }
+  | { type: 'session-create'; operationId?: string; projectPath: string; name?: string; command?: string; host?: string }
+  | { type: 'session-kill'; sessionId: string; source?: SessionKillSource }
+  | { type: 'session-rename'; sessionId: string; newName: string }
+  | { type: 'session-refresh' }
+  | { type: 'tmux-cancel-copy-mode'; sessionId: string }
+  | { type: 'tmux-check-copy-mode'; sessionId: string }
+  | { type: 'terminal-snapshot-request'; sessionId: string; requestId: number }
+  | { type: 'session-wake'; sessionId: string }
+  | { type: 'session-hibernate'; sessionId: string }
+  | { type: 'session-move-to-history'; sessionId: string }
+  | { type: 'ping'; seq?: number }
+) & { attachId?: number }
+
+/** Diagnostic metadata attached to parsed ServerMessages by useWebSocket. */
+export interface DiagnosticMeta {
+  _parseMs: number
+  _rawLength: number
+  _connectionEpoch?: number
+}
+
+/** A ServerMessage with diagnostic timing metadata from the WebSocket layer. */
+export type ServerMessageWithDiagnostics = ServerMessage & DiagnosticMeta
+
+// Typed function signatures for client-side messaging
+export type SendClientMessage = (message: ClientMessage) => boolean | void
+export type SubscribeServerMessage = (listener: (message: ServerMessage) => void) => () => void

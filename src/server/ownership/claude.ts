@@ -1,0 +1,46 @@
+// Claude's local peer registry supplies identity; never connect to its messaging socket.
+import type { ProcessIdentity } from './codex'
+
+export interface ClaudeRecord {
+  pid: number
+  sessionId: string
+  procStart: string
+  parkedJobId?: string
+}
+
+export function parseClaudeRecord(text: string, pid: number, platform: string): ClaudeRecord | null {
+  try {
+    const value = JSON.parse(text)
+    if (value.pid !== pid || value.kind !== 'interactive' || value.entrypoint !== 'cli'
+      || value.pidDomain !== platform || typeof value.version !== 'string' || !value.version.startsWith('2.')
+      || typeof value.procStart !== 'string' || typeof value.sessionId !== 'string'
+      || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value.sessionId)) return null
+    if (value.parkedJobId != null && (typeof value.parkedJobId !== 'string'
+      || !/^[a-zA-Z0-9_-]{1,64}$/.test(value.parkedJobId))) return null
+    return { parkedJobId: value.parkedJobId ?? undefined, pid, sessionId: value.sessionId, procStart: value.procStart.trim().replace(/\s+/g, ' ') }
+  } catch { return null }
+}
+
+export function resolveClaudeRecord(
+  process: ProcessIdentity,
+  first: ClaudeRecord | null,
+  second: ClaudeRecord | null
+): { status: 'resolved'; sessionId: string } | { status: 'unresolved'; reason: string } {
+  if (!first || !second) return { status: 'unresolved', reason: 'claude_registry_unavailable' }
+  if (first.pid !== process.pid || first.procStart !== process.started.trim().replace(/\s+/g, ' ')) {
+    return { status: 'unresolved', reason: 'claude_registry_stale_process' }
+  }
+  if (JSON.stringify(first) !== JSON.stringify(second)) return { status: 'unresolved', reason: 'claude_registry_changed' }
+  return { status: 'resolved', sessionId: first.sessionId }
+}
+
+/** A parked terminal explicitly selects a job; historical continuation links do not. */
+export function parseClaudeJobSession(text: string, jobId: string): string | null {
+  try {
+    const value = JSON.parse(text)
+    return value.template === 'bg' && value.daemonShort === jobId
+      && typeof value.sessionId === 'string'
+      && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value.sessionId)
+      ? value.sessionId : null
+  } catch { return null }
+}

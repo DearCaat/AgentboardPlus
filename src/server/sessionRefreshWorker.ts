@@ -1,0 +1,458 @@
+/// <reference lib="webworker" />
+/**
+ * Worker for async session refresh.
+ * Batches tmux calls and runs status inference off the main thread.
+ */
+import { inferAgentType, normalizePaneStartCommand } from './agentDetection'
+import { config } from './config'
+import { resolveExternalDisplayName } from './displayName'
+import { normalizeProjectPath } from './logDiscovery'
+import { extractRecentUserMessagesFromTmux } from './logMatcher'
+import {
+  BOOTSTRAP_WINDOW_NAME,
+  buildTmuxFormat,
+  splitTmuxFields,
+  splitTmuxLines,
+  withTmuxUtf8Flag,
+} from './tmuxFormat'
+import {
+  inferCachedSessionStatus,
+  inferSessionStatus,
+  type PaneCacheState,
+} from './statusInference'
+import {
+  TMUX_TIMEOUT_ERROR_CODE,
+  TmuxTimeoutError,
+  isTmuxTimeoutError,
+} from './tmuxTimeout'
+import { sanitizedTmuxEnv } from './tmuxEnv'
+import type { Session, SessionStatus, SessionSource } from '../shared/types'
+
+// Format string for batched window listing
+const BATCH_WINDOW_FORMAT = buildTmuxFormat([
+  '#{session_name}',
+  '#{window_id}',
+  '#{window_name}',
+  '#{pane_current_path}',
+  '#{window_activity}',
+  '#{window_creation_time}',
+  '#{pane_start_command}',
+  '#{pane_width}',
+  '#{pane_height}',
+  '#{pid}',
+  '#{@agentboard-session-id}',
+  '#{@agentboard-run-id}',
+])
+const BATCH_WINDOW_FORMAT_FALLBACK = buildTmuxFormat([
+  '#{session_name}',
+  '#{window_id}',
+  '#{window_name}',
+  '#{pane_current_path}',
+  '#{window_activity}',
+  '#{window_activity}',
+  '#{pane_current_command}',
+  '#{pane_width}',
+  '#{pane_height}',
+])
+
+const LAST_USER_MESSAGE_SCROLLBACK_LINES = 200
+
+interface WindowData {
+  sessionName: string
+  windowId: string
+  windowName: string
+  path: string
+  activity: number
+  creation: number
+  command: string
+  width: number
+  height: number
+  serverPid: number
+  boardId: string
+  runId: string
+}
+
+// Cache persists across worker invocations.
+// This depends on worker message handlers running sequentially; concurrent
+// handling would race status transitions and corrupt per-pane state.
+const paneContentCache = new Map<string, PaneCacheState>()
+
+export type RefreshWorkerRequest =
+  | {
+      id: string
+      kind: 'refresh'
+      managedSession: string
+      discoverPrefixes: string[]
+      // Runtime value from the main process; the worker's own config only
+      // reflects the env at spawn time and would go stale when the setting
+      // is changed from the UI.
+      preferWindowName?: boolean
+    }
+  | {
+      id: string
+      kind: 'last-user-message'
+      tmuxWindow: string
+      scrollbackLines?: number
+      agentType?: Session['agentType']
+    }
+  | {
+      id: string
+      kind: 'shutdown'
+    }
+
+export type RefreshWorkerResponse =
+  | {
+      id: string
+      kind: 'refresh'
+      type: 'result'
+      sessions: Session[]
+      // tmux server pid from the enumeration (incarnation marker for the
+      // session catalog; 0 when the server is too old to expand #{pid}).
+      tmuxServerPid: number
+    }
+  | {
+      id: string
+      kind: 'last-user-message'
+      type: 'result'
+      message: string | null
+    }
+  | {
+      id: string
+      kind: 'error'
+      type: 'error'
+      error: string
+      errorCode?: typeof TMUX_TIMEOUT_ERROR_CODE
+    }
+
+const ctx = self as DedicatedWorkerGlobalScope
+
+ctx.onmessage = (event: MessageEvent<RefreshWorkerRequest>) => {
+  const payload = event.data
+  if (!payload || !payload.id) {
+    return
+  }
+
+  try {
+    if (payload.kind === 'shutdown') {
+      ctx.close()
+      return
+    }
+
+    if (payload.kind === 'last-user-message') {
+      const scrollback = captureScrollback(
+        payload.tmuxWindow,
+        payload.scrollbackLines ?? LAST_USER_MESSAGE_SCROLLBACK_LINES
+      )
+      const message = extractRecentUserMessagesFromTmux(scrollback, 1, payload.agentType)[0] ?? null
+      const response: RefreshWorkerResponse = {
+        id: payload.id,
+        kind: 'last-user-message',
+        type: 'result',
+        message,
+      }
+      ctx.postMessage(response)
+      return
+    }
+
+    const { sessions, tmuxServerPid } = listAllWindows(
+      payload.managedSession,
+      payload.discoverPrefixes,
+      payload.preferWindowName ?? config.preferWindowName
+    )
+
+    // Clean up cache entries for windows that no longer exist
+    const currentWindows = new Set(sessions.map((s) => s.tmuxWindow))
+    for (const key of paneContentCache.keys()) {
+      if (!currentWindows.has(key)) {
+        paneContentCache.delete(key)
+      }
+    }
+
+    const response: RefreshWorkerResponse = {
+      id: payload.id,
+      kind: 'refresh',
+      type: 'result',
+      sessions,
+      tmuxServerPid,
+    }
+    ctx.postMessage(response)
+  } catch (error) {
+    const response: RefreshWorkerResponse = {
+      id: payload.id,
+      kind: 'error',
+      type: 'error',
+      error: error instanceof Error ? error.message : String(error),
+      errorCode: isTmuxTimeoutError(error) ? TMUX_TIMEOUT_ERROR_CODE : undefined,
+    }
+    ctx.postMessage(response)
+  }
+}
+
+function runTmux(args: string[]): string {
+  const command = getTmuxCommand(args)
+  const result = Bun.spawnSync(['tmux', ...args], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    timeout: config.tmuxTimeoutMs,
+    env: sanitizedTmuxEnv(),
+  })
+  if (result.signalCode === 'SIGTERM' || result.exitCode === null) {
+    throw new TmuxTimeoutError(command, config.tmuxTimeoutMs)
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(`tmux ${command} failed: ${result.stderr.toString()}`)
+  }
+  return result.stdout.toString()
+}
+
+function runParsedTmux(args: string[]): string {
+  return runTmux(withTmuxUtf8Flag(args))
+}
+
+function getTmuxCommand(args: string[]): string {
+  return args[0] === '-u' ? args[1] ?? 'command' : args[0] ?? 'command'
+}
+
+function isTmuxFormatError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const msg = error.message.toLowerCase()
+  return msg.includes('format') || msg.includes('unknown variable')
+}
+
+function listAllWindowData(): WindowData[] {
+  let output: string
+  try {
+    output = runParsedTmux(['list-windows', '-a', '-F', BATCH_WINDOW_FORMAT])
+  } catch (error) {
+    if (!isTmuxFormatError(error)) {
+      throw error
+    }
+    output = runParsedTmux(['list-windows', '-a', '-F', BATCH_WINDOW_FORMAT_FALLBACK])
+  }
+
+  return splitTmuxLines(output)
+    .flatMap((line) => {
+      // The fallback format omits the trailing identity fields, so both
+      // widths are valid; missing fields parse as untagged.
+      const parts = splitTmuxFields(line, 12) ?? splitTmuxFields(line, 9)
+      if (!parts) {
+        return []
+      }
+      return {
+        sessionName: parts[0] ?? '',
+        windowId: parts[1] ?? '',
+        windowName: parts[2] ?? '',
+        path: parts[3] ?? '',
+        activity: Number.parseInt(parts[4] ?? '0', 10) || 0,
+        creation: Number.parseInt(parts[5] ?? '0', 10) || 0,
+        command: normalizePaneStartCommand(parts[6] ?? ''),
+        width: Number.parseInt(parts[7] ?? '80', 10) || 80,
+        height: Number.parseInt(parts[8] ?? '24', 10) || 24,
+        serverPid: Number.parseInt(parts[9] ?? '0', 10) || 0,
+        boardId: parts[10] ?? '',
+        runId: parts[11] ?? '',
+      }
+    })
+}
+
+function capturePane(tmuxWindow: string): string | null {
+  try {
+    const result = Bun.spawnSync(
+      ['tmux', ...withTmuxUtf8Flag([
+        'capture-pane',
+        '-t',
+        tmuxWindow,
+        '-p',
+        '-J',
+      ])],
+      {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: config.tmuxTimeoutMs,
+        env: sanitizedTmuxEnv(),
+      }
+    )
+    if (result.signalCode === 'SIGTERM' || result.exitCode === null) {
+      return null
+    }
+    if (result.exitCode !== 0) {
+      return null
+    }
+    const lines = result.stdout.toString().split('\n')
+    while (lines.length > 0 && lines[lines.length - 1]?.trim() === '') {
+      lines.pop()
+    }
+    return lines.slice(-30).join('\n')
+  } catch {
+    return null
+  }
+}
+
+function captureScrollback(tmuxWindow: string, lines: number): string {
+  const safeLines = Math.max(1, lines)
+  try {
+    const result = Bun.spawnSync(
+      ['tmux', ...withTmuxUtf8Flag([
+        'capture-pane',
+        '-t',
+        tmuxWindow,
+        '-p',
+        '-J',
+        '-S',
+        `-${safeLines}`,
+      ])],
+      {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: config.tmuxTimeoutMs,
+        env: sanitizedTmuxEnv(),
+      }
+    )
+    if (result.signalCode === 'SIGTERM' || result.exitCode === null) {
+      throw new TmuxTimeoutError('capture-pane', config.tmuxTimeoutMs)
+    }
+    if (result.exitCode !== 0) {
+      return ''
+    }
+    return result.stdout.toString()
+  } catch (error) {
+    if (isTmuxTimeoutError(error)) {
+      throw error
+    }
+    return ''
+  }
+}
+
+function listAllWindows(
+  managedSession: string,
+  discoverPrefixes: string[],
+  preferWindowName: boolean
+): { sessions: Session[]; tmuxServerPid: number } {
+  const allWindows = listAllWindowData()
+  // The pid is identical on every line and survives even when all managed
+  // windows are filtered out (e.g. only the bootstrap window remains).
+  const tmuxServerPid = allWindows.find((w) => w.serverPid)?.serverPid ?? 0
+  const now = Date.now()
+  const wsPrefix = `${managedSession}-ws-`
+
+  const sessions: Session[] = []
+
+  // A session grouped with (or linked into) the managed session shows the same
+  // window ids. Listing them again as "external" duplicates every managed
+  // window, and killing a duplicate kills the real one.
+  const managedWindowIds = new Set(
+    allWindows
+      .filter((window) => window.sessionName === managedSession)
+      .map((window) => window.windowId)
+  )
+
+  for (const window of allWindows) {
+    const { sessionName } = window
+
+    if (sessionName !== managedSession && managedWindowIds.has(window.windowId)) {
+      continue
+    }
+
+    // Skip websocket proxy sessions
+    if (sessionName.startsWith(wsPrefix)) {
+      continue
+    }
+
+    // Skip the bootstrap placeholder window in every session: it is
+    // agentboard-internal bookkeeping, so another instance's base session
+    // (e.g. a dev server with a different TMUX_SESSION) must not leak into
+    // the external list either.
+    if (window.windowName === BOOTSTRAP_WINDOW_NAME) {
+      continue
+    }
+
+    // Determine source
+    let source: SessionSource
+    if (sessionName === managedSession) {
+      source = 'managed'
+    } else if (discoverPrefixes.length === 0) {
+      source = 'external'
+    } else if (discoverPrefixes.some((prefix) => sessionName.startsWith(prefix))) {
+      source = 'external'
+    } else {
+      continue // Skip sessions that don't match any prefix
+    }
+
+    const tmuxWindow = `${sessionName}:${window.windowId}`
+    const content = capturePane(tmuxWindow)
+    const { status, lastChanged } = inferStatus(
+      tmuxWindow,
+      content,
+      window.width,
+      window.height,
+      now
+    )
+
+    const creationTimestamp = window.creation ? window.creation * 1000 : now
+    const displayName = source === 'external'
+      ? resolveExternalDisplayName(sessionName, window.windowName, preferWindowName)
+      : window.windowName
+    const normalizedPath = normalizeProjectPath(window.path)
+
+    sessions.push({
+      id: tmuxWindow,
+      name: displayName,
+      tmuxWindow,
+      projectPath: normalizedPath || window.path,
+      status,
+      lastActivity: new Date(lastChanged).toISOString(),
+      createdAt: new Date(creationTimestamp).toISOString(),
+      agentType: inferAgentType(window.command),
+      source,
+      command: window.command || undefined,
+      agentboardTags:
+        window.serverPid || window.boardId || window.runId
+          ? {
+              boardId: window.boardId,
+              runId: window.runId,
+              serverPid: window.serverPid,
+            }
+          : undefined,
+    })
+  }
+
+  return { sessions, tmuxServerPid }
+}
+
+interface StatusResult {
+  status: SessionStatus
+  lastChanged: number
+}
+
+function inferStatus(
+  tmuxWindow: string,
+  content: string | null,
+  width: number,
+  height: number,
+  now: number
+): StatusResult {
+  const cached = paneContentCache.get(tmuxWindow)
+  if (content === null) {
+    const fallback = inferCachedSessionStatus({
+      prev: cached,
+      now,
+      workingGracePeriodMs: config.workingGracePeriodMs,
+    })
+    if (!fallback) {
+      return { status: 'unknown', lastChanged: now }
+    }
+    paneContentCache.set(tmuxWindow, fallback.nextCache)
+    return { status: fallback.status, lastChanged: fallback.lastChanged }
+  }
+
+  const result = inferSessionStatus({
+    prev: cached,
+    next: { content, width, height },
+    now,
+    workingGracePeriodMs: config.workingGracePeriodMs,
+  })
+
+  paneContentCache.set(tmuxWindow, result.nextCache)
+
+  return { status: result.status, lastChanged: result.lastChanged }
+}

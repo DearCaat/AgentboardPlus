@@ -1,0 +1,1773 @@
+import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { terminalMouseCell } from '../utils/terminalMouseCell'
+import { clientLog } from '../utils/clientLog'
+import type {
+  AgentSession,
+  Session,
+  SendClientMessage,
+  SessionKillSource,
+  SubscribeServerMessage,
+} from '@shared/types'
+import { useSessionStore, type ConnectionStatus } from '../stores/sessionStore'
+import { getSessionDisplayName, useSessionOrganizationStore } from '../stores/sessionOrganizationStore'
+import { useTerminal } from '../hooks/useTerminal'
+import { useIsMobileLayout } from '../hooks/useMobileLayout'
+import { useOnClickOutside } from '../hooks/useOnClickOutside'
+import { useEscapeToClose } from '../hooks/useEscapeToClose'
+import { useEdgeSwipeToOpenDrawer } from '../hooks/useEdgeSwipeToOpenDrawer'
+import { useResolvedTheme, terminalThemes } from '../stores/themeStore'
+import { useSettingsStore, getFontFamily } from '../stores/settingsStore'
+import { isIOSDevice, getEffectiveModifier, getModifierDisplay } from '../utils/device'
+import { keepA11yRowsStable } from '../utils/a11yRowStability'
+import { MEASURE_PROBE_ATTR, watchSelectedRows } from '../utils/iosSelection'
+import { formatRelativeTime } from '../utils/time'
+import { getPathLeaf } from '../utils/sessionLabel'
+import { statusClass, statusText } from '../utils/sessionStatus'
+import SessionRail from './SessionRail'
+import TerminalControls from './TerminalControls'
+import TerminalSnapshotLayer from './TerminalSnapshotLayer'
+import { shouldRejoinWrapped, useOpenSelectText, useTerminalSnapshot } from '../hooks/useTerminalSnapshot'
+import SessionOutputs from './outputs/SessionOutputs'
+import PasteStatus from './PasteStatus'
+import RecoveryDraft from './RecoveryDraft'
+import { useRecoveryDraft } from '../hooks/useRecoveryDraft'
+import { recoveryDraftIdentity } from '../utils/recoveryDraftIdentity'
+import { useBrowserPaste, type BrowserPaste } from '../hooks/useBrowserPaste'
+import { clipboardFiles } from '../utils/browserFiles'
+import SessionDrawer from './SessionDrawer'
+import MobileSessionPeek from './MobileSessionPeek'
+import SessionPreviewContent from './SessionPreviewContent'
+import {
+  AlertTriangleIcon,
+  ArrowDownIcon,
+  Copy01Icon,
+  DotsVerticalIcon,
+  Edit05Icon,
+  Menu01Icon,
+  Moon01Icon,
+  PlusIcon,
+  Settings02Icon,
+  SpinnerIcon,
+  XCloseIcon,
+} from './icons'
+import '../styles/compactMobileControls.css'
+import { ICON_SIZE, TOUCH_TARGET_CLASS, mobileButtonClass } from './controlStyles'
+
+interface TerminalProps {
+  session: Session | null
+  sessions: Session[]
+  /** Unfiltered sessions for the mobile drawer, whose list filters and sorts
+   * itself; its filter menu must offer every project, not only visible ones.
+   * Defaults to `sessions`. */
+  drawerSessions?: Session[]
+  hibernatingSession?: AgentSession | null
+  hibernatingSessions?: AgentSession[]
+  historySessions?: AgentSession[]
+  connectionStatus: ConnectionStatus
+  connectionEpoch?: number
+  sendMessage: SendClientMessage
+  subscribe: SubscribeServerMessage
+  onClose: () => void
+  onSelectSession: (sessionId: string) => void
+  onSelectHibernatingSession?: (sessionId: string) => void
+  onNewSession: () => void
+  onKillSession: (sessionId: string, source?: SessionKillSource) => void
+  onCloseTmux?: (session: Session) => void
+  onRenameSession: (sessionId: string, newName: string) => void
+  onDuplicateSession?: (sessionId: string) => void
+  onResumeSession: (sessionId: string) => void
+  onHibernateSession?: (sessionId: string) => void
+  onMoveToHistory?: (sessionId: string) => void
+  onOpenSettings: () => void
+  onOpenHistory?: () => void
+  loading?: boolean
+  error?: string | null
+}
+
+type IOSResumeInputState = 'idle' | 'focused' | 'interrupted' | 'armed'
+
+function triggerHaptic() {
+  if ('vibrate' in navigator) {
+    navigator.vibrate(10)
+  }
+}
+
+export default function Terminal({
+  session,
+  sessions,
+  drawerSessions,
+  hibernatingSession = null,
+  hibernatingSessions = [],
+  historySessions = [],
+  connectionStatus,
+  connectionEpoch = 0,
+  sendMessage: sendRawMessage,
+  subscribe,
+  onClose: _onClose,
+  onSelectSession,
+  onSelectHibernatingSession,
+  onNewSession,
+  onKillSession,
+  onCloseTmux,
+  onRenameSession,
+  onDuplicateSession,
+  onResumeSession,
+  onHibernateSession,
+  onMoveToHistory,
+  onOpenSettings,
+  onOpenHistory,
+  loading = false,
+  error = null,
+}: TerminalProps) {
+  const resetNativeInputRef = useRef<((afterPaste?: boolean) => void) | undefined>(undefined)
+  const [pasteStatus, setPasteStatus] = useState<'idle' | 'sending' | 'unconfirmed'>('idle')
+  const nextPasteId = useRef(0)
+  const pendingPaste = useRef<{ id: number; sessionId: string; timer: ReturnType<typeof setTimeout> } | null>(null)
+  const finishPaste = useCallback((status: typeof pasteStatus) => {
+    if (pendingPaste.current) clearTimeout(pendingPaste.current.timer)
+    pendingPaste.current = null
+    setPasteStatus(status)
+  }, [])
+  useLayoutEffect(() => {
+    finishPaste('idle')
+    return () => {
+      if (pendingPaste.current) clearTimeout(pendingPaste.current.timer)
+      pendingPaste.current = null
+    }
+  }, [session?.id, connectionEpoch, finishPaste])
+  useEffect(() => {
+    if (connectionStatus !== 'connected' && pendingPaste.current) finishPaste('unconfirmed')
+  }, [connectionStatus, finishPaste])
+  const subscribeTerminal = useCallback<SubscribeServerMessage>((listener) => subscribe((message) => {
+    const pending = pendingPaste.current
+    if (message.type === 'terminal-paste-result' && pending &&
+        message.pasteId === pending.id && message.sessionId === pending.sessionId) {
+      finishPaste(message.ok ? 'idle' : 'unconfirmed')
+    }
+    listener(message)
+  }), [subscribe, finishPaste])
+  const sendMessage = useCallback<SendClientMessage>((message) => {
+    if (message.type === 'terminal-paste' && pendingPaste.current) return true
+    if (message.type === 'terminal-input') resetNativeInputRef.current?.()
+    if (message.type !== 'terminal-paste') return sendRawMessage(message)
+    const id = ++nextPasteId.current
+    const sent = sendRawMessage({ ...message, pasteId: id })
+    if (sent === false) return false
+    resetNativeInputRef.current?.(true)
+    const timer = setTimeout(() => finishPaste('unconfirmed'), 30_000)
+    pendingPaste.current = { id, sessionId: message.sessionId, timer }
+    setPasteStatus('sending')
+    return sent
+  }, [sendRawMessage, finishPaste])
+  void _onClose // Keep for interface compatibility
+  const theme = useResolvedTheme()
+  const terminalTheme = terminalThemes[theme]
+  const compactMobileControls = useSettingsStore((state) => state.compactMobileControls)
+  const showMobileSessionPeek = useSettingsStore((state) => state.showMobileSessionPeek)
+  const useWebGL = useSettingsStore((state) => state.useWebGL)
+  const fontSize = useSettingsStore((state) => state.fontSize)
+  const lineHeight = useSettingsStore((state) => state.lineHeight)
+  const letterSpacing = useSettingsStore((state) => state.letterSpacing)
+  const fontOption = useSettingsStore((state) => state.fontOption)
+  const customFontFamily = useSettingsStore((state) => state.customFontFamily)
+  const fontFamily = getFontFamily(fontOption, customFontFamily)
+  const shortcutModifier = useSettingsStore((state) => state.shortcutModifier)
+  const modDisplay = getModifierDisplay(getEffectiveModifier(shortcutModifier))
+  const isiOS = isIOSDevice()
+  const isMobileLayout = useIsMobileLayout()
+  const [showScrollButton, setShowScrollButton] = useState(false)
+  const [isSelectingText, setIsSelectingText] = useState(false)
+  const [showEndConfirm, setShowEndConfirm] = useState(false)
+  const [showMoreMenu, setShowMoreMenu] = useState(false)
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false)
+  const [isRenaming, setIsRenaming] = useState(false)
+  const [renameValue, setRenameValue] = useState('')
+  const lastSelectionInsideRef = useRef(false)
+  const clearIOSSelectionRef = useRef<(() => void) | null>(null)
+  const moreMenuRef = useRef<HTMLDivElement>(null)
+  const renameInputRef = useRef<HTMLInputElement>(null)
+  const endSessionButtonRef = useRef<HTMLButtonElement>(null)
+  const pasteFilesRef = useRef<(input: BrowserPaste) => void>(() => {})
+  const pasteErrorRef = useRef<(message: string) => void>(() => {})
+  const isRemoteSession = session?.remote === true
+  const remoteAllowControl = useSessionStore((s) => s.remoteAllowControl)
+  const remoteAllowAttach = useSessionStore((s) => s.remoteAllowAttach)
+  const isReadOnly = isRemoteSession && !remoteAllowAttach
+  const canControl = !isRemoteSession || (remoteAllowControl && session?.source === 'managed')
+  const sessionOrganizationEntry = useSessionOrganizationStore((state) =>
+    session ? state.organization.sessions[session.id] : undefined
+  )
+  const hibernatingOrganizationTitle = useSessionOrganizationStore((state) =>
+    hibernatingSession
+      ? state.organization.sessions[hibernatingSession.sessionId]?.title
+      : undefined
+  )
+  const sessionDisplayName = session
+    ? getSessionDisplayName(session, sessionOrganizationEntry)
+    : ''
+  const hibernatingDisplayName = hibernatingSession
+    ? hibernatingOrganizationTitle?.trim() ||
+      hibernatingSession.displayName ||
+      getPathLeaf(hibernatingSession.projectPath) ||
+      hibernatingSession.sessionId.slice(0, 8)
+    : ''
+  const hibernatingProjectName = hibernatingSession ? getPathLeaf(hibernatingSession.projectPath) : ''
+  const hibernatingLastActivity = hibernatingSession
+    ? formatRelativeTime(hibernatingSession.lastActivityAt)
+    : ''
+  const canHibernate =
+    !!session &&
+    !!onHibernateSession &&
+    session.source === 'managed' &&
+    !session.remote &&
+    !!session.agentSessionId?.trim()
+
+  // Matches SessionList's showHostInfo: host badge only when >1 host exists
+  const showHostBadge = useMemo(() => {
+    const hosts = new Set<string>()
+    for (const s of sessions) if (s.host?.trim()) hosts.add(s.host.trim())
+    for (const s of hibernatingSessions) if (s.host?.trim()) hosts.add(s.host.trim())
+    return hosts.size > 1
+  }, [sessions, hibernatingSessions])
+
+  const recoveryIdentity = session && !isReadOnly
+    ? recoveryDraftIdentity(session) : null
+  const recoveryDraft = useRecoveryDraft(recoveryIdentity)
+
+  const {
+    resetNativeInput,
+    containerRef,
+    terminalRef,
+    inTmuxCopyModeRef,
+    isTmuxCopyMode,
+    appMouseRef,
+    setTmuxCopyMode,
+    sendWheelScroll,
+    isSwitching,
+    isInputReady,
+    pendingClipboardOffer,
+    copyPendingClipboardOffer,
+    dismissPendingClipboardOffer,
+  } = useTerminal({
+    sessionId: session?.id ?? null,
+    tmuxTarget: session?.tmuxWindow ?? null,
+    agentType: session?.agentType,
+    agentSessionId: session?.agentSessionId,
+    onPasteFiles: (input) => pasteFilesRef.current(input),
+    onPasteError: (message) => pasteErrorRef.current(message),
+    allowAttach: !isReadOnly,
+    deferInput: recoveryDraft.pending,
+    onDeferredInput: recoveryDraft.capture,
+    connectionStatus,
+    connectionEpoch,
+    sendMessage,
+    subscribe: subscribeTerminal,
+    theme: terminalTheme,
+    fontSize,
+    lineHeight,
+    letterSpacing,
+    fontFamily,
+    useWebGL,
+    onScrollChange: (isAtBottom) => {
+      setShowScrollButton(!isAtBottom)
+    },
+  })
+
+  resetNativeInputRef.current = resetNativeInput
+  const snapshot = useTerminalSnapshot({ sessionId: session?.id ?? null, sendMessage, subscribe })
+  const snapshotOpen = snapshot.state.status !== 'closed'
+  const handleSelectText = useOpenSelectText(snapshot.open, clearIOSSelectionRef)
+  const rejoinWrapped = shouldRejoinWrapped(snapshot.state, session?.agentType)
+
+  const scrollToBottom = useCallback(() => {
+    // Exit tmux copy-mode to return to live output (oracle recommendation)
+    if (!session || isReadOnly) return
+    sendMessage({ type: 'tmux-cancel-copy-mode', sessionId: session.id })
+    setTmuxCopyMode(false)
+    terminalRef.current?.scrollToBottom()
+  }, [session, isReadOnly, sendMessage, setTmuxCopyMode, terminalRef])
+
+  // Edge swipe to open drawer
+  const handleOpenDrawer = useCallback(() => {
+    setIsDrawerOpen(true)
+    triggerHaptic()
+  }, [])
+  const isEdgeSwipingRef = useEdgeSwipeToOpenDrawer({
+    enabled: isMobileLayout || isiOS,
+    isOpen: isDrawerOpen,
+    onOpen: handleOpenDrawer,
+  })
+
+  // Close drawer when switching to desktop layout
+  useEffect(() => {
+    if (!isMobileLayout && !isiOS && isDrawerOpen) {
+      setIsDrawerOpen(false)
+    }
+  }, [isDrawerOpen, isMobileLayout, isiOS])
+
+  // Close more menu when clicking outside
+  const handleCloseMoreMenu = useCallback(() => setShowMoreMenu(false), [])
+  useOnClickOutside(moreMenuRef, showMoreMenu, handleCloseMoreMenu)
+
+  // Focus rename input when renaming
+  useEffect(() => {
+    if (isRenaming && renameInputRef.current) {
+      renameInputRef.current.focus()
+      renameInputRef.current.select()
+    }
+  }, [isRenaming])
+
+  // Focus kill session button when confirm modal opens
+  useEffect(() => {
+    if (showEndConfirm && endSessionButtonRef.current) {
+      endSessionButtonRef.current.focus()
+    }
+  }, [showEndConfirm])
+
+  // Handle Escape key to close confirm modal
+  const handleCloseConfirm = useCallback(() => setShowEndConfirm(false), [])
+  useEscapeToClose(showEndConfirm, handleCloseConfirm)
+
+  const handleEndSession = () => {
+    if (!session) return
+    onKillSession(session.id, 'terminal_confirm_modal')
+    setShowEndConfirm(false)
+  }
+
+  const handleHibernateSession = () => {
+    if (!session || !canHibernate) return
+    onHibernateSession?.(session.agentSessionId!.trim())
+    setShowMoreMenu(false)
+  }
+
+  const handleStartRename = () => {
+    if (!session) return
+    setRenameValue(session.agentSessionName || session.name)
+    setIsRenaming(true)
+    setShowMoreMenu(false)
+  }
+
+  const handleRenameSubmit = () => {
+    if (!session) return
+    const trimmed = renameValue.trim()
+    const displayName = session.agentSessionName || session.name
+    if (trimmed && trimmed !== displayName) {
+      onRenameSession(session.id, trimmed)
+    }
+    setIsRenaming(false)
+  }
+
+  const handleRenameKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      handleRenameSubmit()
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      setIsRenaming(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!isiOS || !session) {
+      setIsSelectingText(false)
+      return
+    }
+
+    const container = containerRef.current
+    if (!container) return
+
+    const isSelectionInside = (sel: Selection) => {
+      const a11yTree = container.querySelector('.xterm-accessibility-tree')
+      if (!a11yTree) return false
+      const anchor = sel.anchorNode
+      const focus = sel.focusNode
+      return (!!anchor && a11yTree.contains(anchor)) || (!!focus && a11yTree.contains(focus))
+    }
+
+    const forceA11yRepaint = () => {
+      const a11yRoot = container.querySelector('.xterm-accessibility') as HTMLElement | null
+      const a11yTree = container.querySelector('.xterm-accessibility-tree') as HTMLElement | null
+      if (!a11yRoot || !a11yTree) return
+
+      a11yRoot.style.setProperty('opacity', '0')
+      a11yTree.style.setProperty('opacity', '0')
+      a11yRoot.style.setProperty('-webkit-user-select', 'none')
+      a11yRoot.style.setProperty('user-select', 'none')
+      a11yTree.style.setProperty('-webkit-user-select', 'none')
+      a11yTree.style.setProperty('user-select', 'none')
+      void a11yRoot.offsetHeight // Force reflow
+
+      requestAnimationFrame(() => {
+        a11yRoot.style.removeProperty('opacity')
+        a11yTree.style.removeProperty('opacity')
+        a11yRoot.style.removeProperty('-webkit-user-select')
+        a11yRoot.style.removeProperty('user-select')
+        a11yTree.style.removeProperty('-webkit-user-select')
+        a11yTree.style.removeProperty('user-select')
+      })
+    }
+
+    // Clears the native highlight once output rewrites a row it covers, so it
+    // never sits over text that was not selected. Lives as long as the selection.
+    let stopWatchingRows: (() => void) | null = null
+    const stopRowWatch = () => {
+      stopWatchingRows?.()
+      stopWatchingRows = null
+    }
+
+    // Hard-clear iOS selection by removing ranges and forcing a11y repaint
+    const clearIOSSelection = () => {
+      stopRowWatch()
+      lastSelectionInsideRef.current = false
+      const sel = window.getSelection()
+      try { sel?.removeAllRanges() } catch {}
+      terminalRef.current?.clearSelection()
+      forceA11yRepaint()
+      setIsSelectingText(false)
+    }
+
+    clearIOSSelectionRef.current = clearIOSSelection
+
+    const onSelectionChange = () => {
+      const sel = window.getSelection()
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+        if (lastSelectionInsideRef.current) {
+          clearIOSSelection()
+        } else {
+          stopRowWatch()
+          // Only update if currently true to avoid unnecessary re-renders
+          setIsSelectingText((prev) => prev ? false : prev)
+        }
+        return
+      }
+
+      const selectionInside = isSelectionInside(sel)
+      if (!selectionInside && lastSelectionInsideRef.current) {
+        clearIOSSelection()
+        return
+      }
+
+      lastSelectionInsideRef.current = selectionInside
+      if (selectionInside && !stopWatchingRows) {
+        const a11yTree = container.querySelector('.xterm-accessibility-tree')
+        if (a11yTree) {
+          stopWatchingRows = watchSelectedRows(a11yTree, () => window.getSelection(), clearIOSSelection)
+        }
+      }
+      const newValue = selectionInside
+      // Only update if value changed
+      setIsSelectingText((prev) => prev !== newValue ? newValue : prev)
+    }
+
+    const onCopy = () => {
+      const sel = window.getSelection()
+      if (!sel || sel.isCollapsed) return
+      if (!isSelectionInside(sel)) return
+
+      setTimeout(clearIOSSelection, 0)
+    }
+
+    // Track touch movement to distinguish taps from drags
+    const TAP_MOVE_THRESHOLD = 10
+    let selectionTouchStart: { x: number; y: number } | null = null
+    let selectionTouchMoved = false
+
+    const onTouchStart = (event: TouchEvent) => {
+      if (event.touches.length === 1) {
+        const touch = event.touches[0]
+        selectionTouchStart = { x: touch.clientX, y: touch.clientY }
+        selectionTouchMoved = false
+      }
+    }
+
+    const onTouchMove = (event: TouchEvent) => {
+      if (selectionTouchMoved || !selectionTouchStart || event.touches.length !== 1) return
+      const touch = event.touches[0]
+      const dx = Math.abs(touch.clientX - selectionTouchStart.x)
+      const dy = Math.abs(touch.clientY - selectionTouchStart.y)
+      if (dx > TAP_MOVE_THRESHOLD || dy > TAP_MOVE_THRESHOLD) {
+        selectionTouchMoved = true
+      }
+    }
+
+    const onTouchEnd = (event: TouchEvent) => {
+      const wasDrag = selectionTouchMoved
+      selectionTouchStart = null
+      selectionTouchMoved = false
+
+      const sel = window.getSelection()
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+        setIsSelectingText(false)
+        return
+      }
+
+      const a11yTree = container.querySelector('.xterm-accessibility-tree')
+      if (!a11yTree) return
+
+      if (!isSelectionInside(sel)) {
+        setIsSelectingText(false)
+        return
+      }
+
+      // If user was dragging (extending selection), don't clear - they're still selecting
+      if (wasDrag) {
+        return
+      }
+
+      // Only clear on taps outside the selection (to dismiss it)
+      const target = event.target as Node | null
+      const targetInTree = target ? a11yTree.contains(target) : false
+
+      let targetInSelection = false
+      if (targetInTree && target) {
+        try {
+          targetInSelection = sel.containsNode(target, true)
+        } catch {
+          targetInSelection = false
+        }
+      }
+
+      if (!targetInTree || !targetInSelection) {
+        setTimeout(clearIOSSelection, 0)
+      }
+    }
+
+    document.addEventListener('selectionchange', onSelectionChange)
+    document.addEventListener('copy', onCopy)
+    document.addEventListener('touchstart', onTouchStart, { passive: true })
+    document.addEventListener('touchmove', onTouchMove, { passive: true })
+    document.addEventListener('touchend', onTouchEnd, { passive: true })
+
+    return () => {
+      document.removeEventListener('selectionchange', onSelectionChange)
+      document.removeEventListener('copy', onCopy)
+      document.removeEventListener('touchstart', onTouchStart)
+      document.removeEventListener('touchmove', onTouchMove)
+      document.removeEventListener('touchend', onTouchEnd)
+      stopRowWatch()
+      clearIOSSelectionRef.current = null
+      lastSelectionInsideRef.current = false
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- use session?.id to avoid re-running on session data changes
+  }, [containerRef, isiOS, session?.id])
+
+  useEffect(() => {
+    if (!isiOS) return
+    const container = containerRef.current
+    if (!container) return
+
+    let disposeRowStability: (() => void) | null = null
+
+    const syncA11yOverlay = () => {
+      const terminal = terminalRef.current
+      const root = container.querySelector('.xterm') as HTMLElement | null
+      if (!terminal || !root) return
+
+      const screen = root.querySelector('.xterm-screen') as HTMLElement | null
+      const a11yRoot = root.querySelector('.xterm-accessibility') as HTMLElement | null
+      const a11yTree = root.querySelector('.xterm-accessibility-tree') as HTMLElement | null
+      if (!screen || !a11yRoot || !a11yTree) return
+
+      // Armed here rather than on mount because xterm builds the tree lazily;
+      // this runs again on rAF, a timeout and viewport resizes until it exists.
+      if (!disposeRowStability) disposeRowStability = keepA11yRowsStable(a11yTree)
+
+      // 1) Position a11y overlay to match the screen rect (handles padding without transforms)
+      const rootRect = root.getBoundingClientRect()
+      const screenRect = screen.getBoundingClientRect()
+
+      const left = screenRect.left - rootRect.left
+      const top = screenRect.top - rootRect.top
+
+      Object.assign(a11yRoot.style, {
+        left: `${left}px`,
+        top: `${top}px`,
+        right: 'auto',
+        bottom: 'auto',
+        width: `${screenRect.width}px`,
+        height: `${screenRect.height}px`,
+      })
+
+      // 2) Compute canvas grid cell size
+      const cellW = screenRect.width / terminal.cols
+      const cellH = screenRect.height / terminal.rows
+
+      // 3) Measure DOM character width inside the a11y tree context
+      const probe = document.createElement('span')
+      probe.textContent = '0'.repeat(200)
+      probe.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;pointer-events:none;letter-spacing:0px'
+      probe.setAttribute(MEASURE_PROBE_ATTR, '')
+      a11yTree.appendChild(probe)
+      const domCharW = probe.getBoundingClientRect().width / 200
+      probe.remove()
+
+      // 4) Compute letter-spacing so DOM advances match the canvas grid
+      const letterSpacing = Math.max(-2, Math.min(2, cellW - domCharW))
+
+      container.style.setProperty('--xterm-font-size', `${terminal.options.fontSize}px`)
+      container.style.setProperty('--xterm-cell-height', `${cellH}px`)
+      container.style.setProperty('--xterm-a11y-letter-spacing', `${letterSpacing}px`)
+    }
+
+    const a11yStart = performance.now()
+    syncA11yOverlay()
+    const a11yMs = Math.round(performance.now() - a11yStart)
+    if (a11yMs > 10) {
+      clientLog('switch_a11y_overlay', { sessionId: session?.id, a11yMs })
+    }
+    const rafId = window.requestAnimationFrame(syncA11yOverlay)
+    const retryId = window.setTimeout(syncA11yOverlay, 100)
+
+    // Re-sync on resize/orientation changes
+    const scheduleSync = () => window.requestAnimationFrame(syncA11yOverlay)
+    window.visualViewport?.addEventListener('resize', scheduleSync)
+    window.addEventListener('orientationchange', scheduleSync)
+
+    return () => {
+      window.cancelAnimationFrame(rafId)
+      window.clearTimeout(retryId)
+      window.visualViewport?.removeEventListener('resize', scheduleSync)
+      window.removeEventListener('orientationchange', scheduleSync)
+      disposeRowStability?.()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- use session?.id to avoid re-running on session data changes
+  }, [containerRef, fontSize, isiOS, session?.id, terminalRef])
+
+  // Track isSelectingText in a ref to avoid re-running effect
+  const isSelectingTextRef = useRef(isSelectingText)
+  useEffect(() => {
+    isSelectingTextRef.current = isSelectingText
+  }, [isSelectingText])
+
+  // Track session ID in a ref for use in handlers without causing effect re-runs
+  const sessionIdRef = useRef(session?.id)
+  useEffect(() => {
+    sessionIdRef.current = session?.id
+  }, [session?.id])
+
+  // Track sendMessage in a ref to avoid effect re-runs
+  const sendMessageRef = useRef(sendMessage)
+  useEffect(() => {
+    sendMessageRef.current = sendMessage
+  }, [sendMessage])
+
+  // Flag to swallow next mouse event (after iOS selection dismissal)
+  const swallowNextMouseRef = useRef(false)
+  const iosResumeInputStateRef = useRef<IOSResumeInputState>('idle')
+
+  // iOS PWA resume can dismiss the software keyboard and then ignore a focus()
+  // delayed until touchend. Remember interrupted terminal focus and perform one
+  // refocus on the next trusted touchstart instead of opening the keyboard on resume.
+  useEffect(() => {
+    if (!isiOS) return
+    const container = containerRef.current
+    if (!container) return
+
+    let focusOutTimer: number | null = null
+    const getTextarea = () =>
+      container.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+
+    const handleFocusIn = (event: FocusEvent) => {
+      if (event.target !== getTextarea()) return
+      iosResumeInputStateRef.current = 'focused'
+    }
+
+    const handleFocusOut = (event: FocusEvent) => {
+      if (event.target !== getTextarea()) return
+      if (focusOutTimer !== null) window.clearTimeout(focusOutTimer)
+      focusOutTimer = window.setTimeout(() => {
+        focusOutTimer = null
+        const textarea = getTextarea()
+        const documentStillFocused =
+          typeof document.hasFocus !== 'function' || document.hasFocus()
+        if (
+          document.activeElement !== textarea &&
+          document.visibilityState !== 'hidden' &&
+          documentStillFocused
+        ) {
+          iosResumeInputStateRef.current = 'idle'
+        }
+      }, 0)
+    }
+
+    const rememberInterruptedFocus = () => {
+      const textarea = getTextarea()
+      if (
+        document.activeElement === textarea ||
+        iosResumeInputStateRef.current === 'focused'
+      ) {
+        iosResumeInputStateRef.current = 'interrupted'
+      }
+    }
+
+    const armResumeRefocus = () => {
+      if (iosResumeInputStateRef.current === 'interrupted') {
+        iosResumeInputStateRef.current = 'armed'
+      }
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        rememberInterruptedFocus()
+      } else {
+        armResumeRefocus()
+      }
+    }
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) armResumeRefocus()
+    }
+
+    document.addEventListener('focusin', handleFocusIn)
+    document.addEventListener('focusout', handleFocusOut)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    window.addEventListener('blur', rememberInterruptedFocus)
+    window.addEventListener('focus', armResumeRefocus)
+    window.addEventListener('pageshow', handlePageShow)
+
+    return () => {
+      document.removeEventListener('focusin', handleFocusIn)
+      document.removeEventListener('focusout', handleFocusOut)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      window.removeEventListener('blur', rememberInterruptedFocus)
+      window.removeEventListener('focus', armResumeRefocus)
+      window.removeEventListener('pageshow', handlePageShow)
+      if (focusOutTimer !== null) window.clearTimeout(focusOutTimer)
+      iosResumeInputStateRef.current = 'idle'
+    }
+  }, [containerRef, isiOS, session?.id])
+
+  // Touch scroll with native long-press selection
+  // Single tap focuses terminal for keyboard input
+  useEffect(() => {
+    const container = containerRef.current
+    const touchSession = session?.id
+    if (!container || !touchSession) return
+
+    // Check if mobile or iOS (iOS needs touch scroll even in landscape where width > 767px)
+    if (!isMobileLayout && !isiOS) return
+    const TAP_MOVE_THRESHOLD = 6 // pixels - allows small jitter without canceling taps
+    const LONG_PRESS_MS = 350
+
+    let touchStartPos = { clientX: 0, clientY: 0 }
+    let touchStartTime = 0
+    let hasMoved = false
+    let lastTouchY: number | null = null
+    let lastTouchTime = 0
+    let velocity = 0
+    let accumulatedDelta = 0
+    let lineHeightPx = Math.round(fontSize * lineHeight)
+    let momentumAnimationId: number | null = null
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null
+    let remoteSelectionActive = false
+    let remoteSelectionLastCell: { col: number; row: number } | null = null
+
+    const resolveLineHeight = () => {
+      const computed = window.getComputedStyle(container)
+      const cssValue = computed.getPropertyValue('--xterm-cell-height').trim()
+      const parsed = Number.parseFloat(cssValue)
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        return parsed
+      }
+      return Math.round(fontSize * lineHeight)
+    }
+
+    const getTextarea = () =>
+      container.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+
+    const getTouchCell = (touch: Pick<Touch, 'clientX' | 'clientY'>) => {
+      const terminal = terminalRef.current
+      return terminal ? terminalMouseCell(container, terminal, touch) : null
+    }
+
+    const disableTextareaIfIdle = () => {
+      const current = getTextarea()
+      if (!current) return
+      if (document.activeElement !== current) {
+        current.disabled = true
+      }
+    }
+
+    const enableTextarea = () => {
+      const current = getTextarea()
+      if (!current) return
+      current.disabled = false
+    }
+
+    // Keep textarea disabled to prevent auto-focus, but don't break active input sessions.
+    disableTextareaIfIdle()
+
+    const focusTerminalInput = () => {
+      // Don't focus if in tmux copy-mode (scrolled back) - user should use scroll-to-bottom button
+      if (inTmuxCopyModeRef.current) {
+        return
+      }
+
+      // Enable and focus - don't re-disable on blur to prevent keyboard dismissal
+      // The textarea will be re-disabled when session changes (effect cleanup)
+      const current = getTextarea()
+      if (!current) return
+      current.disabled = false
+      current.focus()
+    }
+
+    const stopMomentum = () => {
+      if (momentumAnimationId !== null) {
+        cancelAnimationFrame(momentumAnimationId)
+        momentumAnimationId = null
+      }
+      velocity = 0
+    }
+
+    const clearLongPressTimer = () => {
+      if (longPressTimer !== null) {
+        clearTimeout(longPressTimer)
+        longPressTimer = null
+      }
+    }
+
+    const sendMouseToApp = (
+      button: number,
+      cell: { col: number; row: number },
+      final: 'M' | 'm'
+    ): boolean => {
+      const currentSessionId = sessionIdRef.current
+      if (!currentSessionId) return false
+
+      sendMessageRef.current({
+        type: 'terminal-input',
+        sessionId: currentSessionId,
+        data: `\x1b[<${button};${cell.col};${cell.row}${final}`,
+      })
+      return true
+    }
+
+    const sendTapClickToApp = (touch: Touch): boolean => {
+      const currentSessionId = sessionIdRef.current
+      const cell = getTouchCell(touch)
+      if (!currentSessionId || !cell) return false
+
+      sendMessageRef.current({
+        type: 'terminal-input',
+        sessionId: currentSessionId,
+        data: `\x1b[<0;${cell.col};${cell.row}M\x1b[<0;${cell.col};${cell.row}m`,
+      })
+      return true
+    }
+
+    const startRemoteSelection = (point: Pick<Touch, 'clientX' | 'clientY'>): boolean => {
+      if (!isiOS || !appMouseRef.current) return false
+      const cell = getTouchCell(point)
+      if (!cell) return false
+
+      remoteSelectionActive = true
+      remoteSelectionLastCell = cell
+      disableTextareaIfIdle()
+      triggerHaptic()
+      return sendMouseToApp(0, cell, 'M')
+    }
+
+    const dragRemoteSelection = (touch: Touch): boolean => {
+      const cell = getTouchCell(touch)
+      if (!cell) return false
+      if (
+        remoteSelectionLastCell &&
+        remoteSelectionLastCell.col === cell.col &&
+        remoteSelectionLastCell.row === cell.row
+      ) {
+        return true
+      }
+
+      remoteSelectionLastCell = cell
+      return sendMouseToApp(32, cell, 'M')
+    }
+
+    const endRemoteSelection = (touch: Touch | undefined): boolean => {
+      const cell = touch ? getTouchCell(touch) : remoteSelectionLastCell
+      remoteSelectionActive = false
+      remoteSelectionLastCell = null
+      if (!cell) return false
+      return sendMouseToApp(0, cell, 'm')
+    }
+
+    const resetTouchState = () => {
+      clearLongPressTimer()
+      remoteSelectionActive = false
+      remoteSelectionLastCell = null
+      lastTouchY = null
+      velocity = 0
+      accumulatedDelta = 0
+    }
+
+    const hasActiveSelection = () => {
+      if (!isiOS) return false
+      const selection = window.getSelection()
+      if (!selection || selection.isCollapsed) return false
+      const a11yTree = container.querySelector('.xterm-accessibility-tree')
+      if (!a11yTree) return false
+      const anchor = selection.anchorNode
+      const focus = selection.focusNode
+      return (!!anchor && a11yTree.contains(anchor)) || (!!focus && a11yTree.contains(focus))
+    }
+
+    const maybeClearStaleSelection = () => {
+      if (!isiOS || !lastSelectionInsideRef.current) return
+      if (!hasActiveSelection()) {
+        clearIOSSelectionRef.current?.()
+      }
+    }
+
+    const handleTouchStart = (e: TouchEvent) => {
+      stopMomentum()
+      if (import.meta.env.VITE_IOS_NATIVE_PASTE_PROTOTYPE === '1') {
+        const textarea = getTextarea()
+        clientLog('ios_native_paste_touch', { target: (e.target as Element)?.className, textarea: textarea?.getBoundingClientRect().toJSON(), disabled: textarea?.disabled, standalone: window.matchMedia('(display-mode: standalone)').matches })
+      }
+      maybeClearStaleSelection()
+
+      // Skip if edge swiping (opening drawer) or drawer is open
+      if (isEdgeSwipingRef.current || isDrawerOpen) {
+        resetTouchState()
+        return
+      }
+
+      if (isSelectingTextRef.current) {
+        resetTouchState()
+        return
+      }
+
+      if (
+        iosResumeInputStateRef.current === 'armed' &&
+        !inTmuxCopyModeRef.current
+      ) {
+        iosResumeInputStateRef.current = 'idle'
+        focusTerminalInput()
+      }
+
+      if (e.touches.length === 1) {
+        const touch = e.touches[0]
+        touchStartPos = { clientX: touch.clientX, clientY: touch.clientY }
+        touchStartTime = performance.now()
+        hasMoved = false
+        lastTouchY = touch.clientY
+        lastTouchTime = touchStartTime
+        velocity = 0
+        accumulatedDelta = 0
+        lineHeightPx = resolveLineHeight()
+
+        // Enable textarea on touch start so iOS long-press paste menu works
+        enableTextarea()
+
+        if (isiOS && appMouseRef.current && !(import.meta.env.VITE_IOS_NATIVE_PASTE_PROTOTYPE !== '0' && e.target === getTextarea())) {
+          const startPoint = { clientX: touch.clientX, clientY: touch.clientY }
+          longPressTimer = setTimeout(() => {
+            longPressTimer = null
+            if (hasMoved || isEdgeSwipingRef.current || isDrawerOpen) return
+            if (isSelectingTextRef.current || hasActiveSelection()) return
+            startRemoteSelection(startPoint)
+          }, LONG_PRESS_MS)
+        }
+      }
+    }
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (e.touches.length !== 1 || lastTouchY === null) return
+      maybeClearStaleSelection()
+
+      // Skip if edge swiping (opening drawer) or drawer is open
+      if (isEdgeSwipingRef.current || isDrawerOpen) {
+        resetTouchState()
+        return
+      }
+
+      const now = performance.now()
+      const touch = e.touches[0]
+      const x = touch.clientX
+      const y = touch.clientY
+
+      if (remoteSelectionActive) {
+        e.preventDefault()
+        e.stopPropagation()
+        dragRemoteSelection(touch)
+        lastTouchY = y
+        lastTouchTime = now
+        return
+      }
+
+      if (isSelectingTextRef.current || hasActiveSelection()) {
+        resetTouchState()
+        return
+      }
+
+      e.preventDefault()
+      e.stopPropagation()
+
+      const dx = Math.abs(x - touchStartPos.clientX)
+      const dy = Math.abs(y - touchStartPos.clientY)
+      if (!hasMoved && (dx > TAP_MOVE_THRESHOLD || dy > TAP_MOVE_THRESHOLD)) {
+        hasMoved = true
+        clearLongPressTimer()
+        disableTextareaIfIdle()
+      }
+
+      const deltaY = lastTouchY - y
+      const deltaTime = now - lastTouchTime
+      lastTouchY = y
+      lastTouchTime = now
+
+      if (deltaTime > 0) {
+        const instantVelocity = deltaY / deltaTime
+        velocity = velocity * 0.7 + instantVelocity * 0.3
+      }
+
+      accumulatedDelta += deltaY
+      const threshold = Math.max(6, lineHeightPx * 0.6)
+      const scrollEvents = Math.trunc(accumulatedDelta / threshold)
+      if (scrollEvents !== 0) {
+        sendWheelScroll(touchSession, scrollEvents, touchStartPos)
+        accumulatedDelta -= scrollEvents * threshold
+      }
+    }
+
+    const handleTouchEnd = (e: TouchEvent) => {
+      const endVelocity = velocity
+      const touchDuration = performance.now() - touchStartTime
+      clearLongPressTimer()
+
+      if (remoteSelectionActive) {
+        endRemoteSelection(e.changedTouches[0])
+        resetTouchState()
+        e.preventDefault()
+        e.stopPropagation()
+        return
+      }
+
+      resetTouchState()
+
+      // Skip if edge swiping (opening drawer) or drawer is open - let document handler process
+      if (isEdgeSwipingRef.current || isDrawerOpen) {
+        return
+      }
+
+      const activeSelection = hasActiveSelection()
+      if (isSelectingTextRef.current && !activeSelection) {
+        clearIOSSelectionRef.current?.()
+      }
+
+      // If selecting text, let iOS handle the tap naturally to dismiss selection
+      // Don't preventDefault - that breaks iOS selection dismissal
+      // We'll swallow the synthetic mouse event instead to protect tmux
+      if (isSelectingTextRef.current || activeSelection) {
+        if (inTmuxCopyModeRef.current) {
+          swallowNextMouseRef.current = true
+        }
+        return
+      }
+
+      if (!hasMoved) {
+        // Let WebKit own taps and the edit callout on the experimental input target.
+        if (isiOS && import.meta.env.VITE_IOS_NATIVE_PASTE_PROTOTYPE !== '0' && e.target === getTextarea()) return
+        if (isiOS && touchDuration >= LONG_PRESS_MS) return
+        if (appMouseRef.current) {
+          const touch = e.changedTouches[0]
+          if (touch && sendTapClickToApp(touch)) {
+            focusTerminalInput()
+            e.preventDefault()
+            e.stopPropagation()
+            return
+          }
+        }
+        // If in copy-mode, prevent tap from reaching xterm.js (which would send click to tmux and exit copy-mode)
+        if (inTmuxCopyModeRef.current) {
+          e.preventDefault()
+          e.stopPropagation()
+          swallowNextMouseRef.current = true
+          return
+        }
+        focusTerminalInput()
+        return
+      }
+
+      const minVelocity = 0.12 // pixels per ms
+      if (Math.abs(endVelocity) > minVelocity) {
+        let currentVelocity = endVelocity
+        let lastFrameTime = performance.now()
+
+        const animateMomentum = () => {
+          const now = performance.now()
+          const deltaTime = now - lastFrameTime
+          lastFrameTime = now
+
+          const distance = currentVelocity * deltaTime
+          accumulatedDelta += distance
+          const threshold = Math.max(6, lineHeightPx * 0.6)
+          const scrollEvents = Math.trunc(accumulatedDelta / threshold)
+          if (scrollEvents !== 0) {
+            sendWheelScroll(touchSession, scrollEvents, touchStartPos)
+            accumulatedDelta -= scrollEvents * threshold
+          }
+
+          currentVelocity *= Math.pow(0.95, deltaTime / 16.67)
+
+          if (Math.abs(currentVelocity) > 0.02) {
+            momentumAnimationId = requestAnimationFrame(animateMomentum)
+          } else {
+            momentumAnimationId = null
+          }
+        }
+
+        momentumAnimationId = requestAnimationFrame(animateMomentum)
+      }
+    }
+
+    // iOS cancels a touch when a system gesture takes it over. Without this the
+    // long-press timer could still fire, or the app would keep a held button
+    // from a remote selection and treat the next touch as a drag.
+    const handleTouchCancel = () => {
+      clearLongPressTimer()
+      if (remoteSelectionActive) endRemoteSelection(undefined)
+      resetTouchState()
+    }
+
+    // Swallow synthetic mouse events after iOS selection dismissal to protect tmux
+    const handleMouseDown = (e: MouseEvent) => {
+      if (swallowNextMouseRef.current) {
+        e.preventDefault()
+        e.stopPropagation()
+        swallowNextMouseRef.current = false
+      }
+    }
+
+    const startOptions: AddEventListenerOptions = { passive: true, capture: true }
+    const moveOptions: AddEventListenerOptions = { passive: false, capture: true }
+    const endOptions: AddEventListenerOptions = { passive: false, capture: true } // Need passive: false to preventDefault in copy-mode
+    const mouseOptions: AddEventListenerOptions = { capture: true }
+    container.addEventListener('touchstart', handleTouchStart, startOptions)
+    container.addEventListener('touchmove', handleTouchMove, moveOptions)
+    container.addEventListener('touchend', handleTouchEnd, endOptions)
+    container.addEventListener('touchcancel', handleTouchCancel, startOptions)
+    container.addEventListener('mousedown', handleMouseDown, mouseOptions)
+
+    return () => {
+      container.removeEventListener('touchstart', handleTouchStart, startOptions)
+      container.removeEventListener('touchmove', handleTouchMove, moveOptions)
+      container.removeEventListener('touchend', handleTouchEnd, endOptions)
+      container.removeEventListener('touchcancel', handleTouchCancel, startOptions)
+      container.removeEventListener('mousedown', handleMouseDown, mouseOptions)
+      stopMomentum()
+      clearLongPressTimer()
+      // Re-enable textarea on cleanup
+      const cleanupTextarea = getTextarea()
+      if (cleanupTextarea) {
+        cleanupTextarea.disabled = false
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- use session?.id and refs to avoid re-running on unrelated changes
+  }, [session?.id, containerRef, terminalRef, isiOS, isMobileLayout, isDrawerOpen, fontSize, lineHeight, sendWheelScroll, session?.tmuxWindow, connectionStatus, connectionEpoch, isReadOnly])
+
+  const handleSendKey = useCallback(
+    (key: string) => {
+      if (!session || isReadOnly) return
+      if (recoveryDraft.pending || !isInputReady) { recoveryDraft.capture(key, 'typing'); return }
+      if (sendMessage({ type: 'terminal-input', sessionId: session.id, data: key }) === false) {
+        recoveryDraft.capture(key, 'typing')
+      }
+    },
+    [session, isReadOnly, isInputReady, sendMessage, recoveryDraft]
+  )
+
+  // Deliver pasted text as a single bracketed paste (server routes it through
+  // tmux paste-buffer -p) so multi-line content isn't auto-submitted line-by-line.
+  const handlePasteText = useCallback(
+    (text: string) => {
+      if (!session || isReadOnly) return
+      if (recoveryDraft.pending || !isInputReady) { recoveryDraft.capture(text, 'paste'); return }
+      // Exit tmux copy-mode first: a paste-buffer into a pane still in copy-mode
+      // is swallowed by the copy-mode key table instead of reaching the program.
+      if (inTmuxCopyModeRef.current) {
+        sendMessage({ type: 'tmux-cancel-copy-mode', sessionId: session.id })
+        setTmuxCopyMode(false)
+      }
+      if (sendMessage({ type: 'terminal-paste', sessionId: session.id, data: text }) === false) {
+        recoveryDraft.capture(text, 'paste')
+      }
+    },
+    [session, isReadOnly, isInputReady, sendMessage, inTmuxCopyModeRef, setTmuxCopyMode, recoveryDraft]
+  )
+
+  const handlePasteImage = useCallback((data: string) => {
+    if (!session || isReadOnly || !isInputReady || recoveryDraft.pending) return
+    if (inTmuxCopyModeRef.current) {
+      sendMessage({ type: 'tmux-cancel-copy-mode', sessionId: session.id })
+      setTmuxCopyMode(false)
+    }
+    sendMessage({ type: 'terminal-input', sessionId: session.id, data })
+  }, [session, isReadOnly, isInputReady, sendMessage, inTmuxCopyModeRef, setTmuxCopyMode, recoveryDraft.pending])
+
+  const handleRefocus = useCallback(() => {
+    const container = containerRef.current
+    if (!container) return
+    const textarea = container.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+    if (textarea) {
+      textarea.removeAttribute('disabled')
+      textarea.focus()
+    }
+  }, [containerRef])
+
+  const browserPaste = useBrowserPaste({ sessionId: session?.id ?? null,
+    disabled: connectionStatus !== 'connected' || isReadOnly || !isInputReady || recoveryDraft.pending,
+    fileUploadsAllowed: !isRemoteSession,
+    remoteImageSessionId: isRemoteSession ? session?.id : undefined, agentType: session?.agentType,
+    onPasteText: handlePasteText, onPasteImage: handlePasteImage, onRefocus: handleRefocus })
+  pasteFilesRef.current = browserPaste.paste
+  pasteErrorRef.current = browserPaste.fail
+
+  const sendRecoveryDraft = () => {
+    if (!session || isReadOnly || !isInputReady || !recoveryDraft.text || recoveryDraft.persistence === 'sent-remove-failed') return
+    if (inTmuxCopyModeRef.current) {
+      sendMessage({ type: 'tmux-cancel-copy-mode', sessionId: session.id })
+      setTmuxCopyMode(false)
+    }
+    if (sendMessage({ type: 'terminal-paste', sessionId: session.id, data: recoveryDraft.text }) === false) return
+    recoveryDraft.sent()
+    handleRefocus()
+  }
+
+  const isKeyboardVisible = useCallback(() => {
+    if (typeof document === 'undefined') return false
+    const container = containerRef.current
+    if (!container) return false
+    const textarea = container.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+    if (textarea && document.activeElement === textarea) {
+      return true
+    }
+
+    const activeElement = document.activeElement
+    const inputActive =
+      typeof HTMLInputElement !== 'undefined' && activeElement instanceof HTMLInputElement
+    const textareaActive =
+      typeof HTMLTextAreaElement !== 'undefined' && activeElement instanceof HTMLTextAreaElement
+    if (inputActive || textareaActive) {
+      return false
+    }
+    if (activeElement && (activeElement as HTMLElement).isContentEditable) {
+      return false
+    }
+
+    return !!document.documentElement?.classList?.contains('keyboard-visible')
+  }, [containerRef])
+
+  useEffect(() => {
+    if (!isiOS) return
+    const container = containerRef.current
+    if (!container) return
+
+    const a11yRoot = container.querySelector('.xterm-accessibility') as HTMLElement | null
+    const a11yTree = container.querySelector('.xterm-accessibility-tree') as HTMLElement | null
+    if (!a11yRoot || !a11yTree) return
+
+    const updatePointerEvents = () => {
+      const textarea = container.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null
+      const keyboardVisible = textarea ? document.activeElement === textarea : false
+      if (keyboardVisible && !isSelectingTextRef.current) {
+        a11yRoot.style.pointerEvents = 'none'
+        a11yTree.style.pointerEvents = 'none'
+      } else {
+        a11yRoot.style.removeProperty('pointer-events')
+        a11yTree.style.removeProperty('pointer-events')
+      }
+    }
+
+    updatePointerEvents()
+
+    document.addEventListener('focusin', updatePointerEvents)
+    document.addEventListener('focusout', updatePointerEvents)
+    return () => {
+      document.removeEventListener('focusin', updatePointerEvents)
+      document.removeEventListener('focusout', updatePointerEvents)
+    }
+  }, [containerRef, isiOS, isSelectingText])
+
+  // While the hibernation overlay is up, mark the terminal underneath as `inert`
+  // rather than just `aria-hidden`: inert also drops its xterm helper textarea out
+  // of the tab order, so focus can't land on a hidden, unreachable element.
+  useEffect(() => {
+    const container = containerRef.current
+    if (container) {
+      container.inert = !!hibernatingSession
+    }
+  }, [containerRef, hibernatingSession])
+
+  const showSessionPeek = showMobileSessionPeek && !!session && sessions.length > 1
+
+  return (
+    <section
+      className={`flex min-w-0 flex-1 flex-col bg-base terminal-mobile-overlay md:relative md:inset-auto ${isiOS ? 'ios-native-term-selection' : ''} ${isiOS && import.meta.env.VITE_IOS_NATIVE_PASTE_PROTOTYPE !== '0' ? 'ios-native-paste-prototype' : ''}`}
+      data-testid="terminal-panel"
+      data-compact-mobile-controls={compactMobileControls}
+      onDragOver={(event) => {
+        if (!Array.from(event.dataTransfer.types).includes('Files')) return
+        event.preventDefault()
+        event.dataTransfer.dropEffect = session && !isReadOnly && isInputReady && connectionStatus === 'connected' ? 'copy' : 'none'
+      }}
+      onDrop={(event) => {
+        if (!Array.from(event.dataTransfer.types).includes('Files')) return
+        event.preventDefault()
+        event.stopPropagation()
+        if (!session || isReadOnly || !isInputReady || connectionStatus !== 'connected') return
+        const files = clipboardFiles(event.dataTransfer)
+        if (files.length) void browserPaste.paste({ text: '', files })
+      }}
+    >
+      {/* Mobile header - always show on mobile for drawer access */}
+      <div className="mobile-terminal-header flex min-h-[52px] shrink-0 items-center justify-between border-b border-border bg-elevated px-[6px] md:hidden">
+        <div className="flex min-w-0 items-center gap-[7px]">
+          <button
+            onClick={() => setIsDrawerOpen(true)}
+            className={mobileButtonClass('neutral')}
+            aria-label="Open session menu"
+            aria-expanded={isDrawerOpen}
+          >
+            <Menu01Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
+          </button>
+          {session ? (
+            <div className="flex min-w-[72px] flex-col items-start gap-px leading-none">
+              {isRenaming ? (
+                <input
+                  ref={renameInputRef}
+                  type="text"
+                  value={renameValue}
+                  onChange={(e) => setRenameValue(e.target.value)}
+                  onBlur={handleRenameSubmit}
+                  onKeyDown={handleRenameKeyDown}
+                  className="w-full max-w-[112px] rounded border border-border bg-surface px-2 py-0.5 text-sm font-medium text-primary outline-none focus:border-accent"
+                />
+              ) : (
+                <span className="max-w-[112px] truncate text-sm font-medium text-primary">
+                  {sessionDisplayName}
+                </span>
+              )}
+              <span className={`shrink-0 text-[10px] ${connectionStatus !== 'connected' ? 'text-approval' : statusClass[session.status]}`}>
+                {connectionStatus !== 'connected' ? connectionStatus : statusText[session.status]}
+              </span>
+            </div>
+          ) : hibernatingSession ? (
+            <div className="flex min-w-0 flex-col items-start gap-px leading-none">
+              <span className="max-w-[112px] truncate text-sm font-medium text-primary">
+                {hibernatingDisplayName}
+              </span>
+              <span className="text-[10px] font-medium text-blue-400">
+                Hibernating
+              </span>
+            </div>
+          ) : (
+            <span className="text-sm font-medium text-primary">
+              Sessions
+            </span>
+          )}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-[4px]">
+
+          {/* New session button - mobile only (desktop has it in header) */}
+          <button
+            onClick={onNewSession}
+            className={mobileButtonClass('primary')}
+            title={`New session (${modDisplay}N)`}
+            aria-label="New session"
+          >
+            <PlusIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
+          </button>
+
+          {/* Kill session button - mobile only (desktop has it on left) */}
+          {session && canControl && (
+            <button
+              disabled={isSwitching}
+              onClick={() => setShowEndConfirm(true)}
+              className={mobileButtonClass('danger')}
+              title={`Kill session (${modDisplay}X)`}
+              aria-label="Kill session"
+            >
+              <XCloseIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
+            </button>
+          )}
+          {canHibernate && (
+            <button
+              onClick={handleHibernateSession}
+              className={`${mobileButtonClass('neutral', 'hidden')} min-[360px]:flex`}
+              title="Hibernate session"
+              aria-label="Hibernate session"
+            >
+              <Moon01Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
+            </button>
+          )}
+          {hibernatingSession && (
+            <button
+              onClick={() => onResumeSession(hibernatingSession.sessionId)}
+              className="mobile-header-wake btn btn-primary h-[44px] px-3 text-xs"
+            >
+              Wake
+            </button>
+          )}
+
+          {/* More menu - mobile only (desktop has settings in sidebar header) */}
+          {session && (
+            <div className="relative" ref={moreMenuRef}>
+              <button
+                onClick={() => setShowMoreMenu(!showMoreMenu)}
+                className={mobileButtonClass('neutral')}
+                title="More options"
+                aria-label="More options"
+              >
+                <DotsVerticalIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
+              </button>
+
+              {showMoreMenu && (
+                <div className="absolute right-0 top-full mt-1 z-[70] min-w-[140px] rounded-md border border-border bg-elevated shadow-lg py-1">
+                  {canControl && (
+                    <button
+                      onClick={handleStartRename}
+                      className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary"
+                    >
+                      <Edit05Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
+                      Rename
+                    </button>
+                  )}
+                  {canHibernate && (
+                    <button
+                      onClick={handleHibernateSession}
+                      className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary"
+                    >
+                      <Moon01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
+                      Hibernate
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      onOpenSettings()
+                      setShowMoreMenu(false)
+                    }}
+                    className="flex min-h-[44px] w-full items-center gap-2 px-3 py-2 text-left text-sm text-secondary hover:bg-hover hover:text-primary"
+                  >
+                    <Settings02Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
+                    Settings
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Stable wrapper keeps xterm mounted while previews open beside it. */}
+      <SessionOutputs session={session} ready={connectionStatus === 'connected' && isInputReady}>
+      <div className="relative min-w-0 flex-1" data-testid="terminal-content">
+        {showSessionPeek && (
+          <MobileSessionPeek
+            sessions={sessions}
+            selectedId={session.id}
+            isOpen={isDrawerOpen}
+            onOpen={() => setIsDrawerOpen(true)}
+          />
+        )}
+        {/* Theme background on the container so the .xterm padding ring
+            matches the terminal — xterm.js 6.0 no longer paints the viewport
+            with the theme background (black-border regression on mobile).
+            Clip stale canvas/helper-textarea bounds during resize so browser
+            focus cannot scroll the board sideways to the old cursor position. */}
+        <div
+          ref={containerRef}
+          className={`absolute inset-0 overflow-clip ${showSessionPeek ? 'left-[8px] md:left-0' : ''}`}
+          style={{ backgroundColor: terminalTheme.background }}
+        />
+        {session && snapshot.state.status !== 'closed' && (
+          <TerminalSnapshotLayer state={snapshot.state} containerRef={containerRef} terminalRef={terminalRef}
+            background={terminalTheme.background ?? '#000'} foreground={terminalTheme.foreground ?? '#fff'}
+            rejoinWrapped={rejoinWrapped} onCopied={snapshot.close} />
+        )}
+        {session && !isReadOnly && !isInputReady && (
+          <div
+            role="status"
+            aria-live="polite"
+            data-testid="terminal-recovery-status"
+            className="absolute top-2 left-2 z-50 flex items-center gap-1.5 rounded-lg bg-black/60 px-2.5 py-1.5 text-xs text-white/90 shadow-lg backdrop-blur-md"
+          >
+            <SpinnerIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} className={isSwitching || connectionStatus !== 'connected' ? 'animate-spin' : ''} />
+            {connectionStatus === 'connected' ? (isSwitching ? 'Restoring terminal' : 'Terminal unavailable') :
+              connectionStatus === 'disconnected' ? 'Disconnected' : 'Reconnecting'}
+            <span className="text-white/70">· Input paused</span>
+          </div>
+        )}
+        {recoveryDraft.pending && session && !isReadOnly && (
+          <RecoveryDraft key={recoveryIdentity} text={recoveryDraft.text} sessionName={sessionDisplayName} ready={isInputReady}
+            atLimit={recoveryDraft.atLimit} truncated={recoveryDraft.truncated}
+            persistence={recoveryDraft.persistence} onSave={recoveryDraft.save}
+            onDiscardOthers={recoveryDraft.hasOtherDrafts ? recoveryDraft.discardOthers : undefined} onEdit={recoveryDraft.edit} onSend={sendRecoveryDraft}
+            onDiscard={() => { recoveryDraft.discard(); handleRefocus() }} />
+        )}
+        {pendingClipboardOffer && session && (
+          <div className={`absolute ${showScrollButton && !isSelectingText ? 'bottom-20' : 'bottom-8'} left-1/2 z-30 flex max-w-[calc(100%-2rem)] -translate-x-1/2 items-center gap-2 rounded-lg border border-border bg-elevated/95 px-2 py-2 shadow-lg backdrop-blur-sm md:hidden`}>
+            <span className="max-w-[12rem] truncate text-xs text-secondary md:max-w-[18rem]">
+              Selection ready
+            </span>
+            <button
+              type="button"
+              onClick={copyPendingClipboardOffer}
+              className={`relative flex h-8 shrink-0 items-center justify-center gap-1.5 rounded bg-accent px-2.5 text-xs font-medium text-white hover:bg-accent/90 active:scale-95 transition-all ${TOUCH_TARGET_CLASS}`}
+              title="Copy selection"
+              aria-label="Copy selection"
+            >
+              <Copy01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />
+              Copy
+            </button>
+            <button
+              type="button"
+              onClick={dismissPendingClipboardOffer}
+              className={`relative flex h-8 w-8 shrink-0 items-center justify-center rounded border border-border text-secondary hover:bg-hover hover:text-primary active:scale-95 transition-all ${TOUCH_TARGET_CLASS}`}
+              title="Dismiss"
+              aria-label="Dismiss"
+            >
+              <XCloseIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
+            </button>
+          </div>
+        )}
+        {!session && (
+          <div className="absolute inset-0 flex items-center justify-center text-sm text-muted">
+            {hibernatingSession ? null : 'Select a session to view terminal'}
+          </div>
+        )}
+        {session && isReadOnly && (
+          <div className="absolute inset-0 flex items-center justify-center text-center text-sm text-muted">
+            Remote session (read-only). Use SSH to attach on the host.
+          </div>
+        )}
+        {hibernatingSession && (
+          <div className="absolute inset-0 z-10 overflow-y-auto bg-base">
+            <div className="mx-auto flex min-h-full w-full max-w-5xl flex-col gap-4 p-4 md:p-6">
+              <div className="border-b border-border pb-4">
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div className="min-w-0 space-y-2">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+                      <h2 className="min-w-0 truncate text-lg font-semibold text-primary">
+                        {hibernatingDisplayName}
+                      </h2>
+                      <span className="rounded-full bg-blue-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-400">
+                        Hibernating
+                      </span>
+                      {hibernatingProjectName && (
+                        <span className="text-muted">
+                          {hibernatingProjectName}
+                        </span>
+                      )}
+                      <span className="text-muted">
+                        Last active {hibernatingLastActivity}
+                      </span>
+                    </div>
+                    {hibernatingSession.lastResumeError && (
+                      <div
+                        className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-2 py-1 text-xs text-amber-400"
+                        title={`Last wake failed: ${hibernatingSession.lastResumeError}`}
+                      >
+                        <AlertTriangleIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} />
+                        Last wake failed
+                      </div>
+                    )}
+                    {hibernatingSession.lastUserMessage && (
+                      <p className="max-h-28 max-w-3xl overflow-y-auto whitespace-pre-wrap break-words pr-2 text-sm leading-6 text-secondary">
+                        {hibernatingSession.lastUserMessage}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onResumeSession(hibernatingSession.sessionId)}
+                      className="btn btn-primary hidden md:inline-flex"
+                    >
+                      Wake
+                    </button>
+                    {onMoveToHistory && (
+                      <button
+                        type="button"
+                        onClick={() => onMoveToHistory(hibernatingSession.sessionId)}
+                        className="btn btn-secondary"
+                      >
+                        Move to History
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <SessionPreviewContent session={hibernatingSession} />
+            </div>
+          </div>
+        )}
+
+        {/* Copy-mode indicator / scroll to bottom button */}
+        {isTmuxCopyMode && session && !isSelectingText ? (
+          <button
+            type="button"
+            onClick={scrollToBottom}
+            className={`absolute bottom-14 left-1/2 z-20 flex h-10 items-center justify-center rounded-full border border-amber-400/35 bg-amber-500/20 text-amber-100 shadow-lg backdrop-blur-sm transition-all hover:bg-amber-500/30 active:scale-95 md:hidden ${TOUCH_TARGET_CLASS}`}
+            style={{ transform: 'translateX(-50%)' }}
+            title="Exit tmux copy mode and return to live output"
+            aria-label="Exit copy mode"
+          >
+            <span className="px-3 text-[11px] font-semibold uppercase tracking-wide">
+              Copy mode
+            </span>
+            <span className="self-stretch border-l border-amber-400/25" aria-hidden="true" />
+            <span className="px-3 text-sm font-medium">Exit</span>
+          </button>
+        ) : showScrollButton && session && !isSelectingText ? (
+          <button
+            type="button"
+            onClick={scrollToBottom}
+            className={`absolute bottom-8 left-1/2 z-20 flex h-10 px-4 items-center justify-center gap-1.5 rounded-full bg-blue-600/90 text-white shadow-lg hover:bg-blue-600 active:scale-95 transition-all md:hidden ${TOUCH_TARGET_CLASS}`}
+            style={{ transform: 'translateX(-50%)' }}
+            title="Scroll to bottom"
+            aria-label="Scroll to bottom"
+          >
+            <ArrowDownIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
+            <span className="text-sm font-medium">Jump to bottom</span>
+          </button>
+        ) : null}
+
+      </div>
+
+      </SessionOutputs>
+
+      <PasteStatus {...browserPaste} />
+      {pasteStatus !== 'idle' && (
+        <div className="flex items-center justify-between gap-3 border-t border-border bg-elevated px-3 py-2 text-sm text-primary">
+          {pasteStatus === 'sending' ? (
+            <span role="status">Pasting…</span>
+          ) : (
+            <>
+              <span role="alert">Paste delivery could not be confirmed. Check the terminal before trying again.</span>
+              <button type="button" className="min-h-8 px-2 text-secondary" onClick={() => finishPaste('idle')}>Dismiss</button>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Desktop status rail (tmux-style status line) */}
+      <SessionRail
+        session={session}
+        hibernatingSession={hibernatingSession}
+        hibernatingDisplayName={hibernatingDisplayName}
+        showHostBadge={showHostBadge}
+        sessionCount={sessions.length}
+        connectionStatus={connectionStatus}
+        isSwitching={isSwitching}
+        canControl={canControl}
+        canHibernate={canHibernate}
+        modDisplay={modDisplay}
+        onKill={() => setShowEndConfirm(true)}
+        onHibernate={handleHibernateSession}
+        onWake={() =>
+          hibernatingSession && onResumeSession(hibernatingSession.sessionId)
+        }
+        onRename={(newName) => {
+          const target = session?.id ?? hibernatingSession?.sessionId
+          if (target) onRenameSession(target, newName)
+        }}
+        onDuplicate={
+          session && onDuplicateSession
+            ? () => onDuplicateSession(session.id)
+            : undefined
+        }
+        onMoveToHistory={
+          hibernatingSession && onMoveToHistory
+            ? () => onMoveToHistory(hibernatingSession.sessionId)
+            : undefined
+        }
+        isTmuxCopyMode={isTmuxCopyMode}
+        showJumpToBottom={showScrollButton && !isSelectingText}
+        onJumpToBottom={scrollToBottom}
+        selectionReady={!!pendingClipboardOffer}
+        onCopySelection={copyPendingClipboardOffer}
+        onDismissSelection={dismissPendingClipboardOffer}
+      />
+
+      {/* Mobile control strip */}
+      {session && (
+        <TerminalControls
+          onSendKey={handleSendKey}
+          onPasteText={handlePasteText}
+          onPasteImage={handlePasteImage}
+          disabled={connectionStatus !== 'connected' || isReadOnly || !isInputReady || recoveryDraft.pending}
+          sessions={sessions.map(s => ({ id: s.id, name: s.name, status: s.status }))}
+          currentSessionId={session.id}
+          agentType={session.agentType}
+          fileUploadsAllowed={!isRemoteSession}
+          remoteImageSessionId={isRemoteSession ? session.id : undefined}
+          onSelectSession={onSelectSession}
+          hideSessionSwitcher
+          onRefocus={handleRefocus}
+          isKeyboardVisible={isKeyboardVisible}
+          onSelectText={isReadOnly ? undefined : handleSelectText}
+          snapshotActions={snapshotOpen ? {
+            onDone: snapshot.close,
+            onRefresh: snapshot.refresh,
+            busy: snapshot.state.status === 'loading' || (snapshot.state.status === 'ready' && snapshot.state.refreshing),
+          } : undefined}
+        />
+      )}
+
+      {/* Mobile session drawer */}
+      {(isMobileLayout || isiOS) && (
+        <SessionDrawer
+          isOpen={isDrawerOpen}
+          onClose={() => setIsDrawerOpen(false)}
+          sessions={drawerSessions ?? sessions}
+          hibernatingSessions={hibernatingSessions}
+          historySessions={historySessions}
+          selectedSessionId={session?.id ?? null}
+          selectedHibernatingSessionId={hibernatingSession?.sessionId ?? null}
+          onSelect={onSelectSession}
+          onSelectHibernating={onSelectHibernatingSession}
+          onRename={onRenameSession}
+          onCloseTmux={onCloseTmux}
+          onResume={onResumeSession}
+          onHibernate={onHibernateSession}
+          onMoveToHistory={onMoveToHistory}
+          onNewSession={onNewSession}
+          onOpenHistory={onOpenHistory}
+          subscribe={subscribe}
+          loading={loading}
+          error={error}
+        />
+      )}
+
+      {/* Kill session confirmation modal */}
+      {showEndConfirm && session && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="mx-4 w-full max-w-sm rounded-lg border border-border bg-elevated p-4 shadow-xl">
+            <h3 className="text-base font-medium text-primary mb-2 text-balance">
+              Kill Session
+            </h3>
+            <p className="text-sm text-secondary mb-4 text-pretty">
+              Kill "{sessionDisplayName}"? The process will be terminated. Conversation history is preserved in logs.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setShowEndConfirm(false)}
+                className="btn py-1.5 px-3 text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                ref={endSessionButtonRef}
+                onClick={handleEndSession}
+                className="btn btn-danger py-1.5 px-3 text-sm"
+              >
+                Kill Session
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}

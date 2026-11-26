@@ -1,0 +1,2199 @@
+import { useEffect, useRef, useCallback, useLayoutEffect, useState } from 'react'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import { installCodexSidebarImage } from './codexSidebarImage'
+import { ImageAddon } from '@xterm/addon-image'
+import { WebglAddon } from '@xterm/addon-webgl'
+import { WebLinksAddon } from '@xterm/addon-web-links'
+import { ClipboardAddon, type ClipboardSelectionType, type IClipboardProvider } from '@xterm/addon-clipboard'
+import { SearchAddon } from '@xterm/addon-search'
+import { SerializeAddon } from '@xterm/addon-serialize'
+import { ProgressAddon } from '@xterm/addon-progress'
+import type { AgentType, ClipboardOfferSource, SendClientMessage, ServerMessageWithDiagnostics, SubscribeServerMessage } from '@shared/types'
+import { clientLog } from '../utils/clientLog'
+import type { ConnectionStatus } from '../stores/sessionStore'
+import { useSettingsStore } from '../stores/settingsStore'
+import { copyText } from '../utils/copyText'
+import { copyTextWithResult } from '../utils/copyTextWithResult'
+import { getEffectiveModifier, matchesModifier } from '../utils/device'
+import { bracketedPaste, sanitizeImagePath } from '../utils/paste'
+import { installMobileAutocorrect } from '../utils/mobileAutocorrect'
+import { clipboardFiles } from '../utils/browserFiles'
+import { setAppOwnsMouse } from '../utils/iosSelection'
+import { terminalMouseCell } from '../utils/terminalMouseCell'
+
+// Module-level snapshot cache: sessionId → serialized terminal content.
+// Survives component remounts and avoids stale-closure issues in effects.
+const snapshotCache = new Map<string, string>()
+const MAX_SNAPSHOT_ENTRIES = 20
+
+/** Remove a single session's cached terminal snapshot. */
+export function invalidateSnapshotCache(sessionId: string): void {
+  snapshotCache.delete(sessionId)
+}
+
+/** Clear all cached terminal snapshots (e.g. on reconnect). */
+export function clearSnapshotCache(): void {
+  snapshotCache.clear()
+}
+
+// URL regex that matches standard URLs and IP:port patterns
+const URL_REGEX = /https?:\/\/[^\s"'<>]+|\b(?:localhost|\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}(?:\/[^\s"'<>]*)?\b/
+const TRAILING_PUNCTUATION_REGEX = /[.,;:!?]+$/
+const BRACKET_PAIRS: Array<[string, string]> = [
+  ['(', ')'],
+  ['[', ']'],
+  ['{', '}'],
+]
+
+const countOccurrences = (text: string, char: string) => text.split(char).length - 1
+
+export function sanitizeLink(text: string): string {
+  let result = text.trim()
+  if (!result) return result
+
+  const stripTrailingPunctuation = () => {
+    result = result.replace(TRAILING_PUNCTUATION_REGEX, '')
+  }
+
+  stripTrailingPunctuation()
+
+  let trimmed = true
+  while (trimmed) {
+    trimmed = false
+    for (const [open, close] of BRACKET_PAIRS) {
+      if (!result.endsWith(close)) continue
+      const openCount = countOccurrences(result, open)
+      const closeCount = countOccurrences(result, close)
+      if (closeCount > openCount) {
+        result = result.slice(0, -1)
+        trimmed = true
+      }
+    }
+  }
+
+  stripTrailingPunctuation()
+  return result
+}
+
+const getIsMac = () => typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform)
+
+/** Empty bracket paste sequence — signals a paste event without text content. */
+const BRACKET_PASTE_EMPTY = '\x1b[200~\x1b[201~'
+const CTRL_V = '\x16'
+const ENABLE_MOUSE_TRACKING = '\x1b[?1000h\x1b[?1002h\x1b[?1006h'
+const DISABLE_MOUSE_TRACKING = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l'
+
+// Mouse-tracking modes that drive xterm's CoreMouseService protocol/encoding.
+// Pane output can carry DECSET/DECRST for these — a real tmux client (the pty
+// proxy) emits ?1006l ?1000l ?1002l ?1003l on every client redraw, and apps
+// emit their own enables. Every applied sequence fires xterm's
+// onProtocolChange → selectionService.disable() → clearSelection(), which
+// destroys in-progress drags and completed selections. The client owns the
+// mode instead: strip them from pane output and drive it from the appMouse
+// status poll.
+const MOUSE_MODE_PARAMS = new Set([9, 1000, 1002, 1003, 1005, 1006, 1015, 1016])
+// eslint-disable-next-line no-control-regex
+const DECSET_RE = /\x1b\[\?([0-9;]+)([hl])/g
+// Trailing bytes that could be the start of a CSI split across writes.
+// eslint-disable-next-line no-control-regex
+const PARTIAL_CSI_TAIL = /\x1b(?:\[[0-9;<=>?]*)?$/
+
+// Removes mouse-tracking DECSET/DECRST from pane output. A trailing partial
+// CSI is carried in `tail` so sequences split across writes are still caught
+// (xterm's parser would otherwise complete and apply them).
+const stripMouseModeSequences = (data: string, tail: { current: string }) => {
+  const buf = tail.current + data
+  const partial = buf.match(PARTIAL_CSI_TAIL)
+  const end = partial ? buf.length - partial[0].length : buf.length
+  tail.current = partial?.[0] ?? ''
+  return buf.slice(0, end).replace(DECSET_RE, (seq, params: string, term: string) => {
+    const kept = params.split(';').filter((p) => !MOUSE_MODE_PARAMS.has(Number(p)))
+    return kept.length ? `\x1b[?${kept.join(';')}${term}` : ''
+  })
+}
+
+/**
+ * Upload an image blob to the server and return the stored file path.
+ * Returns null on any failure. Bun derives the multipart File.type from the
+ * filename extension (not the declared blob type), so the filename carries the
+ * real extension.
+ */
+async function uploadImageBlob(blob: Blob): Promise<string | null> {
+  try {
+    const ext = (blob.type.split('/')[1] || 'png').toLowerCase()
+    const form = new FormData()
+    form.append('image', blob, `paste.${ext}`)
+    const res = await fetch('/api/paste-image', { method: 'POST', body: form })
+    if (!res.ok) return null
+    const data = (await res.json()) as { path?: unknown }
+    return typeof data.path === 'string' ? data.path : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Ask the server to read the macOS pasteboard and return a file path for an
+ * image (a Finder file URL, or a temp file the server wrote from raw clipboard
+ * image data). Returns null when the clipboard holds no image.
+ */
+async function fetchClipboardImagePath(): Promise<string | null> {
+  try {
+    const res = await fetch('/api/clipboard-file-path')
+    if (!res.ok) return null
+    const data = (await res.json()) as { path?: unknown; isImage?: unknown }
+    if (data.isImage === true && typeof data.path === 'string') return data.path
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Resolve the terminal-input payload that makes the attached agent attach a
+ * pasted image.
+ *
+ * Claude Code attaches an image when it receives the image's file PATH inside a
+ * bracketed paste — not as raw-typed text, and not via an empty bracket paste.
+ * The old empty-bracket signal relied on Claude reading the macOS system
+ * clipboard itself, which its fullscreen/no-flicker renderer no longer does, so
+ * we now deliver an explicit path: upload the clipboard blob when we have it,
+ * otherwise ask the server to resolve a pasteboard path. Codex keeps its
+ * literal Ctrl+V signal (its own native image-paste path).
+ */
+async function resolveImagePasteData(
+  agentType: AgentType | undefined,
+  source: { blob?: Blob | null; path?: string | null }
+): Promise<string | null> {
+  if (agentType === 'codex') return CTRL_V
+  let path = source.path ?? null
+  if (!path && source.blob) path = await uploadImageBlob(source.blob)
+  if (!path) path = await fetchClipboardImagePath()
+  // Fall back to the empty-bracket signal so the classic renderer's native
+  // clipboard read still works when no path could be resolved.
+  return path ? bracketedPaste(sanitizeImagePath(path)) : BRACKET_PASTE_EMPTY
+}
+
+const MAC_SHARED_PASTEBOARD_PATH_PATTERN =
+  /\/Users\/[^/\n]+\/Library\/Group Containers\/group\.com\.apple\.coreservices\.useractivityd\/shared-pasteboard\/items\//
+
+function isMacSharedPasteboardPathText(text: string): boolean {
+  return MAC_SHARED_PASTEBOARD_PATH_PATTERN.test(text)
+}
+
+interface PastePayload {
+  files: File[]
+  text: string
+  hasImage: boolean
+  hasFiles: boolean
+  imageBlob: Blob | null
+}
+
+interface PendingClipboardOffer {
+  id: number
+  text: string
+  source: ClipboardOfferSource
+}
+
+interface SafeClipboardCallbacks {
+  onWriteFailed?: (text: string, source: ClipboardOfferSource) => void
+}
+
+function clipboardHasImage(clipboardData: DataTransfer | null | undefined): boolean {
+  if (!clipboardData) return false
+
+  for (const file of Array.from(clipboardData.files ?? [])) {
+    if (file?.type?.startsWith('image/')) return true
+  }
+
+  for (const item of Array.from(clipboardData.items ?? [])) {
+    if (item?.type?.startsWith('image/')) return true
+  }
+  return false
+}
+
+/**
+ * Extract the first image blob from clipboard data, if one is present and
+ * directly readable. Returns null when the image can't be pulled as a File
+ * (e.g. metadata-only items), in which case callers fall back to a
+ * server-side pasteboard read.
+ */
+function getClipboardImageBlob(
+  clipboardData: DataTransfer | null | undefined
+): Blob | null {
+  if (!clipboardData) return null
+
+  for (const file of Array.from(clipboardData.files ?? [])) {
+    if (file?.type?.startsWith('image/')) return file
+  }
+
+  for (const item of Array.from(clipboardData.items ?? [])) {
+    if (item?.kind === 'file' && item.type?.startsWith('image/')) {
+      const file = item.getAsFile?.()
+      if (file) return file
+    }
+  }
+  return null
+}
+
+/**
+ * Custom clipboard provider that prevents empty writes (matching Ghostty's behavior).
+ * OSC 52 with empty base64 data clears clipboard in reference xterm, but this can
+ * accidentally wipe images or other non-text content the user has copied.
+ */
+class SafeClipboardProvider implements IClipboardProvider {
+  constructor(private callbacks: SafeClipboardCallbacks = {}) {}
+
+  async readText(selection: ClipboardSelectionType): Promise<string> {
+    if (selection !== 'c') return ''
+    try {
+      return await navigator.clipboard.readText()
+    } catch {
+      return ''
+    }
+  }
+
+  async writeText(selection: ClipboardSelectionType, text: string): Promise<void> {
+    // Only write to system clipboard, and only if there's actual non-whitespace content
+    // This prevents OSC 52 sequences from clearing images/rich content from the clipboard
+    if (selection !== 'c' || !text?.trim()) return
+    const startedAt = performance.now()
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error('navigator.clipboard.writeText unavailable')
+      }
+      await navigator.clipboard.writeText(text)
+      clientLog('clipboard_write_success', {
+        source: 'osc52',
+        chars: text.length,
+        durationMs: Math.round(performance.now() - startedAt),
+      })
+    } catch (error) {
+      clientLog('clipboard_write_failed', {
+        source: 'osc52',
+        chars: text.length,
+        error: error instanceof Error ? error.message : String(error),
+      }, 'warn')
+      this.callbacks.onWriteFailed?.(text, 'osc52')
+    }
+  }
+}
+import type { ITheme } from '@xterm/xterm'
+import { isAndroidDevice, isIOSDevice } from '../utils/device'
+
+// Text presentation selector - forces text rendering instead of emoji
+const TEXT_VS = '\uFE0E'
+
+// Characters that iOS Safari renders as emoji but should be text
+// Only add characters here that are verified to cause issues
+const EMOJI_TO_TEXT_CHARS = [
+  '\u23FA', // ⏺ Black Circle for Record (Claude's bullet)
+] as const
+const escapeRegExp = (value: string) =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const EMOJI_TO_TEXT_REGEX = new RegExp(
+  EMOJI_TO_TEXT_CHARS.map(escapeRegExp).join('|'),
+  'g'
+)
+
+/**
+ * Add text presentation selector after characters that iOS renders as emoji.
+ * This forces the browser to render them as text glyphs instead.
+ */
+export function forceTextPresentation(data: string): string {
+  // Hot path: most terminal output doesn't contain emoji-like glyphs.
+  // Avoid per-character concatenation (expensive) and skip work when not needed.
+  for (const char of EMOJI_TO_TEXT_CHARS) {
+    if (data.indexOf(char) === -1) {
+      continue
+    }
+    return data.replace(EMOJI_TO_TEXT_REGEX, `$&${TEXT_VS}`)
+  }
+  return data
+}
+
+interface TerminalParserOperation {
+  terminal: Terminal
+  generation: number
+  data: string
+  reset: boolean
+  done?: () => void
+  discarded?: () => void
+}
+
+interface UseTerminalOptions {
+  sessionId: string | null
+  tmuxTarget: string | null
+  agentType?: AgentType
+  agentSessionId?: string | null
+  allowAttach?: boolean
+  connectionStatus?: ConnectionStatus
+  connectionEpoch?: number
+  sendMessage: SendClientMessage
+  subscribe: SubscribeServerMessage
+  theme: ITheme
+  fontSize: number
+  lineHeight: number
+  letterSpacing: number
+  fontFamily: string
+  useWebGL: boolean
+  onPasteFiles?: (payload: { text: string; files: File[] }) => void
+  onPasteError?: (message: string) => void
+  /** Text for explicit user review only; never queued for terminal delivery. */
+  onDeferredInput?: (data: string, kind: 'typing' | 'paste') => void
+  /** Keep new text in an existing review draft even after transport recovery. */
+  deferInput?: boolean
+  onScrollChange?: (isAtBottom: boolean) => void
+}
+
+export function useTerminal({
+  sessionId,
+  tmuxTarget,
+  agentType,
+  agentSessionId,
+  allowAttach = true,
+  connectionStatus = 'connected',
+  connectionEpoch = 0,
+  sendMessage,
+  subscribe,
+  theme,
+  fontSize,
+  lineHeight,
+  letterSpacing,
+  fontFamily,
+  useWebGL,
+  onScrollChange,
+  onPasteFiles,
+  onPasteError,
+  onDeferredInput,
+  deferInput = false,
+}: UseTerminalOptions) {
+  const previewSession = useRef({ sessionId, agentType, agentSessionId })
+  previewSession.current = { sessionId, agentType, agentSessionId }
+  const onPasteFilesRef = useRef(onPasteFiles)
+  onPasteFilesRef.current = onPasteFiles
+  const onPasteErrorRef = useRef(onPasteError)
+  onPasteErrorRef.current = onPasteError
+  const onDeferredInputRef = useRef(onDeferredInput)
+  onDeferredInputRef.current = onDeferredInput
+  const deferInputRef = useRef(deferInput)
+  deferInputRef.current = deferInput
+  const deferredInputEnabledRef = useRef(false)
+  deferredInputEnabledRef.current = !!sessionId && allowAttach
+  const canReadHostClipboard = () => !onPasteFilesRef.current || (typeof location !== 'undefined' && ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname))
+  const isiOS = isIOSDevice()
+  const isAndroid = isAndroidDevice()
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const terminalRef = useRef<Terminal | null>(null)
+  const nativeInputRef = useRef<ReturnType<typeof installMobileAutocorrect> | null>(null)
+  const updateNativeInputRef = useRef<() => void>(() => {})
+  const clearWindowsPasteInputRef = useRef<(() => void) | null>(null)
+  const resetNativeInput = useCallback((afterPaste = false) => {
+    nativeInputRef.current?.reset()
+    if (afterPaste) clearWindowsPasteInputRef.current?.()
+  }, [])
+  const hasLoggedInitRef = useRef(false)
+  const fitAddonRef = useRef<FitAddon | null>(null)
+  const webglAddonRef = useRef<WebglAddon | null>(null)
+  const webLinksAddonRef = useRef<WebLinksAddon | null>(null)
+  const linkTooltipRef = useRef<HTMLDivElement | null>(null)
+  const searchAddonRef = useRef<SearchAddon | null>(null)
+  const serializeAddonRef = useRef<SerializeAddon | null>(null)
+  const progressAddonRef = useRef<ProgressAddon | null>(null)
+  const resizeTimer = useRef<number | null>(null)
+  const fitTimer = useRef<number | null>(null)
+  const attachDebounceRef = useRef<number | null>(null)
+
+  // Wheel event handling for tmux scrollback
+  const wheelAccumRef = useRef<number>(0)
+  const inTmuxCopyModeRef = useRef<boolean>(false)
+  const [isTmuxCopyMode, setIsTmuxCopyMode] = useState(false)
+  const appMouseRef = useRef<boolean>(false)
+  const altScreenRef = useRef<boolean>(false)
+  const wheelBoundsRef = useRef<Extract<ServerMessageWithDiagnostics, { type: 'tmux-copy-mode-status' }>['wheelBounds']>(undefined)
+  const copyModeCheckTimer = useRef<number | null>(null)
+  const clipboardOfferIdRef = useRef(0)
+  const [pendingClipboardOffer, setPendingClipboardOffer] = useState<PendingClipboardOffer | null>(null)
+
+  const offerClipboardCopy = useCallback((text: string, source: ClipboardOfferSource) => {
+    if (!text?.trim()) return
+    clipboardOfferIdRef.current += 1
+    setPendingClipboardOffer({
+      id: clipboardOfferIdRef.current,
+      text,
+      source,
+    })
+  }, [])
+
+  const copyPendingClipboardOffer = useCallback(() => {
+    if (!pendingClipboardOffer) return
+    copyText(pendingClipboardOffer.text)
+    clientLog('clipboard_manual_copy', {
+      source: pendingClipboardOffer.source,
+      chars: pendingClipboardOffer.text.length,
+    }, 'info')
+    setPendingClipboardOffer(null)
+  }, [pendingClipboardOffer])
+
+  const dismissPendingClipboardOffer = useCallback(() => {
+    setPendingClipboardOffer(null)
+  }, [])
+  const copyModePollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Track the currently attached session to prevent race conditions
+  const attachedSessionRef = useRef<string | null>(null)
+  // A server acknowledgment is necessary but not sufficient: its preceding
+  // screen data must finish parsing before this attachment accepts input.
+  const readySessionRef = useRef<string | null>(null)
+  const parserGenerationRef = useRef(0)
+  const currentConnectionEpochRef = useRef(connectionEpoch)
+  currentConnectionEpochRef.current = connectionEpoch
+  const parserActiveRef = useRef<TerminalParserOperation | null>(null)
+  const parserQueueRef = useRef<TerminalParserOperation[]>([])
+  const attachedTargetRef = useRef<string | null>(null)
+  const attachedConnectionEpochRef = useRef<number>(-1)
+  const focusAfterAttachSessionRef = useRef<string | null>(null)
+  const switchStartRef = useRef<number | null>(null)
+  const sendMessageRef = useRef(sendMessage)
+  const agentTypeRef = useRef(agentType)
+  const onScrollChangeRef = useRef(onScrollChange)
+  const useWebGLRef = useRef(useWebGL)
+
+  // Output buffering with idle-based flushing
+  const outputBufferRef = useRef<Array<{ data: string; outputSeq?: number; epoch: number }>>([])
+  const idleTimerRef = useRef<number | null>(null)
+  const maxTimerRef = useRef<number | null>(null)
+  // Aggregates dropped-output diagnostics — bursts used to emit one clientLog
+  // POST per dropped message (~100 lines/100ms observed), each a sync write
+  // in the server log. One aggregated line per second at most.
+  const droppedOutputRef = useRef({
+    count: 0,
+    bytes: 0,
+    lastEmit: 0,
+    timer: null as number | null,
+    lastMessageSessionId: null as string | null,
+  })
+
+  // Deferred reset: defer terminal.reset() until history arrives to avoid blank flash
+  const needsResetRef = useRef(false)
+  const mouseModeTailRef = useRef('')
+  const [isSwitching, setIsSwitching] = useState(false)
+
+  // Tuning: flush when idle for 2ms, or at most every 16ms
+  const IDLE_FLUSH_MS = 2
+  const MAX_FLUSH_MS = 16
+
+  // iOS compositor repaint state — shared by visibility and subscriber effects.
+  // Unified so only one repaint can be in-flight at a time.
+  const iosRepaintTimerRef = useRef<number | null>(null)
+  const iosRepaintRafRef = useRef<number | null>(null)
+  const iosRepaintPrevRef = useRef<string | null>(null) // non-null when mid-toggle
+
+  // Cancel any pending iOS repaint, restoring display if mid-toggle.
+  const cancelIosRepaint = () => {
+    if (iosRepaintTimerRef.current !== null) {
+      window.clearTimeout(iosRepaintTimerRef.current)
+      iosRepaintTimerRef.current = null
+    }
+    if (iosRepaintRafRef.current !== null) {
+      cancelAnimationFrame(iosRepaintRafRef.current)
+      iosRepaintRafRef.current = null
+    }
+    if (iosRepaintPrevRef.current !== null) {
+      const container = containerRef.current
+      if (container) container.style.display = iosRepaintPrevRef.current
+      iosRepaintPrevRef.current = null
+    }
+  }
+
+  // Schedule an iOS compositor repaint after delayMs.
+  // Cancels any in-flight repaint first (safely restoring display).
+  const scheduleIosRepaint = (delayMs: number, trigger?: string) => {
+    const container = containerRef.current
+    if (!container) return
+
+    cancelIosRepaint()
+
+    clientLog('ios_repaint_schedule', { delayMs, trigger, sessionId: attachedSessionRef.current })
+
+    iosRepaintTimerRef.current = window.setTimeout(() => {
+      iosRepaintTimerRef.current = null
+      // Force xterm.js to re-render all visible rows so the DOM has
+      // fresh content before the compositor is forced to repaint.
+      const terminal = terminalRef.current
+      if (terminal) terminal.refresh(0, terminal.rows - 1)
+
+      const hasContent = terminal ? terminal.buffer.active.length > 0 : false
+      clientLog('ios_repaint_exec', {
+        trigger,
+        hasContent,
+        bufferLines: terminal?.buffer.active.length ?? 0,
+        sessionId: attachedSessionRef.current,
+      })
+
+      iosRepaintPrevRef.current = container.style.display
+      container.style.display = 'none'
+      // Split restore across two animation frames so the compositor
+      // registers the removal before we restore.
+      iosRepaintRafRef.current = requestAnimationFrame(() => {
+        iosRepaintRafRef.current = requestAnimationFrame(() => {
+          iosRepaintRafRef.current = null
+          container.style.display = iosRepaintPrevRef.current ?? ''
+          iosRepaintPrevRef.current = null
+        })
+      })
+    }, delayMs)
+  }
+
+  useEffect(() => {
+    sendMessageRef.current = sendMessage
+  }, [sendMessage])
+
+  useEffect(() => {
+    agentTypeRef.current = agentType
+  }, [agentType])
+
+  useEffect(() => {
+    onScrollChangeRef.current = onScrollChange
+  }, [onScrollChange])
+
+  // Check if terminal is scrolled to bottom
+  const checkScrollPosition = useCallback(() => {
+    const terminal = terminalRef.current
+    if (!terminal || !onScrollChangeRef.current) return
+
+    const buffer = terminal.buffer.active
+    const isAtBottom = !inTmuxCopyModeRef.current && buffer.viewportY >= buffer.baseY
+    onScrollChangeRef.current(isAtBottom)
+  }, [])
+
+  // Serialize resets with parser callbacks. terminal.reset() is synchronous,
+  // while write() queues parsing: resetting ahead of old writes lets old pane
+  // data paint over the new screen. Queued operations from obsolete attachments
+  // can be discarded; an operation already parsing must finish before a reset.
+  const drainParserQueue = useCallback(function drain() {
+    if (parserActiveRef.current) return
+    let operation = parserQueueRef.current.shift()
+    while (operation && (operation.generation !== parserGenerationRef.current ||
+      operation.terminal !== terminalRef.current)) {
+      operation.discarded?.()
+      operation = parserQueueRef.current.shift()
+    }
+    if (!operation) return
+    const current = operation
+    parserActiveRef.current = current
+    if (current.reset) current.terminal.reset()
+    current.terminal.write(current.data, () => {
+      if (parserActiveRef.current !== current) return
+      parserActiveRef.current = null
+      if (current.generation === parserGenerationRef.current &&
+        current.terminal === terminalRef.current) current.done?.()
+      else current.discarded?.()
+      drain()
+    })
+  }, [])
+
+  const writeTerminal = useCallback((data: string, reset = false, done?: () => void, discarded?: () => void) => {
+    const terminal = terminalRef.current
+    if (!terminal) { discarded?.(); return }
+    parserQueueRef.current.push({ terminal, generation: parserGenerationRef.current, data, reset, done, discarded })
+    drainParserQueue()
+  }, [drainParserQueue])
+
+  const acknowledgeOutput = useCallback((chunks: Array<{ outputSeq?: number; epoch: number }>) => {
+    let outputSeq: number | undefined
+    for (const chunk of chunks) {
+      if (chunk.epoch === currentConnectionEpochRef.current && chunk.outputSeq !== undefined) {
+        outputSeq = Math.max(outputSeq ?? 0, chunk.outputSeq)
+      }
+    }
+    if (outputSeq !== undefined) sendMessageRef.current({ type: 'terminal-ack', outputSeq, connectionEpoch: currentConnectionEpochRef.current })
+  }, [])
+
+  const setTmuxCopyMode = useCallback((nextValue: boolean) => {
+    if (inTmuxCopyModeRef.current === nextValue) return
+    inTmuxCopyModeRef.current = nextValue
+    setIsTmuxCopyMode(nextValue)
+
+    // Disable mouse tracking when entering copy-mode so xterm.js does local selection
+    // instead of generating mouse sequences. On exit, the appMouse status poll
+    // re-enables tracking — pane output can't do it (mode sequences stripped).
+    const terminal = terminalRef.current
+    if (terminal && nextValue) {
+      // Disable all mouse tracking modes (1000=X10, 1002=button-event, 1003=any-event, 1006=SGR)
+      writeTerminal(DISABLE_MOUSE_TRACKING)
+    }
+
+    checkScrollPosition()
+  }, [checkScrollPosition, writeTerminal])
+
+  // Request tmux copy-mode status from server (debounced)
+  const requestCopyModeCheck = useCallback(() => {
+    const attached = readySessionRef.current
+    if (!attached) return
+
+    // Debounce: clear existing timer and set a new one
+    if (copyModeCheckTimer.current !== null) {
+      window.clearTimeout(copyModeCheckTimer.current)
+    }
+    copyModeCheckTimer.current = window.setTimeout(() => {
+      copyModeCheckTimer.current = null
+      sendMessageRef.current({ type: 'tmux-check-copy-mode', sessionId: attached })
+    }, 150) // Check 150ms after last scroll
+  }, [])
+
+  const sendWheelScroll = useCallback((session: string, lines: number, point: { clientX: number; clientY: number }) => {
+    const terminal = terminalRef.current
+    if (lines === 0 || !terminal || readySessionRef.current !== session) return
+
+    const bounds = wheelBoundsRef.current
+    if (bounds === null) return
+
+    const cell = appMouseRef.current && bounds && containerRef.current
+      ? terminalMouseCell(containerRef.current, terminal, point) : null
+    // The tmux pane can be smaller than this client when another viewer sizes
+    // the window. Use a visible pane cell, not the center of the browser grid.
+    const col = bounds
+      ? Math.max(bounds.firstCol, Math.min(bounds.lastCol, cell?.col ?? bounds.firstCol))
+      : Math.max(1, Math.floor(terminal.cols / 2))
+    const row = bounds
+      ? Math.max(bounds.firstRow, Math.min(bounds.lastRow, cell?.row ?? bounds.firstRow))
+      : Math.max(1, Math.floor(terminal.rows / 2))
+    const button = lines > 0 ? 65 : 64
+    for (let i = 0; i < Math.abs(lines); i++) {
+      sendMessageRef.current({ type: 'terminal-input', sessionId: session, data: `\x1b[<${button};${col};${row}M` })
+    }
+    if (!appMouseRef.current) {
+      if (lines < 0) setTmuxCopyMode(true)
+      requestCopyModeCheck()
+    }
+  }, [requestCopyModeCheck, setTmuxCopyMode])
+
+  const fitAndResize = useCallback(() => {
+    const terminal = terminalRef.current
+    const fitAddon = fitAddonRef.current
+    if (!terminal || !fitAddon) return
+
+    fitAddon.fit()
+
+    const attached = attachedSessionRef.current
+    if (attached) {
+      sendMessageRef.current({
+        type: 'terminal-resize',
+        sessionId: attached,
+        cols: terminal.cols,
+        rows: terminal.rows,
+      })
+    }
+  }, [])
+
+  // Terminal initialization - only once on mount
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    // Already initialized
+    if (terminalRef.current) return
+
+    // Track if effect has been cleaned up (for async font loading)
+    let cancelled = false
+    let disposeSidebarImage: (() => void) | undefined
+    let unsubscribeAutocorrect: (() => void) | undefined
+
+    // Clear container
+    container.innerHTML = ''
+
+    // Calculate lineHeight that produces integer cell height for any fontSize
+    // This keeps cell sizing stable across fractional line-height rendering
+    const calcLineHeight = (size: number, lh: number) => Math.round(size * lh) / size
+    const computedLineHeight = calcLineHeight(fontSize, lineHeight)
+
+    const terminal = new Terminal({
+      fontFamily,
+      fontSize,
+      lineHeight: computedLineHeight,
+      letterSpacing,
+      scrollback: 0, // Disabled - we use tmux scrollback instead
+      cursorBlink: false,
+      cursorStyle: 'underline',
+      // PTY/tmux output already carries cursor movement. Rewriting LF as CRLF
+      // corrupts cursor-column state for fullscreen applications.
+      convertEol: false,
+      theme,
+      screenReaderMode: isiOS,
+      // Ensure text is readable even when apps use true color (24-bit RGB) sequences
+      // that bypass our theme colors (e.g., Pi using black text on dark backgrounds)
+      minimumContrastRatio: 4.5,
+      // Option+drag forces a local selection even when the pane's app owns the
+      // mouse (Claude/Codex fullscreen TUIs) — the standard macOS convention for
+      // selecting text in a mouse-mode terminal.
+      macOptionClickForcesSelection: true,
+    })
+
+    const fitAddon = new FitAddon()
+    terminal.loadAddon(fitAddon)
+    // Decode inline iTerm/SIXEL graphics forwarded by tmux passthrough.
+    // Bound decoded image storage per terminal; several panes can be mounted.
+    terminal.loadAddon(new ImageAddon({ storageLimit: 32 }))
+    terminal.loadAddon(new ClipboardAddon(undefined, new SafeClipboardProvider({
+      onWriteFailed: offerClipboardCopy,
+    })))
+
+    // Load search addon for terminal buffer search
+    const searchAddon = new SearchAddon()
+    terminal.loadAddon(searchAddon)
+    searchAddonRef.current = searchAddon
+
+    // Load serialize addon for exporting terminal state
+    const serializeAddon = new SerializeAddon()
+    terminal.loadAddon(serializeAddon)
+    serializeAddonRef.current = serializeAddon
+
+    // Load progress addon for OSC 9;4 progress sequences
+    const progressAddon = new ProgressAddon()
+    terminal.loadAddon(progressAddon)
+    progressAddonRef.current = progressAddon
+
+    // Function to complete terminal initialization after fonts are ready
+    // This ensures the WebGL renderer builds its texture atlas with correct font metrics
+    let disposeWindowsPasteInput: (() => void) | undefined
+    const openTerminal = () => {
+      if (cancelled) return
+
+      // The runtime toggle effect may already have loaded the addon if
+      // WebGL was switched on while fonts were still loading.
+      if (useWebGLRef.current && !webglAddonRef.current) {
+        try {
+          const webglAddon = new WebglAddon()
+          // Dispose on context loss so xterm falls back to canvas renderer
+          // instead of trying to render through a dead WebGL context (causes artifacts)
+          webglAddon.onContextLoss(() => {
+            clientLog('webgl_context_loss', { sessionId }, 'info')
+            try { webglAddon.dispose() } catch { /* ignore */ }
+            webglAddonRef.current = null
+          })
+          terminal.loadAddon(webglAddon)
+          webglAddonRef.current = webglAddon
+        } catch {
+          // WebGL addon is optional
+        }
+      }
+
+      terminal.open(container)
+      const textarea = terminal.textarea
+      if (textarea && /^Win/i.test(navigator.platform)) {
+        let composing = false
+        let commitTimer: ReturnType<typeof setTimeout> | undefined
+        let pendingPasteInputClear = false
+        const compositionStart = () => {
+          clearTimeout(commitTimer)
+          composing = true
+        }
+        const compositionEnd = () => {
+          // xterm reads the committed value in its own compositionend timer.
+          clearTimeout(commitTimer)
+          commitTimer = setTimeout(() => {
+            composing = false
+            if (pendingPasteInputClear) {
+              textarea.value = ''
+              pendingPasteInputClear = false
+            }
+          }, 0)
+        }
+        textarea.addEventListener('compositionstart', compositionStart)
+        textarea.addEventListener('compositionend', compositionEnd)
+        clearWindowsPasteInputRef.current = () => {
+          // Explicit Agentboard pastes bypass xterm's paste handler, which clears
+          // this field. Old text can make Microsoft Pinyin's next commit disappear.
+          if (composing) {
+            pendingPasteInputClear = true
+            return
+          }
+          if (textarea.value) textarea.value = ''
+        }
+        disposeWindowsPasteInput = () => {
+          clearTimeout(commitTimer)
+          textarea.removeEventListener('compositionstart', compositionStart)
+          textarea.removeEventListener('compositionend', compositionEnd)
+          clearWindowsPasteInputRef.current = null
+        }
+      }
+      disposeSidebarImage = installCodexSidebarImage(terminal, () => {
+        const selected = previewSession.current
+        return selected.agentType === 'codex' && selected.sessionId === readySessionRef.current ? selected.agentSessionId ?? null : null
+      })
+      const updateAutocorrect = () => {
+        // Recovery drafts use xterm's ordinary input path, not terminal correction sequences.
+        const settings = useSettingsStore.getState()
+        const enabled = (isiOS || isAndroid) && settings.mobileAutocorrect
+          && !!readySessionRef.current && !deferInputRef.current
+        if (enabled === !!nativeInputRef.current) return
+        nativeInputRef.current?.dispose()
+        nativeInputRef.current = null
+        if (enabled) {
+          nativeInputRef.current = installMobileAutocorrect(terminal, () => !!readySessionRef.current, isAndroid ? 'android' : 'ios')
+          clientLog('mobile_autocorrect', {
+            platform: isAndroid ? 'android' : 'ios',
+            protocol: 'explicit-replacement',
+            standalone: (navigator as Navigator & { standalone?: boolean }).standalone === true,
+            displayMode: window.matchMedia('(display-mode: standalone)').matches ? 'standalone' : 'browser',
+          }, 'info')
+        }
+      }
+      updateNativeInputRef.current = updateAutocorrect
+      updateAutocorrect()
+      unsubscribeAutocorrect = useSettingsStore.subscribe((state, previous) => {
+        if (state.mobileAutocorrect !== previous.mobileAutocorrect) updateAutocorrect()
+      })
+      fitAddon.fit()
+
+      if (!hasLoggedInitRef.current) {
+        hasLoggedInitRef.current = true
+        clientLog('terminal_init', {
+          isiOS,
+          useWebGL: useWebGLRef.current,
+          hasWebGL: !!webglAddonRef.current,
+          userAgent: navigator.userAgent.slice(0, 120),
+          platform: navigator.platform,
+          maxTouchPoints: navigator.maxTouchPoints,
+        }, 'info')
+      }
+
+      // Append tooltip after terminal.open() sets terminal.element
+      if (tooltip && terminal.element) {
+        terminal.element.appendChild(tooltip)
+      }
+    }
+
+    // Wait for fonts to be ready before opening terminal to ensure WebGL
+    // texture atlas is built with correct glyph metrics for all font weights
+    if (document.fonts?.ready) {
+      document.fonts.ready.then(openTerminal).catch(openTerminal)
+    } else {
+      // Fallback for environments without document.fonts
+      openTerminal()
+    }
+
+    // Create tooltip element inside terminal (with xterm-hover class to prevent interference)
+    // Guard for test environments where document.createElement may not be available
+    let tooltip: HTMLDivElement | null = null
+    let tooltipUrl: HTMLDivElement | null = null
+    let tooltipHint: HTMLDivElement | null = null
+    if (typeof document !== 'undefined' && document.createElement) {
+      tooltip = document.createElement('div')
+      tooltip.className = 'xterm-hover'
+      tooltip.style.cssText = `
+        position: absolute;
+        display: none;
+        z-index: 20;
+        padding: 4px 8px;
+        font-size: 12px;
+        border-radius: 4px;
+        background: var(--bg-surface);
+        border: 1px solid var(--border);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        color: var(--text-primary);
+        pointer-events: none;
+        max-width: 400px;
+        word-break: break-all;
+      `
+      tooltipUrl = document.createElement('div')
+      tooltip.appendChild(tooltipUrl)
+
+      tooltipHint = document.createElement('div')
+      tooltipHint.style.color = 'var(--text-muted)'
+      tooltipHint.style.marginTop = '2px'
+      tooltipHint.style.fontSize = '11px'
+      tooltip.appendChild(tooltipHint)
+
+      linkTooltipRef.current = tooltip
+    }
+
+    const showTooltip = (event: MouseEvent, text: string) => {
+      if (!terminal.element || !tooltip || !tooltipUrl || !tooltipHint) return
+      const sanitized = sanitizeLink(text)
+      if (!sanitized) return
+      const rect = terminal.element.getBoundingClientRect()
+      // Truncate long URLs
+      const displayUrl = sanitized.length > 60 ? sanitized.slice(0, 57) + '...' : sanitized
+      tooltipUrl.textContent = displayUrl
+      tooltipHint.textContent = `${getIsMac() ? '⌘' : 'Ctrl'}+click to open`
+      tooltip.style.left = `${event.clientX - rect.left + 10}px`
+      tooltip.style.top = `${event.clientY - rect.top + 10}px`
+      tooltip.style.display = 'block'
+    }
+
+    const hideTooltip = () => {
+      if (tooltip) tooltip.style.display = 'none'
+    }
+
+    // Track the currently hovered link URL so we can open it on mousedown
+    // before xterm.js sends mouse sequences to tmux that exit copy-mode
+    let hoveredLinkUrl: string | null = null
+    let linkOpenedOnMouseDown = false
+    let linkOpenedResetTimer: ReturnType<typeof setTimeout> | null = null
+
+    // Link handler with hover/leave callbacks - used for both OSC 8 and WebLinksAddon
+    const linkHandler = {
+      activate: (event: MouseEvent, text: string) => {
+        // Skip if already opened by mousedown handler (prevents double-open)
+        if (linkOpenedOnMouseDown) return
+        // Fallback for cases where mousedown didn't intercept
+        if (event.metaKey || event.ctrlKey) {
+          const sanitized = sanitizeLink(text)
+          if (!sanitized) return
+          window.open(sanitized, '_blank', 'noopener')
+        }
+      },
+      hover: (event: MouseEvent, text: string) => {
+        const sanitized = sanitizeLink(text)
+        hoveredLinkUrl = sanitized || null
+        showTooltip(event, text)
+      },
+      leave: () => {
+        hoveredLinkUrl = null
+        hideTooltip()
+      },
+    }
+
+    // Open links on mousedown instead of click to beat the race condition where
+    // xterm.js sends mouse sequences to tmux (exiting copy-mode) before the
+    // link addon's click handler fires
+    const handleLinkMouseDown = (e: MouseEvent) => {
+      if (hoveredLinkUrl && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault()
+        e.stopPropagation()
+        linkOpenedOnMouseDown = true
+        window.open(hoveredLinkUrl, '_blank', 'noopener')
+        // Reset flag after a short delay (in case click event still fires)
+        if (linkOpenedResetTimer) clearTimeout(linkOpenedResetTimer)
+        linkOpenedResetTimer = setTimeout(() => { linkOpenedOnMouseDown = false }, 100)
+      }
+    }
+    container.addEventListener('mousedown', handleLinkMouseDown, true)
+
+    let selectionStart: { x: number; y: number } | null = null
+    const startSelection = (event: PointerEvent) => {
+      if (event.pointerType !== 'mouse' || event.button !== 0) return
+      selectionStart = { x: event.clientX, y: event.clientY }
+    }
+    const copyMouseSelection = (event: MouseEvent) => {
+      const start = selectionStart
+      selectionStart = null
+      if (!start || event.button !== 0) return
+      if (Math.hypot(event.clientX - start.x, event.clientY - start.y) < 3) return
+      const text = terminal.getSelection()
+      if (text.trim()) void copyTextWithResult(text)
+    }
+    // xterm finalizes or clears its selection in its mouseup handler.
+    container.addEventListener('pointerdown', startSelection)
+    window.addEventListener('mouseup', copyMouseSelection)
+
+    // Set linkHandler for OSC 8 hyperlinks
+    terminal.options.linkHandler = linkHandler
+
+    // WebLinksAddon for auto-detected URLs (pass linkHandler for hover/leave)
+    const webLinksAddon = new WebLinksAddon(
+      (event, uri) => linkHandler.activate(event, uri),
+      {
+        urlRegex: URL_REGEX,
+        hover: (event, text) => linkHandler.hover(event, text),
+        leave: () => linkHandler.leave(),
+      }
+    )
+    terminal.loadAddon(webLinksAddon)
+    webLinksAddonRef.current = webLinksAddon
+
+    // Paste interception state: each keydown creates a resolver that the
+    // capture-phase paste listener fulfills with clipboardData text/metadata.
+    // This per-request model prevents race conditions with rapid pastes
+    // and avoids double-paste without depending on the async Clipboard API.
+    let pasteResolver: ((payload: PastePayload) => void) | null = null
+    let pasteTimeoutId: ReturnType<typeof setTimeout> | null = null
+    let deferredPaste: { generation: number; epoch: number } | null = null
+
+    const pasteModifier = getIsMac() ? 'metaKey' : 'ctrlKey' as const
+
+    const captureDeferredInput = (data: string, kind: 'typing' | 'paste') => {
+      if (!data || !deferredInputEnabledRef.current || !onDeferredInputRef.current) return
+      // Reject an entire terminal command sequence, never retain its printable
+      // suffix. Typing permits only text, newline, and backspace editing.
+      // Plain pasted text additionally permits tab indentation.
+      // eslint-disable-next-line no-control-regex
+      const controls = kind === 'typing' ? /[\x00-\x07\x09\x0b\x0c\x0e-\x1f\x80-\x9f]/ : /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/
+      if (controls.test(data)) return
+      onDeferredInputRef.current(kind === 'paste' ? data.replace(/\r\n?/g, '\n') : data, kind)
+    }
+
+    // Session IDs can repeat after A→B→A or reconnect. Fence each async
+    // paste to the exact attachment generation that accepted the gesture.
+    const capturePasteAttachment = (sessionId: string) => ({
+      sessionId, generation: parserGenerationRef.current, epoch: currentConnectionEpochRef.current,
+    })
+    const isPasteAttachmentCurrent = (attachment: ReturnType<typeof capturePasteAttachment>) =>
+      !deferInputRef.current && attachment.generation === parserGenerationRef.current &&
+      attachment.epoch === currentConnectionEpochRef.current &&
+      attachedSessionRef.current === attachment.sessionId &&
+      readySessionRef.current === attachment.sessionId
+
+    const sendInputIfStillAttached = (attachment: ReturnType<typeof capturePasteAttachment>, data: string | null) => {
+      if (data && isPasteAttachmentCurrent(attachment)) {
+        const expected = attachment.sessionId
+        if (inTmuxCopyModeRef.current) {
+          sendMessageRef.current({ type: 'tmux-cancel-copy-mode', sessionId: expected })
+          setTmuxCopyMode(false)
+        }
+        sendMessageRef.current({ type: 'terminal-input', sessionId: expected, data })
+      }
+    }
+
+    terminal.attachCustomKeyEventHandler((event) => {
+      if (event.type === 'keydown' && !(event[pasteModifier] && event.key.toLowerCase() === 'v')) deferredPaste = null
+      // Let Agentboard's window-level handlers receive the configured
+      // modifier + 1..9 (direct navigation) and + comma (settings) before
+      // xterm translates or cancels them. Read the store synchronously so
+      // modifier changes take effect without recreating the terminal.
+      if (
+        event.type === 'keydown' &&
+        /^(Digit[1-9]|Comma)$/.test(event.code) &&
+        matchesModifier(
+          event,
+          getEffectiveModifier(useSettingsStore.getState().shortcutModifier)
+        )
+      ) {
+        return false
+      }
+
+      // Cmd/Ctrl+C: copy selection (only non-whitespace to avoid clearing images from clipboard)
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'c') {
+        if (terminal.hasSelection()) {
+          const selection = terminal.getSelection()
+          if (selection?.trim() && navigator.clipboard) {
+            void navigator.clipboard.writeText(selection)
+          }
+          return false
+        }
+      }
+
+      // Ctrl+V on macOS desktop: dedicated image-paste shortcut. There's no
+      // browser paste event (so no clipboard blob), so we ask the server to
+      // resolve a pasteboard image path and deliver it as a bracketed paste for
+      // Claude to attach natively; Codex gets a literal Ctrl+V byte.
+      // Ctrl+V doesn't trigger a browser paste event, so there's no double-paste risk.
+      // Excluded on iOS: no Finder/osascript, and Ctrl+V with hardware keyboard
+      // should not trigger desktop image paste behavior.
+      if (getIsMac() && !isiOS && event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'v' && event.type === 'keydown') {
+        const attached = deferInputRef.current ? null : readySessionRef.current
+        if (attached) {
+          if (!canReadHostClipboard()) {
+            onPasteErrorRef.current?.('Use browser paste or choose a file from this device.')
+            return false
+          }
+          if (inTmuxCopyModeRef.current) {
+            sendMessageRef.current({ type: 'tmux-cancel-copy-mode', sessionId: attached })
+            setTmuxCopyMode(false)
+          }
+          const attachment = capturePasteAttachment(attached)
+          void (async () => {
+            const data = await resolveImagePasteData(agentTypeRef.current, {})
+            sendInputIfStillAttached(attachment, data)
+          })()
+        }
+        return !attached // Only swallow when attached
+      }
+
+      // Cmd+V on macOS / Ctrl+V on other platforms: intercept paste to handle
+      // Finder file copies and normal text paste.
+      // We use a capture-phase paste listener (installed below) to grab
+      // clipboardData synchronously and suppress ClipboardAddon, avoiding
+      // double-paste without any Clipboard API permission dependency.
+      if (event[pasteModifier] && event.key.toLowerCase() === 'v' && event.type === 'keydown') {
+        if ((!readySessionRef.current || deferInputRef.current) && deferredInputEnabledRef.current && onDeferredInputRef.current) {
+          // Remember gesture ownership until the native paste event. Readiness
+          // becoming true before that event must not turn it into a live paste.
+          deferredPaste = { generation: parserGenerationRef.current, epoch: currentConnectionEpochRef.current }
+          return pasteModifier === 'metaKey'
+        }
+        deferredPaste = null
+
+        // Create a per-request promise so the capture-phase paste listener
+        // can deliver clipboardData text directly to this paste attempt.
+        // Timeout ensures we don't hang if the paste event never fires.
+        // Cancel any pending paste request to prevent overlapping resolvers
+        if (pasteTimeoutId !== null) {
+          clearTimeout(pasteTimeoutId)
+          pasteTimeoutId = null
+        }
+        pasteResolver = null
+        const pastePromise = new Promise<PastePayload | null>((resolve) => {
+          pasteTimeoutId = setTimeout(() => {
+            pasteTimeoutId = null
+            pasteResolver = null
+            resolve(null)
+          }, 100)
+          pasteResolver = (payload: PastePayload) => {
+            if (pasteTimeoutId !== null) {
+              clearTimeout(pasteTimeoutId)
+              pasteTimeoutId = null
+            }
+            resolve(payload)
+          }
+        })
+        void (async () => {
+          try {
+            const attached = readySessionRef.current
+            if (!attached) return
+            const attachment = capturePasteAttachment(attached)
+
+            // Wait for the paste event to deliver text (up to 100ms timeout).
+            // Falls back to clipboard API if paste event didn't fire.
+            const payload = await pastePromise
+            if (!isPasteAttachmentCurrent(attachment)) return
+            // With browser uploads enabled, native paste owns clipboard access.
+            // Do not issue a second asynchronous read if the browser is slow.
+            if (!payload && onPasteFilesRef.current) return
+            let text = payload?.text ?? null
+            if (text === null) {
+              try { text = await navigator.clipboard.readText() } catch { text = '' }
+            }
+
+            if (!isPasteAttachmentCurrent(attachment)) return
+            if (payload?.files.length && onPasteFilesRef.current) {
+              if (isPasteAttachmentCurrent(attachment)) {
+                // File copies can also expose just their names as text. Do not
+                // insert those names alongside their uploaded paths.
+                const names = payload.files.map((file) => file.name).join('\n')
+                onPasteFilesRef.current({ files: payload.files, text: text.trim() === names ? '' : text })
+              }
+              return
+            }
+
+            if (payload?.hasImage && getIsMac() && !isiOS) {
+              if (!canReadHostClipboard()) {
+                if (payload.imageBlob) {
+                  const blob = payload.imageBlob
+                  onPasteFilesRef.current?.({ text: '', files: [new File([blob], `clipboard.${blob.type.split('/')[1] || 'png'}`, { type: blob.type })] })
+                } else onPasteErrorRef.current?.('The browser did not provide image data. Choose the file to upload it.')
+                return
+              }
+              // Upload the clipboard image and deliver its path as a bracketed
+              // paste so Claude attaches it natively (works in both renderers).
+              const data = await resolveImagePasteData(agentTypeRef.current, { blob: payload.imageBlob })
+              sendInputIfStillAttached(attachment, data)
+              return
+            }
+
+            // Finder copies may expose the filename as text alongside file metadata.
+            // Resolve the full path before treating that filename as ordinary text.
+            if (payload?.hasFiles && !canReadHostClipboard()) {
+              onPasteErrorRef.current?.('The browser did not provide file data. Drop the file onto the terminal or choose it to upload.')
+              return
+            }
+            if ((!text || payload?.hasFiles) && getIsMac() && !isiOS && canReadHostClipboard()) {
+              try {
+                const res = await fetch('/api/clipboard-file-path')
+                if (res.ok) {
+                  const { path, isImage } = (await res.json()) as { path: string | null; isImage?: boolean }
+                  if (path) {
+                    if (isImage) {
+                      // Deliver the resolved image path as a bracketed paste.
+                      const data = await resolveImagePasteData(agentTypeRef.current, { path })
+                      sendInputIfStillAttached(attachment, data)
+                      return
+                    }
+                    // Send as raw input (no bracket paste) so Claude Code
+                    // doesn't detect a paste and read the system clipboard.
+                    // Trailing space matches the browser file-upload path
+                    // (useBrowserPaste) so consecutive paths don't merge.
+                    sendInputIfStillAttached(attachment, sanitizeImagePath(path) + ' ')
+                    return
+                  }
+                }
+              } catch { /* not on macOS or endpoint unavailable */ }
+            }
+
+            if (text && !isMacSharedPasteboardPathText(text)) {
+              // Deliver as an explicit paste so the server can bracket it via
+              // tmux (paste-buffer -p). Relying on xterm's terminal.paste()
+              // would only bracket when the browser's own bracketedPasteMode is
+              // on — which it isn't when we attach to an already-running app
+              // (e.g. Claude Code in no-flicker/fullscreen), causing multi-line
+              // pastes to auto-submit on the first newline. Guard on the live
+              // ref (like sendInputIfStillAttached) so a session switch during
+              // the async clipboard read doesn't paste into the wrong session.
+              if (isPasteAttachmentCurrent(attachment)) {
+                // Exit tmux copy-mode first (as onData does for typed input):
+                // paste-buffer into a pane still in copy-mode is swallowed by
+                // the copy-mode key table instead of reaching the program.
+                if (inTmuxCopyModeRef.current) {
+                  sendMessageRef.current({ type: 'tmux-cancel-copy-mode', sessionId: attached })
+                  setTmuxCopyMode(false)
+                }
+                const sent = sendMessageRef.current({ type: 'terminal-paste', sessionId: attached, data: text })
+                if (sent === false && !payload?.hasFiles && !payload?.hasImage) captureDeferredInput(text, 'paste')
+              }
+              return
+            }
+
+            // Shared Mac clipboard image pastes can expose only a protected
+            // useractivityd path to the browser. Sending that path to an agent
+            // is useless; ask the server to resolve a real pasteboard image path
+            // (falling back to the empty-bracket signal) so the CLI can attach it.
+            if (getIsMac() && !isiOS && canReadHostClipboard()) {
+              const data = await resolveImagePasteData(agentTypeRef.current, {})
+              sendInputIfStillAttached(attachment, data)
+            }
+          } finally {
+            pasteResolver = null
+          }
+        })()
+        // Browser file uploads are handled by the capture-phase paste listener.
+        // Safari needs the key's default action to dispatch that native event.
+        // On Windows/Linux, continuing through xterm would emit ^V and cancel
+        // the browser default. macOS Cmd+V has no such xterm mapping.
+        return Boolean(onPasteFilesRef.current) && pasteModifier === 'metaKey'
+      }
+
+      // Ctrl+Backspace: delete word backward (browser eats this otherwise)
+      if (event.ctrlKey && event.key === 'Backspace' && event.type === 'keydown') {
+        const attached = deferInputRef.current ? null : readySessionRef.current
+        if (attached) {
+          sendMessageRef.current({ type: 'terminal-input', sessionId: attached, data: '\x17' })
+        }
+        return false
+      }
+
+      return true
+    })
+
+    // Capture-phase paste listener: when our keydown handler has an active
+    // pasteResolver, grab the clipboard text synchronously from clipboardData
+    // (no permissions needed) and suppress the event so ClipboardAddon doesn't
+    // also paste (preventing double-paste).
+    const handlePaste = (e: ClipboardEvent) => {
+      const deferred = deferredPaste
+      deferredPaste = null
+      if (deferred || (!pasteResolver && (!readySessionRef.current || deferInputRef.current) && onDeferredInputRef.current && deferredInputEnabledRef.current)) {
+        e.preventDefault()
+        e.stopPropagation()
+        if (deferred && (deferred.generation !== parserGenerationRef.current || deferred.epoch !== currentConnectionEpochRef.current)) return
+        const clipboard = e.clipboardData
+        const hasFiles = (clipboard?.files?.length ?? 0) > 0 ||
+          Array.from(clipboard?.items ?? []).some(item => item.kind === 'file') ||
+          Array.from(clipboard?.types ?? []).includes('Files')
+        if (!hasFiles && !clipboardHasImage(clipboard)) captureDeferredInput(clipboard?.getData('text/plain') ?? '', 'paste')
+        return
+      }
+      if (!pasteResolver) {
+        const files = clipboardFiles(e.clipboardData)
+        const text = e.clipboardData?.getData('text/plain') ?? ''
+        if ((!files.length && !text) || !onPasteFilesRef.current) return
+        e.preventDefault()
+        e.stopPropagation()
+        if (readySessionRef.current && readySessionRef.current === attachedSessionRef.current) {
+          const names = files.map(file => file.name).join('\n')
+          onPasteFilesRef.current({ text: files.length && text.trim() === names ? '' : text, files })
+        }
+        return
+      }
+      e.preventDefault()
+      e.stopPropagation()
+      const text = e.clipboardData?.getData('text/plain') ?? ''
+      const imageBlob = getClipboardImageBlob(e.clipboardData)
+      const hasImage = imageBlob !== null || clipboardHasImage(e.clipboardData)
+      const resolver = pasteResolver
+      pasteResolver = null
+      const hasFiles = (e.clipboardData?.files?.length ?? 0) > 0
+        || Array.from(e.clipboardData?.items ?? []).some((item) => item.kind === 'file')
+        || Array.from(e.clipboardData?.types ?? []).includes('Files')
+      resolver({ text, hasImage, hasFiles, imageBlob, files: clipboardFiles(e.clipboardData) })
+    }
+    container.addEventListener('paste', handlePaste, { capture: true })
+
+    // Handle input - only send to attached session
+    terminal.onData((data) => {
+      const attached = deferInputRef.current ? null : readySessionRef.current
+      if (attached) {
+        // When in copy-mode, filter out mouse sequences so clicks don't exit copy-mode
+        // This prevents accidental copy-mode exit when clicking in scrollback (Safari desktop)
+        // Mouse sequence formats:
+        // - SGR extended: ESC [ < Ps ; Ps ; Ps M/m (most common with tmux)
+        // - URXVT: ESC [ Ps ; Ps ; Ps M
+        // - Normal/UTF-8: ESC [ M followed by exactly 3 encoded bytes
+        // eslint-disable-next-line no-control-regex
+        const isMouseSequence = /^\x1b\[(<[\d;]+[Mm]|[\d;]+M|M[\x20-\xff]{3})$/.test(data)
+        if (inTmuxCopyModeRef.current && isMouseSequence) {
+          return // Drop mouse event, let xterm handle selection locally
+        }
+
+        // If we scrolled in tmux copy-mode, exit it before sending keyboard input
+        if (inTmuxCopyModeRef.current) {
+          sendMessageRef.current({ type: 'tmux-cancel-copy-mode', sessionId: attached })
+          setTmuxCopyMode(false)
+        }
+        const sent = sendMessageRef.current({ type: 'terminal-input', sessionId: attached, data })
+        if (sent === false) captureDeferredInput(data, 'typing')
+      } else captureDeferredInput(data, 'typing')
+    })
+
+    // Forward wheel events to tmux for scrollback (like Blink terminal)
+    // This enters tmux copy-mode instead of using xterm.js local scrollback
+    terminal.attachCustomWheelEventHandler((ev) => {
+      const attached = readySessionRef.current
+      if (!attached) return true // Let xterm handle it
+
+      // Don't intercept wheel over HTML inputs (like Claude Code's text box)
+      const target = ev.target as HTMLElement | null
+      if (target?.closest('input, textarea, [contenteditable="true"], .xterm-hover')) {
+        return true
+      }
+
+      // If user has active selection, let them scroll to extend it
+      if (terminal.hasSelection()) return true
+
+      // Shift+scroll = horizontal scroll intent, let browser handle
+      if (ev.shiftKey) return true
+
+      // Accumulate wheel delta to avoid spamming on trackpads
+      const STEP = 30
+      wheelAccumRef.current += ev.deltaY
+
+      const lines = Math.trunc(wheelAccumRef.current / STEP)
+      wheelAccumRef.current -= lines * STEP
+      sendWheelScroll(attached, lines, ev)
+      return false // We handled it, prevent xterm local scroll
+    })
+
+    terminalRef.current = terminal
+    fitAddonRef.current = fitAddon
+
+    return () => {
+      disposeWindowsPasteInput?.()
+      updateNativeInputRef.current = () => {}
+      disposeSidebarImage?.()
+      unsubscribeAutocorrect?.()
+      nativeInputRef.current?.dispose()
+      nativeInputRef.current = null
+      // Cancel any pending async operations (font loading)
+      cancelled = true
+      // Clean up link handling state
+      if (linkOpenedResetTimer) clearTimeout(linkOpenedResetTimer)
+      hoveredLinkUrl = null
+      // Remove link mousedown handler
+      container.removeEventListener('mousedown', handleLinkMouseDown, true)
+      container.removeEventListener('pointerdown', startSelection)
+      window.removeEventListener('mouseup', copyMouseSelection)
+      // Remove paste intercept handler
+      container.removeEventListener('paste', handlePaste, true)
+      if (pasteTimeoutId !== null) {
+        clearTimeout(pasteTimeoutId)
+        pasteTimeoutId = null
+      }
+      pasteResolver = null
+      // Remove tooltip element
+      if (linkTooltipRef.current) {
+        linkTooltipRef.current.remove()
+        linkTooltipRef.current = null
+      }
+      if (webLinksAddonRef.current) {
+        try {
+          webLinksAddonRef.current.dispose()
+        } catch {
+          // Ignore
+        }
+        webLinksAddonRef.current = null
+      }
+      if (webglAddonRef.current) {
+        try {
+          webglAddonRef.current.dispose()
+        } catch {
+          // Ignore
+        }
+        webglAddonRef.current = null
+      }
+      parserGenerationRef.current += 1
+      parserActiveRef.current?.discarded?.()
+      parserActiveRef.current = null
+      for (const operation of parserQueueRef.current.splice(0)) operation.discarded?.()
+      try {
+        terminal.dispose()
+      } catch {
+        // Ignore
+      }
+      if (container) {
+        container.innerHTML = ''
+      }
+      terminalRef.current = null
+      fitAddonRef.current = null
+      searchAddonRef.current = null
+      serializeAddonRef.current = null
+      progressAddonRef.current = null
+      if (fitTimer.current) {
+        window.clearTimeout(fitTimer.current)
+      }
+      if (copyModeCheckTimer.current !== null) {
+        window.clearTimeout(copyModeCheckTimer.current)
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitAndResize])
+
+  // Update theme
+  useEffect(() => {
+    if (terminalRef.current) {
+      terminalRef.current.options.theme = theme
+    }
+  }, [theme])
+
+  // Update font size, lineHeight, letterSpacing, and fontFamily (maintaining integer cell height)
+  useEffect(() => {
+    const terminal = terminalRef.current
+    const fitAddon = fitAddonRef.current
+    if (terminal && fitAddon) {
+      terminal.options.fontFamily = fontFamily
+      terminal.options.fontSize = fontSize
+      // Recalculate lineHeight for integer cell height
+      terminal.options.lineHeight = Math.round(fontSize * lineHeight) / fontSize
+      terminal.options.letterSpacing = letterSpacing
+      fitAddon.fit()
+      // Notify server of new dimensions
+      const attached = attachedSessionRef.current
+      if (attached) {
+        sendMessageRef.current({
+          type: 'terminal-resize',
+          sessionId: attached,
+          cols: terminal.cols,
+          rows: terminal.rows,
+        })
+      }
+    }
+  }, [fontSize, lineHeight, letterSpacing, fontFamily])
+
+  // Handle WebGL toggle at runtime
+  useEffect(() => {
+    const terminal = terminalRef.current
+    if (!terminal) return
+
+    const wasEnabled = useWebGLRef.current
+    useWebGLRef.current = useWebGL
+
+    // Skip on first render (initialization handles it)
+    if (wasEnabled === useWebGL) return
+
+    if (useWebGL) {
+      // Enable WebGL
+      if (!webglAddonRef.current) {
+        try {
+          const webglAddon = new WebglAddon()
+          webglAddon.onContextLoss(() => {
+            try { webglAddon.dispose() } catch { /* ignore */ }
+            webglAddonRef.current = null
+          })
+          terminal.loadAddon(webglAddon)
+          webglAddonRef.current = webglAddon
+        } catch {
+          // WebGL addon is optional
+        }
+      }
+    } else {
+      // Disable WebGL - dispose addon to fall back to canvas
+      if (webglAddonRef.current) {
+        try {
+          webglAddonRef.current.dispose()
+        } catch {
+          // Ignore disposal errors
+        }
+        webglAddonRef.current = null
+      }
+    }
+  }, [useWebGL])
+
+  // Revoke input synchronously when selection or connection intent changes.
+  // The full attach routine remains passive because xterm is initialized in a
+  // passive effect, but this layout effect closes the old-pane input window
+  // before the browser can deliver another user event.
+  useLayoutEffect(() => {
+    nativeInputRef.current?.reset()
+    parserGenerationRef.current += 1
+    readySessionRef.current = null
+    wheelBoundsRef.current = undefined
+    wheelAccumRef.current = 0
+    acknowledgeOutput(outputBufferRef.current)
+    outputBufferRef.current = []
+    if (sessionId && allowAttach && connectionStatus === 'connected') setIsSwitching(true)
+    return () => { parserGenerationRef.current += 1 }
+  }, [sessionId, tmuxTarget, allowAttach, connectionStatus, connectionEpoch, acknowledgeOutput])
+
+  // Pause correction while detached or collecting a recovery draft; resume after ready.
+  useLayoutEffect(() => {
+    updateNativeInputRef.current()
+  }, [isSwitching, deferInput, sessionId, tmuxTarget, allowAttach, connectionStatus, connectionEpoch])
+
+  // Handle session changes and websocket reconnects - attach/detach.
+  useEffect(() => {
+    const terminal = terminalRef.current
+    if (!terminal) return
+
+    const prevAttached = attachedSessionRef.current
+    const prevTarget = attachedTargetRef.current
+
+    if (!allowAttach) {
+      readySessionRef.current = null
+      if (attachDebounceRef.current !== null) {
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
+      if (prevAttached) {
+        sendMessageRef.current({ type: 'terminal-detach', sessionId: prevAttached })
+        attachedSessionRef.current = null
+        attachedTargetRef.current = null
+        attachedConnectionEpochRef.current = -1
+        focusAfterAttachSessionRef.current = null
+        setTmuxCopyMode(false)
+      }
+      writeTerminal('', true)
+      needsResetRef.current = false
+      setIsSwitching(false)
+      return
+    }
+
+    // Reattach when websocket comes back: server-side ws.currentSessionId is
+    // cleared on disconnect, so input is ignored until a fresh terminal-attach.
+    if (connectionStatus !== 'connected') {
+      readySessionRef.current = null
+      if (attachDebounceRef.current !== null) {
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
+      if (prevAttached) {
+        clientLog('terminal_detach_on_disconnect', { connectionStatus, prevAttached })
+        attachedSessionRef.current = null
+        attachedTargetRef.current = null
+        attachedConnectionEpochRef.current = -1
+        focusAfterAttachSessionRef.current = null
+        setTmuxCopyMode(false)
+      }
+      // Server state may have changed — all snapshots are potentially stale
+      clearSnapshotCache()
+      needsResetRef.current = false
+      setIsSwitching(false)
+      return
+    }
+
+    // Detach from previous session first
+    if (prevAttached && prevAttached !== sessionId) {
+      readySessionRef.current = null
+      // Capture terminal snapshot before detach for instant restore on switch-back
+      try {
+        const serialized = serializeAddonRef.current?.serialize()
+        if (serialized) {
+          snapshotCache.set(prevAttached, serialized)
+          // Evict oldest entry if over limit
+          if (snapshotCache.size > MAX_SNAPSHOT_ENTRIES) {
+            const oldest = snapshotCache.keys().next().value
+            if (oldest) snapshotCache.delete(oldest)
+          }
+        }
+      } catch {
+        // serialize() can fail on a disposed terminal — ignore
+      }
+      sendMessageRef.current({ type: 'terminal-detach', sessionId: prevAttached })
+      attachedSessionRef.current = null
+      attachedTargetRef.current = null
+      attachedConnectionEpochRef.current = -1
+      focusAfterAttachSessionRef.current = null
+      // Reset copy-mode state - each session has its own scroll position
+      setTmuxCopyMode(false)
+    }
+
+    // Attach to new session
+    const attachedEpoch = attachedConnectionEpochRef.current
+    const needsReattachForConnection = connectionEpoch !== attachedEpoch
+
+    if (sessionId && (sessionId !== prevAttached || tmuxTarget !== prevTarget || needsReattachForConnection)) {
+      clientLog('terminal_attach', {
+        sessionId,
+        tmuxTarget,
+        prevAttached,
+        prevTarget,
+        connectionStatus,
+        connectionEpoch,
+        attachedEpoch,
+      })
+      const switchStart = performance.now()
+
+      // Defer reset until history arrives (no blank flash).
+      // Drain stale output buffer first — prevents old session's data
+      // from consuming the one-shot reset meant for new session's history.
+      outputBufferRef.current = []
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current)
+        idleTimerRef.current = null
+      }
+      if (maxTimerRef.current !== null) {
+        window.clearTimeout(maxTimerRef.current)
+        maxTimerRef.current = null
+      }
+      needsResetRef.current = true
+      setIsSwitching(true)
+      if (prevAttached !== null) {
+        readySessionRef.current = null
+      }
+
+      // Instantly show cached snapshot for the target session (if available)
+      const cached = snapshotCache.get(sessionId)
+      if (cached) {
+        writeTerminal(stripMouseModeSequences(cached, mouseModeTailRef), true)
+        // needsResetRef stays true — live history will replace the snapshot
+      }
+
+      // Fit terminal first to get accurate dimensions
+      const fitAddon = fitAddonRef.current
+      if (fitAddon) {
+        fitAddon.fit()
+      }
+      const fitDone = performance.now()
+
+      // Mark refs before sending so the output subscriber can match
+      // incoming messages to the correct session. Input is naturally suppressed
+      // because terminal-input uses attachedSessionRef which won't reach the
+      // server until ws.data.currentSessionId is set by the server's handler.
+      attachedSessionRef.current = sessionId
+      attachedTargetRef.current = tmuxTarget ?? null
+      attachedConnectionEpochRef.current = connectionEpoch
+      focusAfterAttachSessionRef.current = sessionId
+
+      // Store the start time so the output subscriber can measure end-to-end
+      switchStartRef.current = switchStart
+
+      // Cancel any pending attach from a rapid epoch change
+      if (attachDebounceRef.current !== null) {
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
+
+      const attachMsg = {
+        type: 'terminal-attach' as const,
+        sessionId,
+        tmuxTarget: tmuxTarget ?? undefined,
+        cols: terminal.cols,
+        rows: terminal.rows,
+      }
+
+      const isSessionSwitch = prevAttached !== null && prevAttached !== sessionId
+
+      // Session switch (e.g. after kill): use microtask so the message is sent
+      // after the current React commit phase but before the browser yields to
+      // new tasks — cannot be cancelled by effect cleanup unlike setTimeout.
+      // Reconnection / epoch change: use 50ms debounce to deduplicate rapid
+      // re-attaches from rapid epoch changes.
+      if (isSessionSwitch) {
+        const attachTarget = sessionId
+        queueMicrotask(() => {
+          // Guard: skip if a newer switch already changed the target
+          if (attachedSessionRef.current !== attachTarget) return
+          sendMessageRef.current(attachMsg)
+          sendMessageRef.current({ type: 'tmux-check-copy-mode', sessionId })
+        })
+      } else {
+        attachDebounceRef.current = window.setTimeout(() => {
+          attachDebounceRef.current = null
+          sendMessageRef.current(attachMsg)
+          sendMessageRef.current({ type: 'tmux-check-copy-mode', sessionId })
+        }, 50)
+      }
+
+      clientLog('switch_attach_sent', {
+        sessionId,
+        fitMs: Math.round(fitDone - switchStart),
+        totalMs: Math.round(performance.now() - switchStart),
+        from: prevAttached ?? null,
+        immediate: isSessionSwitch,
+      })
+    }
+
+    // No attach needed — already attached to this session+target
+    if (
+      sessionId &&
+      sessionId === prevAttached &&
+      tmuxTarget === prevTarget &&
+      !needsReattachForConnection
+    ) {
+      clientLog('terminal_attach_skip', {
+        sessionId,
+        prevAttached,
+        connectionStatus,
+        connectionEpoch,
+        attachedEpoch,
+      })
+    }
+    // Handle deselection — cancel any pending debounced attach
+    if (!sessionId && prevAttached) {
+      if (attachDebounceRef.current !== null) {
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
+      attachedSessionRef.current = null
+      attachedTargetRef.current = null
+      attachedConnectionEpochRef.current = -1
+      focusAfterAttachSessionRef.current = null
+      readySessionRef.current = null
+    }
+
+    // Cancel pending debounced attach on effect re-run or unmount
+    return () => {
+      if (attachDebounceRef.current !== null) {
+        clientLog('attach_debounce_cancelled', {
+          sessionId,
+          attachedSession: attachedSessionRef.current,
+        }, 'info')
+        window.clearTimeout(attachDebounceRef.current)
+        attachDebounceRef.current = null
+      }
+    }
+  }, [sessionId, tmuxTarget, allowAttach, connectionStatus, connectionEpoch, checkScrollPosition, setTmuxCopyMode, writeTerminal])
+
+  useEffect(() => {
+    if (copyModePollIntervalRef.current !== null) {
+      globalThis.clearInterval(copyModePollIntervalRef.current)
+      copyModePollIntervalRef.current = null
+    }
+
+    if (!sessionId || !allowAttach || connectionStatus !== 'connected') return
+
+    copyModePollIntervalRef.current = globalThis.setInterval(() => {
+      if (attachedSessionRef.current !== sessionId) return
+      sendMessageRef.current({ type: 'tmux-check-copy-mode', sessionId })
+    }, 750)
+
+    return () => {
+      if (copyModePollIntervalRef.current !== null) {
+        globalThis.clearInterval(copyModePollIntervalRef.current)
+        copyModePollIntervalRef.current = null
+      }
+    }
+  }, [sessionId, allowAttach, connectionStatus])
+
+  // Subscribe to terminal output with idle-based buffering
+  // Batches chunks until the stream goes idle to avoid splitting escape sequences
+  useEffect(() => {
+    const flush = () => {
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current)
+        idleTimerRef.current = null
+      }
+      if (maxTimerRef.current !== null) {
+        window.clearTimeout(maxTimerRef.current)
+        maxTimerRef.current = null
+      }
+
+      const terminal = terminalRef.current
+      const chunks = outputBufferRef.current
+      if (!terminal || chunks.length === 0) return
+
+      outputBufferRef.current = []
+      const data = chunks.map(chunk => chunk.data).join('')
+
+      const reset = needsResetRef.current
+      needsResetRef.current = false
+
+      const writeStart = performance.now()
+      const dataLen = data.length
+
+      writeTerminal(stripMouseModeSequences(data, mouseModeTailRef), reset, () => {
+        acknowledgeOutput(chunks)
+        const writeMs = Math.round(performance.now() - writeStart)
+        // Log slow writes (>50ms) to catch render bottlenecks
+        if (writeMs > 50) {
+          clientLog('switch_write_slow', {
+            sessionId: attachedSessionRef.current,
+            writeMs,
+            bytes: dataLen,
+          })
+        }
+        if (isiOS && writeMs > 50) {
+          clientLog('ios_write_slow', {
+            sessionId: attachedSessionRef.current,
+            writeMs,
+            bytes: dataLen,
+          })
+        }
+        checkScrollPosition()
+      }, () => acknowledgeOutput(chunks))
+    }
+
+    const scheduleFlush = () => {
+      // Reset idle timer on each new chunk
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current)
+      }
+      idleTimerRef.current = window.setTimeout(flush, IDLE_FLUSH_MS)
+
+      // Start max timer if not already running
+      if (maxTimerRef.current === null) {
+        maxTimerRef.current = window.setTimeout(flush, MAX_FLUSH_MS)
+      }
+    }
+
+    const emitDropLog = () => {
+      const acc = droppedOutputRef.current
+      acc.timer = null
+      if (acc.count === 0) return
+      clientLog('terminal_output_dropped', {
+        messageSessionId: acc.lastMessageSessionId,
+        attachedSession: attachedSessionRef.current,
+        drops: acc.count,
+        bytes: acc.bytes,
+        hasSwitchStart: switchStartRef.current !== null,
+      }, 'info')
+      acc.count = 0
+      acc.bytes = 0
+      acc.lastEmit = performance.now()
+    }
+
+    const unsubscribe = subscribe((message) => {
+      const attachedSession = attachedSessionRef.current
+
+      // Log dropped terminal-output to diagnose missing history after kill —
+      // aggregated to at most one log per second (see droppedOutputRef).
+      if (
+        message.type === 'terminal-output' &&
+        (!attachedSession || message.sessionId !== attachedSession)
+      ) {
+        const acc = droppedOutputRef.current
+        acc.count += 1
+        acc.bytes += message.data.length
+        acc.lastMessageSessionId = message.sessionId
+        const now = performance.now()
+        if (now - acc.lastEmit >= 1000) {
+          emitDropLog()
+        } else if (acc.timer === null) {
+          acc.timer = window.setTimeout(emitDropLog, 1000 - (now - acc.lastEmit))
+        }
+      }
+
+      if (
+        message.type === 'terminal-output' &&
+        attachedSession &&
+        message.sessionId === attachedSession
+      ) {
+        // Log time from attach-send to first output (server roundtrip)
+        const switchStart = switchStartRef.current
+        if (switchStart) {
+          clientLog('switch_first_output', {
+            sessionId: message.sessionId,
+            serverRoundtripMs: Math.round(performance.now() - switchStart),
+            bytes: message.data.length,
+            parseMs: (message as ServerMessageWithDiagnostics)._parseMs ?? -1,
+            rawLength: (message as ServerMessageWithDiagnostics)._rawLength ?? -1,
+          })
+          // Clear so we only log for the first output after a switch
+          switchStartRef.current = null
+        }
+
+        outputBufferRef.current.push({
+          data: isiOS ? forceTextPresentation(message.data) : message.data,
+          outputSeq: message.outputSeq,
+          epoch: (message as ServerMessageWithDiagnostics)._connectionEpoch ?? currentConnectionEpochRef.current,
+        })
+        scheduleFlush()
+      }
+
+      if (
+        message.type === 'terminal-ready' &&
+        attachedSession &&
+        message.sessionId === attachedSession
+      ) {
+        readySessionRef.current = null
+        flush()
+        const reset = needsResetRef.current
+        needsResetRef.current = false
+        const readySession = message.sessionId
+        // Even an empty write is queued by xterm, so this callback follows all
+        // preceding screen data. The operation's generation guards A→B→A and
+        // a reconnect to the same session while parsing is still outstanding.
+        writeTerminal('', reset, () => {
+          if (attachedSessionRef.current !== readySession) return
+          readySessionRef.current = readySession
+          setIsSwitching(false)
+
+          const readySwitchStart = switchStartRef.current
+          // switchStartRef may already be cleared by terminal-output above; only log if still set
+          if (readySwitchStart) {
+            clientLog('switch_ready', {
+              sessionId: message.sessionId,
+              totalMs: Math.round(performance.now() - readySwitchStart),
+            })
+            switchStartRef.current = null
+          }
+
+          if (focusAfterAttachSessionRef.current === message.sessionId) {
+            terminalRef.current?.focus()
+            focusAfterAttachSessionRef.current = null
+          }
+
+          // Force iOS compositor repaint after reconnect data delivery.
+          // The visibilitychange repaint fires early and may only show stale
+          // content; this second repaint catches the fresh data from reconnect.
+          // Flush pending output first so the repaint captures fresh data.
+          // Uses shared scheduleIosRepaint so it coalesces with any pending
+          // visibility-triggered repaint (no double-flicker).
+          if (isiOS) {
+            scheduleIosRepaint(50, 'terminal-ready')
+          }
+        })
+      }
+
+      // Clear switching state on terminal-error so spinner doesn't get stuck
+      if (
+        message.type === 'terminal-error' &&
+        attachedSession &&
+        (!message.sessionId || message.sessionId === attachedSession)
+      ) {
+        parserGenerationRef.current += 1
+        readySessionRef.current = null
+        acknowledgeOutput(outputBufferRef.current)
+        outputBufferRef.current = []
+        needsResetRef.current = false
+        setIsSwitching(false)
+      }
+
+      if (
+        message.type === 'clipboard-offer' &&
+        attachedSession &&
+        message.sessionId === attachedSession
+      ) {
+        const text = message.text
+        if (!text?.trim()) return
+
+        if (!isiOS && navigator.clipboard?.writeText) {
+          const startedAt = performance.now()
+          void navigator.clipboard.writeText(text)
+            .then(() => {
+              clientLog('clipboard_write_success', {
+                source: message.source,
+                chars: text.length,
+                durationMs: Math.round(performance.now() - startedAt),
+              })
+            })
+            .catch((error) => {
+              clientLog('clipboard_write_failed', {
+                source: message.source,
+                chars: text.length,
+                error: error instanceof Error ? error.message : String(error),
+              }, 'warn')
+              offerClipboardCopy(text, message.source)
+            })
+        } else {
+          offerClipboardCopy(text, message.source)
+        }
+      }
+
+      // Handle tmux copy-mode status response
+      if (
+        message.type === 'tmux-copy-mode-status' &&
+        attachedSession &&
+        message.sessionId === attachedSession
+      ) {
+        const nextAppMouse = message.appMouse === true && !message.inCopyMode
+        appMouseRef.current = nextAppMouse
+        altScreenRef.current = message.altScreen === true
+        wheelBoundsRef.current = message.wheelBounds
+        // While the app owns the mouse, a long-press drag goes to the app as
+        // its own selection; native iOS selection would start a second one.
+        if (isiOS) {
+          const selection = typeof window.getSelection === 'function' ? window.getSelection() : null
+          setAppOwnsMouse(containerRef.current, nextAppMouse, selection)
+        }
+
+        // Client owns xterm's mouse mode: pane-output mode sequences are
+        // stripped (see stripMouseModeSequences), so the mode is driven solely
+        // here from the pane's mouse_any_flag. Heal lost modes on every status
+        // (750ms poll), not only on false→true transitions — modes can be lost
+        // without a transition (terminal.reset()/recreation, tmux mode-sync
+        // gaps), leaving the pane permanently unable to receive mouse input.
+        //
+        // But only write on actual desync: every DECSET/DECRST fires xterm's
+        // onProtocolChange even for a same-value set, and that handler runs
+        // selectionService.disable() → clearSelection() — which destroys any
+        // in-progress or completed selection and removes the mid-drag
+        // document listeners. A same-mode rewrite is never safe.
+        const terminal = terminalRef.current
+        if (terminal) {
+          const mode = terminal.modes.mouseTrackingMode
+          if (nextAppMouse ? mode !== 'drag' : mode !== 'none') {
+            writeTerminal(nextAppMouse ? ENABLE_MOUSE_TRACKING : DISABLE_MOUSE_TRACKING)
+          }
+        }
+
+        setTmuxCopyMode(message.inCopyMode)
+      }
+    })
+
+    return () => {
+      unsubscribe()
+      // Flush any remaining buffer on cleanup
+      flush()
+      cancelIosRepaint()
+      // Emit the pending aggregate instead of discarding it with the timer.
+      if (droppedOutputRef.current.timer !== null) {
+        window.clearTimeout(droppedOutputRef.current.timer)
+      }
+      emitDropLog()
+    }
+  }, [subscribe, checkScrollPosition, setTmuxCopyMode, offerClipboardCopy, writeTerminal, acknowledgeOutput])
+
+  // Handle resize - with longer debounce to prevent flickering
+  useEffect(() => {
+    const container = containerRef.current
+    const terminal = terminalRef.current
+    const fitAddon = fitAddonRef.current
+
+    if (!container || !terminal || !fitAddon) return
+
+    const handleResize = () => {
+      if (resizeTimer.current) {
+        window.clearTimeout(resizeTimer.current)
+      }
+
+      // Longer debounce to prevent rapid resize events
+      resizeTimer.current = window.setTimeout(() => {
+        fitAndResize()
+      }, 150)
+    }
+
+    const observer = new ResizeObserver(handleResize)
+    observer.observe(container)
+
+    // Initial fit
+    handleResize()
+
+    return () => {
+      observer.disconnect()
+      if (resizeTimer.current) {
+        window.clearTimeout(resizeTimer.current)
+      }
+    }
+  }, [])
+
+  // Force iOS compositor repaint on visibility resume.
+  // iOS WKWebView shows a stale cached snapshot after background/foreground.
+  // Uses shared scheduleIosRepaint/cancelIosRepaint so the visibility and
+  // terminal-ready repaint paths can't interfere with each other.
+  //
+  // Also recreate WebGL context — iOS can silently kill it during background.
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return
+
+    // Log visibility changes unconditionally for diagnostics
+    const handleVisibilityDiag = () => {
+      if (document.visibilityState !== 'hidden') {
+        clientLog('terminal_visibility_resume', {
+          isiOS,
+          hasWebGL: !!webglAddonRef.current,
+          useWebGL: useWebGLRef.current,
+          hasTerminal: !!terminalRef.current,
+          bufferLines: terminalRef.current?.buffer.active.length ?? 0,
+          sessionId: attachedSessionRef.current,
+        }, 'info')
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibilityDiag)
+
+    if (!isiOS) {
+      return () => {
+        document.removeEventListener('visibilitychange', handleVisibilityDiag)
+      }
+    }
+
+    // iOS can silently kill the WebGL context during background without
+    // firing onContextLoss. Force-recreate the addon to get a fresh context.
+    // Without this, xterm renders through a dead WebGL context → blank screen.
+    // Called from multiple resume handlers because iOS doesn't reliably fire
+    // visibilitychange (WebKit #202399) — focus is often the only event.
+    const recreateWebGLIfNeeded = (trigger: string) => {
+      const terminal = terminalRef.current
+      if (terminal && webglAddonRef.current && useWebGLRef.current) {
+        try {
+          webglAddonRef.current.dispose()
+        } catch { /* ignore */ }
+        webglAddonRef.current = null
+        try {
+          const webglAddon = new WebglAddon()
+          webglAddon.onContextLoss(() => {
+            clientLog('webgl_context_loss', { sessionId: attachedSessionRef.current }, 'info')
+            try { webglAddon.dispose() } catch { /* ignore */ }
+            webglAddonRef.current = null
+          })
+          terminal.loadAddon(webglAddon)
+          webglAddonRef.current = webglAddon
+          clientLog('ios_webgl_recreated', { trigger }, 'info')
+        } catch {
+          clientLog('ios_webgl_recreate_failed', { trigger }, 'info')
+        }
+      }
+    }
+
+    const handleVisibility = () => {
+      // Skip hidden transitions. Don't require 'visible' specifically —
+      // visibilityState can be wrong in iOS PWA standalone (WebKit #202399).
+      if (document.visibilityState === 'hidden') return
+      recreateWebGLIfNeeded('visibilitychange')
+      scheduleIosRepaint(200, 'visibilitychange')
+    }
+
+    const handlePageShow = (e: PageTransitionEvent) => {
+      // pageshow fires on BFCache/freeze restore — more reliable than
+      // visibilitychange in iOS PWA standalone mode.
+      if (!e.persisted) return
+      recreateWebGLIfNeeded('pageshow')
+      scheduleIosRepaint(200, 'pageshow')
+    }
+
+    const handleFocus = () => {
+      // Fallback: window 'focus' reliably fires when an iOS PWA returns
+      // to the foreground, even when visibilitychange doesn't fire
+      // (WebKit #202399) and the WebSocket stays alive (no reconnect).
+      recreateWebGLIfNeeded('focus')
+      scheduleIosRepaint(200, 'focus')
+    }
+
+    document.addEventListener('visibilitychange', handleVisibility)
+    window.addEventListener('pageshow', handlePageShow)
+    window.addEventListener('focus', handleFocus)
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityDiag)
+      document.removeEventListener('visibilitychange', handleVisibility)
+      window.removeEventListener('pageshow', handlePageShow)
+      window.removeEventListener('focus', handleFocus)
+      cancelIosRepaint()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const isInputReady =
+    !!sessionId &&
+    allowAttach &&
+    connectionStatus === 'connected' &&
+    readySessionRef.current === sessionId
+
+  return {
+    resetNativeInput,
+    containerRef,
+    terminalRef,
+    searchAddonRef,
+    serializeAddonRef,
+    progressAddonRef,
+    inTmuxCopyModeRef,
+    isTmuxCopyMode,
+    appMouseRef,
+    setTmuxCopyMode,
+    sendWheelScroll,
+    isSwitching,
+    isInputReady,
+    pendingClipboardOffer,
+    copyPendingClipboardOffer,
+    dismissPendingClipboardOffer,
+  }
+}

@@ -1,0 +1,487 @@
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import fs from 'node:fs/promises'
+import fsSync from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import type { Session } from '../../shared/types'
+import { handleMatchWorkerRequest } from '../logMatchWorker'
+import type { MatchWorkerRequest } from '../logMatchWorkerTypes'
+
+const messages: unknown[] = []
+
+const bunAny = Bun as typeof Bun & { spawnSync: typeof Bun.spawnSync }
+const originalSpawnSync = bunAny.spawnSync
+const tmuxOutputs = new Map<string, string>()
+
+const originalClaude = process.env.CLAUDE_CONFIG_DIR
+const originalCodex = process.env.CODEX_HOME
+const originalPi = process.env.PI_HOME
+const originalOmpAgentDir = process.env.PI_CODING_AGENT_DIR
+const originalAgentboardData = process.env.AGENTBOARD_DATA_DIR
+const originalGrok = process.env.GROK_HOME
+
+let tempRoot = ''
+
+function buildPromptScrollback(
+  messages: string[],
+  options: { prefix?: string; glyph?: string } = {}
+): string {
+  const prefix = options.prefix ?? ''
+  const glyph = options.glyph ?? '❯'
+  return messages
+    .map((message) => `${prefix}${glyph} ${message}\n⏺ ok`)
+    .join('\n')
+    .concat('\n')
+}
+
+/**
+ * Build a log entry in proper Claude/Codex format with "text" field.
+ * This format is required for the JSON field pattern matching.
+ */
+function buildUserLogEntry(message: string, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    ...extra,
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text: message }] }
+  })
+}
+
+function findJsonlFiles(dir: string): string[] {
+  const results: string[] = []
+  if (!fsSync.existsSync(dir)) return results
+  const entries = fsSync.readdirSync(dir, { withFileTypes: true })
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name)
+    if (entry.isDirectory()) {
+      results.push(...findJsonlFiles(fullPath))
+    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      results.push(fullPath)
+    }
+  }
+  return results
+}
+
+function runRg(args: string[]) {
+  // Union semantics: a file/line matches when ANY -e pattern matches.
+  const patterns: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-e' && args[i + 1] !== undefined) {
+      patterns.push(args[i + 1] as string)
+      i++
+    }
+  }
+  const regexes = patterns.map((p) => new RegExp(p, 'm'))
+  const matchesAny = (text: string) => regexes.some((r) => r.test(text))
+
+  if (args.includes('--json')) {
+    const filePath = args[args.length - 1] ?? ''
+    if (!filePath || regexes.length === 0 || !fsSync.existsSync(filePath)) {
+      return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+    }
+    const lines = fsSync.readFileSync(filePath, 'utf8').split('\n')
+    const output: string[] = []
+    lines.forEach((line, index) => {
+      if (matchesAny(line)) {
+        output.push(JSON.stringify({ type: 'match', data: { line_number: index + 1 } }))
+      }
+    })
+    const exitCode = output.length > 0 ? 0 : 1
+    return {
+      exitCode,
+      stdout: Buffer.from(output.join('\n')),
+      stderr: Buffer.from(''),
+    }
+  }
+
+  if (args.includes('-l')) {
+    if (regexes.length === 0) {
+      return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+    }
+    const targets: string[] = []
+    let skipNext = false
+    for (let i = 0; i < args.length; i += 1) {
+      const arg = args[i] ?? ''
+      if (skipNext) {
+        skipNext = false
+        continue
+      }
+      if (!arg) continue
+      if (arg === '--glob' || arg === '--threads' || arg === '-e') {
+        skipNext = true
+        continue
+      }
+      if (arg.startsWith('-')) continue
+      targets.push(arg)
+    }
+    const files: string[] = []
+    for (const target of targets) {
+      if (!fsSync.existsSync(target)) continue
+      const stat = fsSync.statSync(target)
+      if (stat.isDirectory()) {
+        files.push(...findJsonlFiles(target))
+      } else if (stat.isFile()) {
+        files.push(target)
+      }
+    }
+    const matches = files.filter((file) => {
+      const content = fsSync.readFileSync(file, 'utf8')
+      return matchesAny(content)
+    })
+    return {
+      exitCode: matches.length > 0 ? 0 : 1,
+      stdout: Buffer.from(matches.join('\n')),
+      stderr: Buffer.from(''),
+    }
+  }
+
+  // Plain content mode: rg -e <patterns...> <file> → the matched line, once per
+  // matching line (used by the batch scan's per-file attribution pass).
+  if (regexes.length > 0) {
+    const targets: string[] = []
+    let skip = false
+    for (const arg of args) {
+      if (skip) { skip = false; continue }
+      if (arg === '-e' || arg === '--threads' || arg === '--glob') { skip = true; continue }
+      if (arg.startsWith('-') || arg === 'rg') continue
+      targets.push(arg)
+    }
+    const output: string[] = []
+    for (const target of targets) {
+      if (!fsSync.existsSync(target) || !fsSync.statSync(target).isFile()) continue
+      for (const line of fsSync.readFileSync(target, 'utf8').split('\n')) {
+        if (matchesAny(line)) output.push(line)
+      }
+    }
+    return {
+      exitCode: output.length > 0 ? 0 : 1,
+      stdout: Buffer.from(output.join('\n')),
+      stderr: Buffer.from(''),
+    }
+  }
+
+  return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+}
+
+function setTmuxOutput(target: string, content: string) {
+  tmuxOutputs.set(target, content)
+}
+
+function postRequest(request: MatchWorkerRequest) {
+  messages.push(handleMatchWorkerRequest(request))
+}
+
+afterAll(() => {
+  bunAny.spawnSync = originalSpawnSync
+  if (originalClaude) process.env.CLAUDE_CONFIG_DIR = originalClaude
+  else delete process.env.CLAUDE_CONFIG_DIR
+  if (originalCodex) process.env.CODEX_HOME = originalCodex
+  else delete process.env.CODEX_HOME
+  if (originalPi) process.env.PI_HOME = originalPi
+  else delete process.env.PI_HOME
+  if (originalOmpAgentDir) process.env.PI_CODING_AGENT_DIR = originalOmpAgentDir
+  else delete process.env.PI_CODING_AGENT_DIR
+  if (originalAgentboardData) process.env.AGENTBOARD_DATA_DIR = originalAgentboardData
+  else delete process.env.AGENTBOARD_DATA_DIR
+  if (originalGrok) process.env.GROK_HOME = originalGrok
+  else delete process.env.GROK_HOME
+})
+
+beforeEach(async () => {
+  messages.length = 0
+  tmuxOutputs.clear()
+
+  tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-worker-'))
+  process.env.CLAUDE_CONFIG_DIR = path.join(tempRoot, 'claude')
+  process.env.CODEX_HOME = path.join(tempRoot, 'codex')
+  process.env.PI_HOME = path.join(tempRoot, 'pi')
+  process.env.PI_CODING_AGENT_DIR = path.join(tempRoot, 'omp-agent')
+  process.env.AGENTBOARD_DATA_DIR = path.join(tempRoot, 'agentboard')
+  process.env.GROK_HOME = path.join(tempRoot, 'grok')
+  await fs.mkdir(path.join(process.env.CLAUDE_CONFIG_DIR, 'projects'), {
+    recursive: true,
+  })
+  await fs.mkdir(path.join(process.env.CODEX_HOME, 'sessions'), {
+    recursive: true,
+  })
+  await fs.mkdir(path.join(process.env.PI_HOME, 'agent', 'sessions'), {
+    recursive: true,
+  })
+
+  bunAny.spawnSync = ((args: string[]) => {
+    const tmuxSubcommand = args[1] === '-u' ? args[2] : args[1]
+    if (args[0] === 'tmux' && tmuxSubcommand === 'capture-pane') {
+      const targetIndex = args.indexOf('-t')
+      const target = targetIndex >= 0 ? args[targetIndex + 1] : ''
+      const output = tmuxOutputs.get(target ?? '') ?? ''
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(output),
+        stderr: Buffer.from(''),
+      } as ReturnType<typeof Bun.spawnSync>
+    }
+    if (args[0] === 'rg') {
+      return runRg(args) as ReturnType<typeof Bun.spawnSync>
+    }
+    return {
+      exitCode: 0,
+      stdout: Buffer.from(''),
+      stderr: Buffer.from(''),
+    } as ReturnType<typeof Bun.spawnSync>
+  }) as typeof Bun.spawnSync
+})
+
+afterEach(async () => {
+  bunAny.spawnSync = originalSpawnSync
+  tmuxOutputs.clear()
+  if (tempRoot) {
+    await fs.rm(tempRoot, { recursive: true, force: true })
+  }
+  if (originalClaude) process.env.CLAUDE_CONFIG_DIR = originalClaude
+  else delete process.env.CLAUDE_CONFIG_DIR
+  if (originalCodex) process.env.CODEX_HOME = originalCodex
+  else delete process.env.CODEX_HOME
+  if (originalPi) process.env.PI_HOME = originalPi
+  else delete process.env.PI_HOME
+  if (originalOmpAgentDir) process.env.PI_CODING_AGENT_DIR = originalOmpAgentDir
+  else delete process.env.PI_CODING_AGENT_DIR
+  if (originalAgentboardData) process.env.AGENTBOARD_DATA_DIR = originalAgentboardData
+  else delete process.env.AGENTBOARD_DATA_DIR
+  if (originalGrok) process.env.GROK_HOME = originalGrok
+  else delete process.env.GROK_HOME
+})
+
+const baseSession: Session = {
+  id: 'session-1',
+  name: 'alpha',
+  tmuxWindow: 'agentboard:1',
+  projectPath: '/tmp/alpha',
+  status: 'working',
+  lastActivity: '2024-01-01T00:00:00.000Z',
+  createdAt: '2024-01-01T00:00:00.000Z',
+  agentType: 'claude',
+  source: 'managed',
+}
+
+describe('logMatchWorker', () => {
+  test('skips matching when sessions already mapped', async () => {
+    const logDir = path.join(process.env.CLAUDE_CONFIG_DIR as string, 'projects', 'alpha')
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session-1.jsonl')
+    await fs.writeFile(
+      logPath,
+      buildUserLogEntry('hello', { sessionId: 'session-1', cwd: '/tmp/alpha' })
+    )
+
+    postRequest({
+      id: 'request-1',
+      windows: [baseSession],
+      maxLogsPerPoll: 5,
+      sessions: [
+        {
+          sessionId: 'session-1',
+          logFilePath: logPath,
+          currentWindow: 'agentboard:1',
+          lastActivityAt: new Date().toISOString(),
+        },
+      ],
+      scrollbackLines: 25,
+    })
+
+    expect(messages).toHaveLength(1)
+    const response = messages[0] as Record<string, unknown>
+    expect(response.type).toBe('result')
+    expect(response.matchSkipped).toBe(true)
+    expect(response.matches).toEqual([])
+    expect(response.matchWindowCount).toBe(0)
+    expect(response.matchLogCount).toBe(0)
+  })
+
+  test('matches entries and returns resolved windows', async () => {
+    const logDir = path.join(process.env.CLAUDE_CONFIG_DIR as string, 'projects', 'alpha')
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session-2.jsonl')
+    const message = 'alpha one'
+    await fs.writeFile(
+      logPath,
+      buildUserLogEntry(message, { sessionId: 'session-2', cwd: '/tmp/alpha' })
+    )
+
+    setTmuxOutput('agentboard:1', buildPromptScrollback([message]))
+
+    postRequest({
+      id: 'request-2',
+      windows: [baseSession],
+      maxLogsPerPoll: 5,
+      sessions: [],
+      scrollbackLines: 25,
+    })
+
+    expect(messages).toHaveLength(1)
+    const response = messages[0] as Record<string, unknown>
+    expect(response.type).toBe('result')
+    expect(response.matchSkipped).toBe(false)
+    expect(response.matchWindowCount).toBe(1)
+    expect(response.matchLogCount).toBe(1)
+    expect(response.matches).toEqual([{ logPath, tmuxWindow: 'agentboard:1' }])
+  })
+
+  test('retains discovered metadata when matching throws', async () => {
+    const logDir = path.join(process.env.CLAUDE_CONFIG_DIR as string, 'projects', 'alpha')
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session-3.jsonl')
+    await fs.writeFile(
+      logPath,
+      buildUserLogEntry('boom', { sessionId: 'session-3', cwd: '/tmp/alpha' })
+    )
+
+    bunAny.spawnSync = (() => {
+      throw new Error('boom')
+    }) as typeof Bun.spawnSync
+
+    postRequest({
+      id: 'request-3',
+      windows: [baseSession],
+      maxLogsPerPoll: 5,
+      sessions: [],
+      scrollbackLines: 25,
+    })
+
+    expect(messages).toHaveLength(1)
+    const response = messages[0] as Record<string, unknown>
+    expect(response.type).toBe('result')
+    expect(response.matchingError).toBe('boom')
+    expect(response.entries).toEqual(expect.arrayContaining([expect.objectContaining({sessionId:'session-3'})]))
+  })
+
+  test('uses preFilteredPaths and skips full directory scan', async () => {
+    const logDir = path.join(process.env.CLAUDE_CONFIG_DIR as string, 'projects', 'alpha')
+    await fs.mkdir(logDir, { recursive: true })
+
+    const includedLogPath = path.join(logDir, 'included.jsonl')
+    const scannedOnlyLogPath = path.join(logDir, 'scanned-only.jsonl')
+    await fs.writeFile(
+      includedLogPath,
+      buildUserLogEntry('included message', {
+        sessionId: 'session-included',
+        cwd: '/tmp/alpha',
+      })
+    )
+    await fs.writeFile(
+      scannedOnlyLogPath,
+      buildUserLogEntry('scanned only message', {
+        sessionId: 'session-scanned-only',
+        cwd: '/tmp/alpha',
+      })
+    )
+
+    postRequest({
+      id: 'request-prefiltered',
+      windows: [],
+      maxLogsPerPoll: 25,
+      sessions: [],
+      scrollbackLines: 25,
+      preFilteredPaths: [includedLogPath],
+    })
+
+    expect(messages).toHaveLength(1)
+    const response = messages[0] as Record<string, unknown>
+    expect(response.type).toBe('result')
+    const entries = response.entries as Array<{ logPath: string }>
+    expect(entries).toHaveLength(1)
+    expect(entries[0]?.logPath).toBe(includedLogPath)
+  })
+
+  test('falls back to full scan when preFilteredPaths is empty', async () => {
+    const logDir = path.join(process.env.CLAUDE_CONFIG_DIR as string, 'projects', 'alpha')
+    await fs.mkdir(logDir, { recursive: true })
+
+    const firstLogPath = path.join(logDir, 'first.jsonl')
+    const secondLogPath = path.join(logDir, 'second.jsonl')
+    await fs.writeFile(
+      firstLogPath,
+      buildUserLogEntry('first message', {
+        sessionId: 'session-first',
+        cwd: '/tmp/alpha',
+      })
+    )
+    await fs.writeFile(
+      secondLogPath,
+      buildUserLogEntry('second message', {
+        sessionId: 'session-second',
+        cwd: '/tmp/alpha',
+      })
+    )
+
+    postRequest({
+      id: 'request-empty-prefiltered',
+      windows: [],
+      maxLogsPerPoll: 25,
+      sessions: [],
+      scrollbackLines: 25,
+      preFilteredPaths: [],
+    })
+
+    expect(messages).toHaveLength(1)
+    const response = messages[0] as Record<string, unknown>
+    expect(response.type).toBe('result')
+    const entries = (response.entries as Array<{ logPath: string }>).map(
+      (entry) => entry.logPath
+    )
+    expect(entries).toContain(firstLogPath)
+    expect(entries).toContain(secondLogPath)
+  })
+
+  test('verifyJobs returns per-session verdicts and skips the poll pipeline', async () => {
+    const logDir = path.join(tempRoot, 'logs')
+    await fs.mkdir(logDir, { recursive: true })
+    const logPath = path.join(logDir, 'session-verify.jsonl')
+    const message = 'verify this exact startup message'
+    await fs.writeFile(
+      logPath,
+      buildUserLogEntry(message, { sessionId: 's-verify', cwd: '/tmp/alpha' })
+    )
+    setTmuxOutput('agentboard:1', buildPromptScrollback([message]))
+    // agentboard:2 has no captured output — no extractable messages.
+
+    postRequest({
+      id: 'request-verify',
+      windows: [baseSession],
+      maxLogsPerPoll: 5,
+      sessions: [],
+      scrollbackLines: 25,
+      logDirs: [logDir],
+      verifyJobs: [
+        {
+          sessionId: 's-verify',
+          tmuxWindow: 'agentboard:1',
+          logFilePath: logPath,
+          context: {},
+          excludeLogPaths: [],
+        },
+        {
+          sessionId: 's-empty',
+          tmuxWindow: 'agentboard:2',
+          logFilePath: logPath,
+          context: {},
+          excludeLogPaths: [],
+        },
+      ],
+    })
+
+    expect(messages).toHaveLength(1)
+    const response = messages[0] as Record<string, unknown>
+    expect(response.type).toBe('result')
+    const results = response.verifyResults as Array<{
+      sessionId: string
+      verification: { status: string }
+    }>
+    expect(results).toHaveLength(2)
+    expect(results[0]?.sessionId).toBe('s-verify')
+    expect(results[0]?.verification.status).toBe('verified')
+    expect(results[1]?.sessionId).toBe('s-empty')
+    expect(results[1]?.verification.status).toBe('inconclusive')
+    // A verify request must not run the regular poll pipeline.
+    expect(response.entries).toBeUndefined()
+    expect(response.matchSkipped).toBeUndefined()
+  })
+})

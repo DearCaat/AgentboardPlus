@@ -1,0 +1,600 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import TestRenderer, { act } from 'react-test-renderer'
+import type { AgentSession, Session } from '@shared/types'
+import SessionList from '../components/SessionList'
+import { useSettingsStore } from '../stores/settingsStore'
+import { useSessionStore } from '../stores/sessionStore'
+import { useSessionOrganizationStore } from '../stores/sessionOrganizationStore'
+
+const globalAny = globalThis as typeof globalThis & {
+  setTimeout?: typeof setTimeout
+  clearTimeout?: typeof clearTimeout
+  setInterval?: typeof setInterval
+  clearInterval?: typeof clearInterval
+  window?: Window & typeof globalThis
+  document?: Document
+}
+
+const originalSetTimeout = globalAny.setTimeout
+const originalClearTimeout = globalAny.clearTimeout
+const originalSetInterval = globalAny.setInterval
+const originalClearInterval = globalAny.clearInterval
+const originalWindow = globalAny.window
+const originalDocument = globalAny.document
+const originalFetch = globalThis.fetch
+
+const baseSession: Session = {
+  id: 'session-1',
+  name: 'alpha',
+  tmuxWindow: 'agentboard:1',
+  projectPath: '/tmp/alpha',
+  status: 'working',
+  lastActivity: '2024-01-01T00:00:00.000Z',
+  createdAt: '2024-01-01T00:00:00.000Z',
+  source: 'managed',
+}
+
+function makeSession(overrides: Partial<Session>): Session {
+  return { ...baseSession, ...overrides }
+}
+
+function makeAgentSession(overrides: Partial<AgentSession> = {}): AgentSession {
+  return {
+    sessionId: 'hibernating-1',
+    logFilePath: '/tmp/hibernating-1.jsonl',
+    projectPath: '/tmp/alpha',
+    agentType: 'claude',
+    displayName: 'alpha-hibernating',
+    createdAt: '2024-01-01T00:00:00.000Z',
+    lastActivityAt: '2024-01-01T00:00:00.000Z',
+    isActive: false,
+    isHibernating: true,
+    ...overrides,
+  }
+}
+
+function menuItemWithText(root: TestRenderer.ReactTestInstance, label: string) {
+  return root.findAllByProps({ role: 'menuitem' }).find((item) => {
+    const children = Array.isArray(item.props.children)
+      ? item.props.children
+      : [item.props.children]
+    return children.filter((child) => typeof child === 'string').join('').includes(label)
+  })
+}
+
+// The window/document stubs live in beforeAll/afterAll, NOT beforeEach:
+// rendering SessionList schedules async framer-motion frame callbacks that
+// can fire between tests, and a per-test restore would put back
+// originalWindow — which is undefined whenever no earlier test file in this
+// process registered a DOM (order varies with readdir; Linux CI hits it) —
+// crashing the frame callback on window.innerWidth between tests.
+beforeAll(() => {
+  globalAny.window = {
+    innerWidth: 1024,
+    innerHeight: 768,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    matchMedia: () => ({
+      matches: false,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+    }),
+  } as unknown as Window & typeof globalThis
+
+  globalAny.document = {
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  } as unknown as Document
+})
+
+afterAll(async () => {
+  // Drain pending framer-motion frame callbacks while the stub window is
+  // still in place; only then hand the globals back.
+  await new Promise((resolve) => originalSetTimeout?.(resolve, 64))
+  globalAny.window = originalWindow
+  globalAny.document = originalDocument
+})
+
+beforeEach(() => {
+  useSettingsStore.setState({
+    sessionSortMode: 'created',
+    sessionSortDirection: 'desc',
+    showProjectName: true,
+    showLastUserMessage: true,
+    showSessionIdPrefix: false,
+    projectFilters: [],
+    hostFilters: [],
+  })
+
+  useSessionStore.setState({
+    exitingSessions: new Map(),
+    hostStatuses: [],
+  })
+  useSessionOrganizationStore.setState({
+    profileId: null,
+    ready: false,
+    available: false,
+    error: null,
+    organization: { groups: [], sessions: {} },
+  })
+})
+
+afterEach(() => {
+  globalAny.setTimeout = originalSetTimeout
+  globalAny.clearTimeout = originalClearTimeout
+  globalAny.setInterval = originalSetInterval
+  globalAny.clearInterval = originalClearInterval
+  useSettingsStore.setState({
+    sessionSortMode: 'created',
+    sessionSortDirection: 'desc',
+    showProjectName: true,
+    showLastUserMessage: true,
+    showSessionIdPrefix: false,
+    projectFilters: [],
+    hostFilters: [],
+  })
+  useSessionStore.setState({
+    exitingSessions: new Map(),
+  })
+  useSessionOrganizationStore.setState({
+    profileId: null,
+    ready: false,
+    available: false,
+    error: null,
+    organization: { groups: [], sessions: {} },
+  })
+  globalThis.fetch = originalFetch
+})
+
+describe('SessionList component', () => {
+  test('marks a remote row offline in place and clears the badge when its host recovers', () => {
+    const session = makeSession({ remote: true, host: 'test-remote-host', status: 'permission' })
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => {
+      renderer = TestRenderer.create(
+        <SessionList sessions={[session]} selectedSessionId={session.id} loading={false} error={null}
+          onSelect={() => {}} onRename={() => {}} />
+      )
+    })
+    const row = renderer.root.findByProps({ 'data-testid': 'session-card' })
+    const updateHost = (ok: boolean) => act(() => {
+      useSessionStore.setState({ hostStatuses: [{ host: 'test-remote-host', ok, lastUpdated: session.lastActivity }] })
+    })
+    updateHost(false)
+    expect(row.findByProps({ title: 'test-remote-host is unreachable' }).props.children).toBe('Offline')
+    expect(row.props['aria-pressed']).toBe(true)
+    updateHost(true)
+    expect(row.findAllByProps({ title: 'test-remote-host is unreachable' })).toHaveLength(0)
+    act(() => renderer.unmount())
+  })
+
+  test('orders sessions by status and selects on click', () => {
+    useSettingsStore.setState({
+      sessionSortMode: 'status',
+      sessionSortDirection: 'desc',
+    })
+
+    const sessions = [
+      makeSession({
+        id: 'waiting-old',
+        status: 'waiting',
+        lastActivity: '2024-01-01T00:00:00.000Z',
+      }),
+      makeSession({
+        id: 'unknown',
+        status: 'unknown',
+        lastActivity: '2024-01-05T00:00:00.000Z',
+      }),
+      makeSession({
+        id: 'permission',
+        status: 'permission',
+        lastActivity: '2024-01-04T00:00:00.000Z',
+      }),
+      makeSession({
+        id: 'working',
+        status: 'working',
+        lastActivity: '2024-01-02T00:00:00.000Z',
+      }),
+      makeSession({
+        id: 'waiting-new',
+        status: 'waiting',
+        lastActivity: '2024-01-03T00:00:00.000Z',
+      }),
+    ]
+
+    const selected: string[] = []
+
+    const renderer = TestRenderer.create(
+      <SessionList
+        sessions={sessions}
+        selectedSessionId={null}
+        loading={false}
+        error={null}
+        onSelect={(sessionId) => selected.push(sessionId)}
+        onRename={() => {}}
+      />
+    )
+
+    const cards = renderer.root.findAllByProps({
+      'data-testid': 'session-card',
+    })
+
+    expect(cards.map((card) => card.props['data-session-id'])).toEqual([
+      'permission',
+      'unknown',
+      'waiting-new',
+      'working',
+      'waiting-old',
+    ])
+
+    act(() => {
+      cards[0].props.onClick()
+    })
+
+    expect(selected).toEqual(['permission'])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('keys from nested controls do not select the card', () => {
+    const selected: string[] = []
+    const renderer = TestRenderer.create(
+      <SessionList
+        sessions={[makeSession({ id: 'only' })]}
+        selectedSessionId={null}
+        loading={false}
+        error={null}
+        onSelect={(sessionId) => selected.push(sessionId)}
+        onRename={() => {}}
+      />
+    )
+    const card = renderer.root.findByProps({ 'data-testid': 'session-card' })
+    const self = {}
+    const nested = {}
+
+    act(() => {
+      // Bubbled from a PR chip / "+N" button inside the card.
+      card.props.onKeyDown({ key: 'Enter', target: nested, currentTarget: self })
+      card.props.onKeyDown({ key: ' ', target: nested, currentTarget: self })
+    })
+    expect(selected).toEqual([])
+
+    act(() => {
+      card.props.onKeyDown({ key: 'Enter', target: self, currentTarget: self })
+    })
+    expect(selected).toEqual(['only'])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('shows context menu on long press and renames via menu', () => {
+    globalAny.setTimeout = ((callback: () => void, delay?: number) => {
+      if (delay === 500) {
+        callback()
+      }
+      return 1 as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout
+    globalAny.clearTimeout = (() => {}) as typeof clearTimeout
+
+    const renameCalls: Array<{ id: string; name: string }> = []
+
+    const renderer = TestRenderer.create(
+      <SessionList
+        sessions={[baseSession]}
+        selectedSessionId={null}
+        loading={false}
+        error={null}
+        onSelect={() => {}}
+        onRename={(sessionId, newName) => {
+          renameCalls.push({ id: sessionId, name: newName })
+        }}
+      />
+    )
+
+    const card = renderer.root.findByProps({ 'data-testid': 'session-card' })
+
+    // Simulate long press with touch event including coordinates
+    act(() => {
+      card.props.onTouchStart({ touches: [{ clientX: 100, clientY: 200 }] })
+    })
+
+    // Context menu should appear
+    const contextMenu = renderer.root.findByProps({ role: 'menu' })
+    expect(contextMenu).toBeTruthy()
+
+    // Find and click the Rename button in context menu
+    const renameButton = contextMenu.findAllByProps({ role: 'menuitem' })[0]
+    act(() => {
+      renameButton.props.onClick({ stopPropagation: () => {} })
+    })
+
+    // Now the input should appear for renaming
+    const input = renderer.root.findByType('input')
+
+    act(() => {
+      input.props.onChange({ target: { value: '  Beta  ' } })
+    })
+
+    act(() => {
+      input.props.onKeyDown({ key: 'Enter', preventDefault: () => {} })
+    })
+
+    expect(renameCalls).toEqual([{ id: 'session-1', name: 'Beta' }])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('moves sessions into groups and edits display names without tmux rename', async () => {
+    const savedRequests: RequestInit[] = []
+    globalThis.fetch = (async (_input, init) => {
+      savedRequests.push(init ?? {})
+      return { ok: true } as Response
+    }) as typeof fetch
+    useSessionOrganizationStore.setState({
+      profileId: 'admin',
+      ready: true,
+      available: true,
+      error: null,
+      organization: {
+        groups: [{ id: 'research', name: 'Research', color: 'green' }],
+        sessions: { 'session-1': { title: 'Readable label' } },
+      },
+    })
+    const renameCalls: string[] = []
+    const renderer = TestRenderer.create(
+      <SessionList
+        sessions={[baseSession]}
+        selectedSessionId={null}
+        loading={false}
+        error={null}
+        onSelect={() => {}}
+        onRename={(_sessionId, name) => renameCalls.push(name)}
+      />
+    )
+
+    expect(JSON.stringify(renderer.toJSON())).toContain('Readable label')
+    const card = renderer.root.findByProps({ 'data-testid': 'session-card' })
+    act(() => {
+      card.props.onContextMenu({
+        preventDefault() {},
+        stopPropagation() {},
+        clientX: 40,
+        clientY: 50,
+      })
+    })
+    const moveButton = menuItemWithText(renderer.root, 'Move to Research')
+    expect(moveButton).toBeDefined()
+    act(() => {
+      moveButton!.props.onClick({ stopPropagation() {} })
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(useSessionOrganizationStore.getState().organization.sessions['session-1']?.groupId).toBe('research')
+    expect(savedRequests[0].headers).toMatchObject({ 'X-AgentBoard-Profile': 'admin' })
+    expect(renderer.root.findByProps({ 'data-testid': 'session-card' }).props.style).toMatchObject({
+      borderLeftColor: '#22c55e',
+    })
+
+    const groupedCard = renderer.root.findByProps({ 'data-testid': 'session-card' })
+    act(() => {
+      groupedCard.props.onContextMenu({
+        preventDefault() {},
+        stopPropagation() {},
+        clientX: 40,
+        clientY: 50,
+      })
+    })
+    const displayNameButton = menuItemWithText(renderer.root, 'Edit display name')
+    expect(displayNameButton).toBeDefined()
+    act(() => {
+      displayNameButton!.props.onClick({ stopPropagation() {} })
+    })
+    const input = renderer.root.findByProps({ 'aria-label': 'Edit display name' })
+    act(() => {
+      input.props.onChange({ target: { value: 'Friendly label' } })
+    })
+    act(() => {
+      renderer.root.findByProps({ 'aria-label': 'Edit display name' }).props.onKeyDown({
+        key: 'Enter',
+        preventDefault() {},
+      })
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(renameCalls).toEqual([])
+    expect(useSessionOrganizationStore.getState().organization.sessions['session-1']).toEqual({
+      title: 'Friendly label',
+      groupId: 'research',
+    })
+    expect(JSON.stringify(renderer.toJSON())).toContain('Friendly label')
+
+    const collapseButton = renderer.root.findByProps({ 'aria-label': 'Collapse Research' })
+    act(() => collapseButton.props.onClick())
+    expect(useSessionOrganizationStore.getState().organization.groups[0].collapsed).toBe(true)
+    expect(renderer.root.findAllByProps({ 'data-testid': 'session-card' })).toHaveLength(0)
+
+    act(() => renderer.unmount())
+  })
+
+  test('renders hibernating subsection and selects hibernating sessions', () => {
+    const selectedHibernating: string[] = []
+    const renameCalls: Array<{ id: string; name: string }> = []
+    const hibernatingSession = makeAgentSession({ sessionId: 'hibernating-42' })
+
+    const renderer = TestRenderer.create(
+      <SessionList
+        sessions={[baseSession]}
+        hibernatingSessions={[hibernatingSession]}
+        historySessions={[]}
+        selectedSessionId={null}
+        selectedHibernatingSessionId={hibernatingSession.sessionId}
+        loading={false}
+        error={null}
+        onSelect={() => {}}
+        onSelectHibernating={(sessionId) => selectedHibernating.push(sessionId)}
+        onRename={(sessionId, newName) => {
+          renameCalls.push({ id: sessionId, name: newName })
+        }}
+      />
+    )
+
+    const html = JSON.stringify(renderer.toJSON())
+    expect(html).toContain('Hibernating')
+    expect(html).toContain('alpha-hibernating')
+
+    const hibernatingButton = renderer.root.findByProps({
+      'data-testid': 'hibernating-session-card',
+    })
+
+    act(() => {
+      hibernatingButton.props.onClick()
+    })
+
+    expect(selectedHibernating).toEqual([hibernatingSession.sessionId])
+
+    act(() => {
+      hibernatingButton.props.onContextMenu({
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        clientX: 10,
+        clientY: 20,
+      })
+    })
+
+    const contextMenu = renderer.root.findByProps({ role: 'menu' })
+    const renameButton = contextMenu
+      .findAllByProps({ role: 'menuitem' })
+      .find((button) => {
+        const children = Array.isArray(button.props.children)
+          ? button.props.children
+          : [button.props.children]
+        return children.some((child) => child === 'Rename')
+      })
+    if (!renameButton) {
+      throw new Error('Expected Hibernating rename button')
+    }
+
+    act(() => {
+      renameButton.props.onClick({ stopPropagation: () => {} })
+    })
+
+    const input = renderer.root.findByType('input')
+    act(() => {
+      input.props.onChange({ target: { value: '  renamed-hibernate  ' } })
+    })
+    act(() => {
+      input.props.onKeyDown({ key: 'Enter', preventDefault: () => {} })
+    })
+
+    expect(renameCalls).toEqual([
+      { id: hibernatingSession.sessionId, name: 'renamed-hibernate' },
+    ])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('cancels rename on escape after opening via context menu', () => {
+    globalAny.setTimeout = ((callback: () => void, delay?: number) => {
+      if (delay === 500) {
+        callback()
+      }
+      return 1 as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout
+    globalAny.clearTimeout = (() => {}) as typeof clearTimeout
+
+    const renameCalls: Array<{ id: string; name: string }> = []
+
+    const renderer = TestRenderer.create(
+      <SessionList
+        sessions={[baseSession]}
+        selectedSessionId={null}
+        loading={false}
+        error={null}
+        onSelect={() => {}}
+        onRename={(sessionId, newName) => {
+          renameCalls.push({ id: sessionId, name: newName })
+        }}
+      />
+    )
+
+    const card = renderer.root.findByProps({ 'data-testid': 'session-card' })
+
+    // Simulate long press with touch event including coordinates
+    act(() => {
+      card.props.onTouchStart({ touches: [{ clientX: 100, clientY: 200 }] })
+    })
+
+    // Find and click the Rename button in context menu
+    const contextMenu = renderer.root.findByProps({ role: 'menu' })
+    const renameButton = contextMenu.findAllByProps({ role: 'menuitem' })[0]
+    act(() => {
+      renameButton.props.onClick({ stopPropagation: () => {} })
+    })
+
+    const input = renderer.root.findByType('input')
+
+    act(() => {
+      input.props.onChange({ target: { value: '  Gamma  ' } })
+    })
+
+    act(() => {
+      input.props.onKeyDown({ key: 'Escape', preventDefault: () => {} })
+    })
+
+    expect(renameCalls).toEqual([])
+    expect(() => renderer.root.findByType('input')).toThrow()
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('refresh interval registers and clears on unmount', () => {
+    const intervals: Array<{ id: number; delay: number }> = []
+    const cleared: number[] = []
+
+    globalAny.setInterval = ((callback: () => void, delay?: number) => {
+      const id = 42
+      intervals.push({ id, delay: delay ?? 0 })
+      return id as unknown as ReturnType<typeof setInterval>
+    }) as typeof setInterval
+    globalAny.clearInterval = ((id: number) => {
+      cleared.push(id)
+    }) as typeof clearInterval
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <SessionList
+          sessions={[baseSession]}
+          selectedSessionId={null}
+          loading={false}
+          error={null}
+          onSelect={() => {}}
+          onRename={() => {}}
+        />
+      )
+    })
+
+    expect(intervals).toEqual([{ id: 42, delay: 30000 }])
+
+    act(() => {
+      renderer.unmount()
+    })
+
+    expect(cleared).toEqual([42])
+  })
+})

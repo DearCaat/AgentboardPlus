@@ -1,0 +1,796 @@
+/**
+ * double-attach.integration.test.ts
+ *
+ * Reproduces and verifies the "slow first WebSocket message after reconnect"
+ * issue where the client sends two terminal-attach messages ~34ms apart (double-
+ * attach).  Each would cause the server to capture and send ~62KB of scrollback
+ * history.  The server-side dedup logic should collapse the second attach into a
+ * cheap terminal-ready acknowledgement, halving the data volume.
+ *
+ * The server has two dedup layers:
+ *   1. terminalAttachSeq: rapid back-to-back attaches cancel the previous one
+ *      before it completes (only the latest seq wins).
+ *   2. lastAttachKey/lastAttachTs: if the first attach completes and a second
+ *      arrives for the same session+target within the dedup window (500ms
+ *      production default, widened via AGENTBOARD_ATTACH_DEDUP_MS here), the
+ *      second skips the expensive scrollback capture and just sends
+ *      terminal-ready.
+ *
+ * This test exercises both layers with real server integration.
+ */
+
+import { reapPrivateTmuxServer, socketPath } from '../../../tests/e2e/tmuxReap'
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import fs from 'node:fs'
+import net from 'node:net'
+import path from 'node:path'
+import os from 'node:os'
+import {
+  canBindLocalhost,
+  createTmuxTmpDir,
+  isTmuxAvailable,
+  privateTmuxEnv,
+  waitForTmuxWindows,
+} from './testEnvironment'
+
+const tmuxAvailable = isTmuxAvailable()
+const localhostBindable = canBindLocalhost()
+const testHost = '127.0.0.1'
+
+if (!tmuxAvailable || !localhostBindable) {
+  const reasons: string[] = []
+  if (!tmuxAvailable) reasons.push('tmux not available')
+  if (!localhostBindable) reasons.push('localhost sockets unavailable')
+  test.skip(
+    `${reasons.join(' and ')} - skipping double-attach integration test`,
+    () => {}
+  )
+} else {
+  describe('double-attach dedup integration', () => {
+    const sessionName = `agentboard-dblattach-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`
+    const dbPath = path.join(
+      os.tmpdir(),
+      `agentboard-dblattach-${process.pid}-${Date.now()}.db`
+    )
+    const logFilePath = path.join(
+      os.tmpdir(),
+      `agentboard-dblattach-${process.pid}-${Date.now()}.log`
+    )
+
+    let serverProcess: ReturnType<typeof Bun.spawn> | null = null
+    let port = 0
+    let tmuxTmpDir: string | null = null
+    let tmuxWindowTarget = ''
+    let discoveredSessionId = ''
+
+    const tmuxEnv = (): NodeJS.ProcessEnv => privateTmuxEnv(tmuxTmpDir)
+
+    beforeAll(async () => {
+      tmuxTmpDir = createTmuxTmpDir()
+
+      // Create a tmux session with a window
+      Bun.spawnSync(
+        [
+          'tmux',
+          'new-session',
+          '-d',
+          '-s',
+          sessionName,
+          '-x',
+          '120',
+          '-y',
+          '40',
+        ],
+        { stdout: 'ignore', stderr: 'ignore', env: tmuxEnv() }
+      )
+
+      // Find the default window target
+      const windows = await waitForTmuxWindows(sessionName, tmuxEnv())
+      tmuxWindowTarget = windows[0]
+
+      // Pump some content into the pane to generate scrollback history so
+      // captureTmuxHistory returns non-empty data.
+      for (let i = 0; i < 50; i++) {
+        Bun.spawnSync(
+          [
+            'tmux',
+            'send-keys',
+            '-t',
+            tmuxWindowTarget,
+            `echo "scrollback line ${i}"`,
+            'Enter',
+          ],
+          { stdout: 'ignore', stderr: 'ignore', env: tmuxEnv() }
+        )
+      }
+      // Give tmux a moment to process
+      await delay(500)
+
+      // Start the server
+      port = await getFreePort()
+      serverProcess = Bun.spawn(['bun', 'src/server/index.ts'], {
+        cwd: process.cwd(),
+        env: {
+          ...privateTmuxEnv(tmuxTmpDir),
+          PORT: String(port),
+          TMUX_SESSION: sessionName,
+          DISCOVER_PREFIXES: '',
+          AGENTBOARD_LOG_POLL_MS: '0',
+          AGENTBOARD_DB_PATH: dbPath,
+          TERMINAL_MODE: 'pty',
+          LOG_LEVEL: 'debug',
+          LOG_FILE: logFilePath,
+          AGENTBOARD_LOG_MATCH_WORKER: 'false',
+          // Widened so "attach within the dedup window" doesn't race event-loop
+          // stalls on loaded machines — the window is what we verify, not ms.
+          AGENTBOARD_ATTACH_DEDUP_MS: '2500',
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+
+      drainStream(serverProcess.stdout)
+      drainStream(serverProcess.stderr)
+
+      await waitForHealth(port, serverProcess)
+
+      // Discover the actual session ID — the initial window refresh runs
+      // asynchronously after bind, so poll until it appears.
+      const ourSession = await waitForSession(port, tmuxWindowTarget)
+      discoveredSessionId = ourSession.id
+    }, 60000)
+
+    afterAll(async () => {
+      if (serverProcess) {
+        try {
+          serverProcess.kill()
+          await serverProcess.exited
+        } catch {
+          // ignore
+        }
+      }
+
+      // Reap children while the private server still proves their ownership.
+      if (tmuxTmpDir) reapPrivateTmuxServer(socketPath(tmuxTmpDir))
+
+      for (const f of [dbPath, logFilePath]) {
+        try {
+          fs.unlinkSync(f)
+        } catch {
+          // ignore
+        }
+      }
+
+      if (tmuxTmpDir) {
+        try {
+          fs.rmSync(tmuxTmpDir, { recursive: true, force: true })
+        } catch {
+          // ignore
+        }
+      }
+    })
+
+    test(
+      'rapid back-to-back terminal-attach: seq mechanism cancels first attach',
+      async () => {
+        // When two terminal-attach messages arrive before either completes,
+        // the terminalAttachSeq mechanism cancels the first one (only the
+        // latest seq wins).  This results in ONE terminal-ready and ONE
+        // scrollback from the surviving (second) attach.
+        const ws = new WebSocket(`ws://${testHost}:${port}/ws?catalog=2`)
+        await waitForOpen(ws)
+
+        const messages: Array<{
+          type: string
+          sessionId?: string
+          data?: string
+        }> = []
+        ws.onmessage = (event) => {
+          try {
+            messages.push(JSON.parse(String(event.data)))
+          } catch {
+            // ignore
+          }
+        }
+
+        await waitUntil(
+          () =>
+            messages.some((m) => m.type === 'sessions') &&
+            messages.some((m) => m.type === 'server-config'),
+          5000,
+          'initial sessions/config messages'
+        )
+        messages.length = 0
+
+        // Send two terminal-attach messages back-to-back.
+        ws.send(
+          JSON.stringify({
+            type: 'terminal-attach',
+            sessionId: discoveredSessionId,
+            tmuxTarget: tmuxWindowTarget,
+            cols: 120,
+            rows: 40,
+          })
+        )
+        ws.send(
+          JSON.stringify({
+            type: 'terminal-attach',
+            sessionId: discoveredSessionId,
+            tmuxTarget: tmuxWindowTarget,
+            cols: 120,
+            rows: 40,
+          })
+        )
+
+        // Wait for at least one terminal-ready
+        await waitUntil(
+          () =>
+            messages.some(
+              (m) =>
+                m.type === 'terminal-ready' &&
+                m.sessionId === discoveredSessionId
+            ),
+          10000,
+          'at least one terminal-ready message'
+        )
+        await delay(1000)
+
+        // Between the seq mechanism (cancels first attach if still in progress)
+        // and the dedup layer (skips second attach within the dedup window), at most one
+        // FULL scrollback capture should happen. The second attach may produce
+        // a terminal-ready (from dedup) but no scrollback output.
+        const terminalReadys = messages.filter(
+          (m) =>
+            m.type === 'terminal-ready' &&
+            m.sessionId === discoveredSessionId
+        )
+        // 1 ready = seq cancelled first attach; 2 = both ran but dedup skipped second scrollback
+        expect(terminalReadys.length).toBeGreaterThanOrEqual(1)
+        expect(terminalReadys.length).toBeLessThanOrEqual(2)
+
+        // Count ALL scrollback outputs (terminal-output before the LAST terminal-ready).
+        // Only one scrollback capture should have produced output.
+        const lastReadyIndex = messages.findLastIndex(
+          (m) =>
+            m.type === 'terminal-ready' &&
+            m.sessionId === discoveredSessionId
+        )
+        const scrollbackOutputs = messages
+          .slice(0, lastReadyIndex)
+          .filter(
+            (m) =>
+              m.type === 'terminal-output' &&
+              m.sessionId === discoveredSessionId
+          )
+
+        // At least one scrollback capture regardless of which layer caught the duplicate
+        // (history may be chunked into multiple terminal-output messages)
+        expect(scrollbackOutputs.length).toBeGreaterThanOrEqual(1)
+
+        ws.close()
+      },
+      60000
+    )
+
+    test(
+      'second terminal-attach within the dedup window after first completes triggers dedup',
+      async () => {
+        // This test exercises the lastAttachKey/lastAttachTs dedup layer.
+        // We let the first attach complete fully, then send a second one
+        // inside the (test-widened) dedup window.  The server should skip
+        // scrollback capture for the second and only send terminal-ready.
+        const ws = new WebSocket(`ws://${testHost}:${port}/ws?catalog=2`)
+        await waitForOpen(ws)
+
+        const messages: Array<{
+          type: string
+          sessionId?: string
+          data?: string
+        }> = []
+        ws.onmessage = (event) => {
+          try {
+            messages.push(JSON.parse(String(event.data)))
+          } catch {
+            // ignore
+          }
+        }
+
+        await waitUntil(
+          () =>
+            messages.some((m) => m.type === 'sessions') &&
+            messages.some((m) => m.type === 'server-config'),
+          5000,
+          'initial sessions/config messages'
+        )
+        messages.length = 0
+        const logBytesAtTestStart = readTextIfExists(logFilePath).length
+
+        // Step 1: Send the first terminal-attach and wait for it to complete
+        ws.send(
+          JSON.stringify({
+            type: 'terminal-attach',
+            sessionId: discoveredSessionId,
+            tmuxTarget: tmuxWindowTarget,
+            cols: 120,
+            rows: 40,
+          })
+        )
+
+        await waitUntil(
+          () =>
+            messages.some(
+              (m) =>
+                m.type === 'terminal-ready' &&
+                m.sessionId === discoveredSessionId
+            ),
+          10000,
+          'first terminal-ready'
+        )
+
+        // Verify: one terminal-ready, and one scrollback output before it
+        const firstReadyIndex = messages.findIndex(
+          (m) =>
+            m.type === 'terminal-ready' &&
+            m.sessionId === discoveredSessionId
+        )
+        const scrollbacksBeforeFirstReady = messages
+          .slice(0, firstReadyIndex)
+          .filter(
+            (m) =>
+              m.type === 'terminal-output' &&
+              m.sessionId === discoveredSessionId
+          )
+        expect(scrollbacksBeforeFirstReady.length).toBeGreaterThanOrEqual(1)
+        await waitUntil(
+          () => {
+            const logDelta = readTextIfExists(logFilePath).slice(logBytesAtTestStart)
+            return (
+              logDelta.includes('terminal_history_send') &&
+              logDelta.includes(`"sessionId":"${discoveredSessionId}"`)
+            )
+          },
+          5000,
+          'first attach history log'
+        )
+
+        // No settle wait: every assertion below is server-log based
+        // (terminal_attach_dedup present, terminal_history_send absent) or a
+        // terminal-ready count, so late-draining first-attach chunks can't
+        // produce a false positive — and sending attach 2 promptly keeps it
+        // well inside the dedup window instead of burning it on a quiet
+        // period that unrelated broadcasts can never guarantee.
+
+        // Snapshot logs after the first attach settles so we can prove the second
+        // attach only emitted the dedup fast-path and no new history capture.
+        const logBytesBeforeSecondAttach = readTextIfExists(logFilePath).length
+
+        // Record the total message count so we can isolate second-attach messages.
+        const messagesBeforeSecondAttach = messages.length
+
+        // 800ms > the 500ms production default: if AGENTBOARD_ATTACH_DEDUP_MS
+        // didn't reach the server, attach 2 would miss the dedup window and
+        // the terminal_attach_dedup assertion below would fail — the gap
+        // doubles as a check that the env knob is wired.
+        await delay(800)
+
+        // Step 2: Send the second terminal-attach (well within the widened window).
+        ws.send(
+          JSON.stringify({
+            type: 'terminal-attach',
+            sessionId: discoveredSessionId,
+            tmuxTarget: tmuxWindowTarget,
+            cols: 120,
+            rows: 40,
+          })
+        )
+
+        // Wait for the second terminal-ready
+        await waitUntil(
+          () =>
+            messages.filter(
+              (m) =>
+                m.type === 'terminal-ready' &&
+                m.sessionId === discoveredSessionId
+            ).length >= 2,
+          10000,
+          'second terminal-ready from dedup path'
+        )
+
+        // Give a moment for any trailing messages
+        await delay(200)
+        await waitUntil(
+          () => {
+            const logDelta = readTextIfExists(logFilePath).slice(logBytesBeforeSecondAttach)
+            return logDelta.includes('terminal_attach_dedup')
+          },
+          5000,
+          'terminal_attach_dedup log'
+        )
+
+        // Look at messages received AFTER the second attach was sent.
+        const secondAttachMessages = messages.slice(messagesBeforeSecondAttach)
+
+        // Find the second terminal-ready in the new batch
+        const secondReadyIndex = secondAttachMessages.findIndex(
+          (m) =>
+            m.type === 'terminal-ready' &&
+            m.sessionId === discoveredSessionId
+        )
+        expect(secondReadyIndex).not.toBe(-1)
+
+        // Delayed first-attach output may still be in flight here, so validate
+        // the dedup contract via server logs rather than raw message timing.
+        const logDeltaAfterSecondAttach = readTextIfExists(logFilePath).slice(
+          logBytesBeforeSecondAttach
+        )
+        expect(logDeltaAfterSecondAttach).toContain('terminal_attach_dedup')
+        expect(logDeltaAfterSecondAttach).not.toContain('terminal_history_send')
+
+        // Total terminal-ready count should be exactly 2
+        const totalReadys = messages.filter(
+          (m) =>
+            m.type === 'terminal-ready' &&
+            m.sessionId === discoveredSessionId
+        ).length
+        expect(totalReadys).toBe(2)
+
+        ws.close()
+
+        // Verify the log file contains a terminal_attach_dedup event
+        await delay(500) // allow pino to flush
+        let logContent = ''
+        try {
+          logContent = fs.readFileSync(logFilePath, 'utf-8')
+        } catch {
+          // If log file doesn't exist (pino async flush), skip this check
+        }
+        if (logContent) {
+          expect(logContent).toContain('terminal_attach_dedup')
+        }
+      },
+      60000
+    )
+
+    test(
+      'attaches for different sessions within the dedup window are NOT deduped',
+      async () => {
+        // Create a second tmux window in the same session
+        Bun.spawnSync(
+          [
+            'tmux',
+            'new-window',
+            '-t',
+            sessionName,
+            '-n',
+            'second-window',
+          ],
+          { stdout: 'ignore', stderr: 'ignore', env: tmuxEnv() }
+        )
+
+        // Find the new window target
+        const listResult = Bun.spawnSync(
+          [
+            'tmux',
+            'list-windows',
+            '-t',
+            sessionName,
+            '-F',
+            '#{session_name}:#{window_id}',
+          ],
+          { stdout: 'pipe', stderr: 'pipe', env: tmuxEnv() }
+        )
+        const allWindows = listResult.stdout
+          .toString()
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean)
+        const secondWindow = allWindows.find((w) => w !== tmuxWindowTarget)
+        if (!secondWindow) {
+          throw new Error('Failed to create second tmux window')
+        }
+
+        // Add some content to the second window
+        for (let i = 0; i < 30; i++) {
+          Bun.spawnSync(
+            [
+              'tmux',
+              'send-keys',
+              '-t',
+              secondWindow,
+              `echo "window2 line ${i}"`,
+              'Enter',
+            ],
+            { stdout: 'ignore', stderr: 'ignore', env: tmuxEnv() }
+          )
+        }
+        await delay(500)
+
+        // Trigger refreshes until the registry actually discovers the new window.
+        // A single session-refresh message can be dropped if a prior refresh is
+        // already in flight, so poll the server's current session snapshot
+        // instead of assuming a single websocket broadcast arrives in time.
+        const refreshWs = new WebSocket(`ws://${testHost}:${port}/ws?catalog=2`)
+        await waitForOpen(refreshWs)
+        const secondSession = await waitForDiscoveredSession(
+          port,
+          refreshWs,
+          secondWindow
+        )
+        if (!secondSession) {
+          throw new Error('Server did not discover second tmux window')
+        }
+        const secondSessionId = secondSession.id
+        refreshWs.close()
+
+        // Now connect a new WebSocket and attach to two DIFFERENT sessions rapidly
+        const ws = new WebSocket(`ws://${testHost}:${port}/ws?catalog=2`)
+        await waitForOpen(ws)
+
+        const messages: Array<{
+          type: string
+          sessionId?: string
+          data?: string
+        }> = []
+        ws.onmessage = (event) => {
+          try {
+            messages.push(JSON.parse(String(event.data)))
+          } catch {
+            // ignore
+          }
+        }
+
+        await waitUntil(
+          () => messages.some((m) => m.type === 'sessions'),
+          5000,
+          'sessions message'
+        )
+        messages.length = 0
+        const logBytesBeforeAttaches = readTextIfExists(logFilePath).length
+
+        // Attach to first session
+        ws.send(
+          JSON.stringify({
+            type: 'terminal-attach',
+            sessionId: discoveredSessionId,
+            tmuxTarget: tmuxWindowTarget,
+            cols: 120,
+            rows: 40,
+          })
+        )
+
+        // Immediately attach to a DIFFERENT session
+        ws.send(
+          JSON.stringify({
+            type: 'terminal-attach',
+            sessionId: secondSessionId,
+            tmuxTarget: secondWindow,
+            cols: 120,
+            rows: 40,
+          })
+        )
+
+        // Wait for terminal-ready for the second session (the most recent attach wins
+        // via the seq mechanism since both share the same ws)
+        await waitUntil(
+          () =>
+            messages.some(
+              (m) =>
+                m.type === 'terminal-ready' &&
+                m.sessionId === secondSessionId
+            ),
+          10000,
+          'terminal-ready for second session'
+        )
+
+        const marker = `second-attach-marker-${Date.now()}`
+        ws.send(
+          JSON.stringify({
+            type: 'terminal-input',
+            sessionId: secondSessionId,
+            data: `echo "${marker}"\r`,
+          })
+        )
+        await waitUntil(
+          () => capturePaneText(secondWindow, tmuxEnv()).includes(marker),
+          5000,
+          'marker in second window after attach'
+        )
+
+        await waitUntil(
+          () => {
+            const logDelta = readTextIfExists(logFilePath).slice(logBytesBeforeAttaches)
+            return (
+              logDelta.includes('terminal_attach_profile') &&
+              logDelta.includes(`"sessionId":"${secondSessionId}"`)
+            )
+          },
+          5000,
+          'terminal_attach_profile log for second session'
+        )
+
+        const logDeltaAfterAttaches = readTextIfExists(logFilePath).slice(
+          logBytesBeforeAttaches
+        )
+        expect(logDeltaAfterAttaches).toContain('terminal_attach_profile')
+        expect(logDeltaAfterAttaches).toContain(`"sessionId":"${secondSessionId}"`)
+        expect(logDeltaAfterAttaches).not.toContain('terminal_attach_dedup')
+
+        ws.close()
+      },
+      60000
+    )
+  })
+}
+
+// --- Helper functions ---
+
+async function getFreePort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.unref()
+    server.once('error', reject)
+    server.listen({ port: 0, host: testHost }, () => {
+      const address = server.address()
+      if (address && typeof address === 'object') {
+        const { port } = address
+        server.close(() => resolve(port))
+      } else {
+        server.close(() => reject(new Error('Unable to allocate port')))
+      }
+    })
+  })
+}
+
+async function waitForHealth(
+  port: number,
+  proc: ReturnType<typeof Bun.spawn>,
+  timeoutMs = 60000
+): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (proc.exitCode !== null) {
+      throw new Error(`Server process exited with code ${proc.exitCode}`)
+    }
+    try {
+      const response = await fetch(`http://${testHost}:${port}/api/health`)
+      if (response.ok) {
+        return
+      }
+    } catch {
+      // retry
+    }
+    await delay(100)
+  }
+  throw new Error('Server did not become healthy in time')
+}
+
+async function waitForSession(
+  port: number,
+  tmuxWindow: string,
+  timeoutMs = 15000
+): Promise<{ id: string; tmuxWindow: string }> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const response = await fetch(`http://${testHost}:${port}/api/sessions`)
+      const sessions = (await response.json()) as Array<{
+        id: string
+        tmuxWindow: string
+      }>
+      const found = sessions.find((s) => s.tmuxWindow === tmuxWindow)
+      if (found) return found
+    } catch {
+      // retry
+    }
+    await delay(100)
+  }
+  throw new Error(`Server did not discover tmux window ${tmuxWindow}`)
+}
+
+async function waitForOpen(
+  ws: WebSocket,
+  timeoutMs = 5000
+): Promise<void> {
+  if (ws.readyState === WebSocket.OPEN) return
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('WebSocket open timeout'))
+    }, timeoutMs)
+    ws.onopen = () => {
+      clearTimeout(timeout)
+      resolve()
+    }
+    ws.onerror = () => {
+      clearTimeout(timeout)
+      reject(new Error('WebSocket error'))
+    }
+  })
+}
+
+/**
+ * Polls a condition function until it returns true, or throws on timeout.
+ */
+async function waitUntil(
+  condition: () => boolean,
+  timeoutMs: number,
+  description: string
+): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (condition()) return
+    await delay(50)
+  }
+  throw new Error(`Timed out waiting for: ${description}`)
+}
+
+async function waitForDiscoveredSession(
+  port: number,
+  refreshWs: WebSocket,
+  tmuxWindow: string,
+  timeoutMs = 10000
+): Promise<{ id: string; tmuxWindow: string } | undefined> {
+  const startedAt = Date.now()
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (refreshWs.readyState === WebSocket.OPEN) {
+      refreshWs.send(JSON.stringify({ type: 'session-refresh' }))
+    }
+    await delay(150)
+
+    try {
+      const response = await fetch(`http://${testHost}:${port}/api/sessions`)
+      if (response.ok) {
+        const sessions = (await response.json()) as Array<{
+          id: string
+          tmuxWindow: string
+        }>
+        const match = sessions.find((session) => session.tmuxWindow === tmuxWindow)
+        if (match) {
+          return match
+        }
+      }
+    } catch {
+      // retry
+    }
+
+    await delay(150)
+  }
+
+  return undefined
+}
+
+function drainStream(
+  stream: ReadableStream<Uint8Array> | number | null | undefined
+) {
+  if (!stream || typeof stream === 'number') return
+  const reader = (stream as ReadableStream<Uint8Array>).getReader()
+  const pump = async () => {
+    while (true) {
+      const { done } = await reader.read()
+      if (done) break
+    }
+  }
+  void pump()
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function readTextIfExists(filePath: string): string {
+  try {
+    return fs.readFileSync(filePath, 'utf-8')
+  } catch {
+    return ''
+  }
+}
+
+function capturePaneText(target: string, env: NodeJS.ProcessEnv): string {
+  const result = Bun.spawnSync(
+    ['tmux', 'capture-pane', '-t', target, '-p', '-J'],
+    { stdout: 'pipe', stderr: 'ignore', env }
+  )
+  return result.exitCode === 0 ? result.stdout.toString() : ''
+}

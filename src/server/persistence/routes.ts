@@ -1,0 +1,168 @@
+/** Session library API: catalog history and recovery. */
+import { Hono } from 'hono'
+import type { Session } from '../../shared/types'
+import type {
+  HistoryQuery,
+  Lifecycle,
+  PersistenceSettings,
+  HistoryDetail,
+} from '../../shared/persistence'
+import type { AgentSessionRecord } from '../db'
+import type { PersistenceRuntime } from './runtime'
+import { savePersistenceSettings } from './settings'
+import { RequestError, notFound } from './errors'
+import { logger } from '../logger'
+import { toAgentSession } from '../agentSessions'
+import { metadataIdentity, MetadataScanSupersededError } from '../sessionMetadataClient'
+import type { SessionMetadata } from '../sessionMetadataWorker'
+import { sessionSummary } from '../catalogMessages'
+
+export function registerPersistenceRoutes(
+  parent: Hono,
+  runtime: PersistenceRuntime,
+  options: {
+    metadataFor: (record: AgentSessionRecord) => SessionMetadata | Promise<SessionMetadata>
+    commandFor: (r: AgentSessionRecord) => string
+    changed: () => void
+    activated: (s: Session) => void
+  }
+) {
+  const app = new Hono()
+  app.onError((error, c) => {
+    if (error instanceof RequestError)
+      return c.json({ error: error.message }, error.status)
+    // Malformed JSON bodies are the client's fault too.
+    if (error instanceof SyntaxError)
+      return c.json({ error: 'Invalid request body' }, 400)
+    logger.error('library_request_failed', {
+      method: c.req.method,
+      path: c.req.path,
+      error: error.message,
+    })
+    return c.json({ error: error.message }, 500)
+  })
+  const { sessions, db } = runtime,
+    { catalog } = sessions
+  const resume = async (id: string, operationId?: string) => {
+    const saved = catalog.get(id)
+    if (!saved) throw notFound()
+    const live =
+      sessions.findLive(saved) ||
+      sessions.resume(id, options.commandFor, operationId)
+    options.activated(live)
+    options.changed()
+    return live
+  }
+  const api = '/api/library'
+  // Cross-origin mutations are rejected for all of /api in serverFetch (requestOrigin.ts).
+  app.get(api, (c) => {
+    const q = c.req.query()
+    return c.json(
+      catalog.history({
+        q: q.q,
+        state: q.state as HistoryQuery['state'],
+        project: q.project,
+        agent: q.agent,
+        pinned: q.pinned === 'true',
+        hours: Number(q.hours),
+        cursor: q.cursor,
+        limit: Number(q.limit),
+      })
+    )
+  })
+  app.get(`${api}/health`, (c) => c.json(runtime.health()))
+  app.put(`${api}/settings`, async (c) =>
+    c.json(
+      savePersistenceSettings(
+        db,
+        await c.req.json<Partial<PersistenceSettings>>()
+      )
+    )
+  )
+  app.get(`${api}/:id`, async (c) => {
+    const id = c.req.param('id')
+    const linkedRecords = () => (db.db.query(
+      'SELECT provider_id AS id FROM session_conversations WHERE session_id=? ORDER BY linked_at DESC'
+    ).all(id) as { id: string }[]).flatMap(({ id }) => {
+      const record = db.getSessionById(id)
+      return record ? [record] : []
+    })
+    // All authoritative fields are materialized after the final await, not
+    // independently as each conversation finishes scanning.
+    while (true) {
+      if (!catalog.get(id)) return c.json({ error: 'Session not found' }, 404)
+      const records = linkedRecords()
+      let metadata: SessionMetadata[]
+      try {
+        metadata = await Promise.all(records.map(options.metadataFor))
+      } catch (error) {
+        if (error instanceof MetadataScanSupersededError) continue
+        throw error
+      }
+      const session = catalog.get(id)
+      if (!session) return c.json({ error: 'Session not found' }, 404)
+      const current = linkedRecords()
+      if (current.length !== records.length || current.some((record, i) =>
+        metadataIdentity(record) !== metadataIdentity(records[i]))) continue
+      const preview = db.db.query(
+        'SELECT terminal_preview AS terminalPreview, terminal_preview_at AS terminalPreviewAt FROM board_sessions WHERE id=?'
+      ).get(id) as Pick<HistoryDetail, 'terminalPreview' | 'terminalPreviewAt'>
+      return c.json({
+        session,
+        conversations: current.map((record, i) => sessionSummary({
+          ...toAgentSession(record, { cachedPrsOnly: true }), ...metadata[i],
+        })),
+        ...preview,
+        events: catalog.events(id),
+      } satisfies HistoryDetail)
+    }
+  })
+  app.post(`${api}/:id/resume`, async (c) => {
+    const body: { operationId?: string } = await c.req
+      .json<{ operationId?: string }>()
+      .catch(() => ({}))
+    if (
+      body.operationId !== undefined &&
+      (typeof body.operationId !== 'string' || body.operationId.length > 128)
+    )
+      throw new RequestError('Invalid operation ID')
+    return c.json(await resume(c.req.param('id'), body.operationId))
+  })
+  app.patch(`${api}/:id`, async (c) => {
+    const saved = catalog.get(c.req.param('id'))
+    if (!saved) return c.json({ error: 'Session not found' }, 404)
+    const body = await c.req.json<{
+      name?: string
+      pinned?: boolean
+      state?: Lifecycle
+    }>()
+    if (body.name !== undefined && typeof body.name !== 'string')
+      throw new RequestError('Invalid name')
+    if (body.pinned !== undefined && typeof body.pinned !== 'boolean')
+      throw new RequestError('Invalid pin')
+    if (
+      body.state !== undefined &&
+      body.state !== 'archived' &&
+      body.state !== 'hibernating'
+    )
+      throw new RequestError('Choose archived or hibernating')
+    if (body.name !== undefined) {
+      if (saved.window) sessions.renameWindow(saved.window, body.name)
+      else {
+        catalog.rename(saved.id, body.name)
+        if (saved.providerId)
+          db.updateSession(saved.providerId, { displayName: body.name })
+      }
+    }
+    if (body.pinned !== undefined) {
+      catalog.pin(saved.id, body.pinned)
+    }
+    if (body.state !== undefined) {
+      sessions.stop(saved, body.state)
+    }
+    options.changed()
+    return c.json(catalog.get(saved.id))
+  })
+  parent.route('/', app)
+  return { resume }
+}

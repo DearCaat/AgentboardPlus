@@ -1,0 +1,1075 @@
+import { restrictDatabaseFiles } from './databasePermissions'
+import { mapRow } from './sessionRecord'
+import { readSessionLists } from './sessionReads'
+import fs from 'node:fs'
+import path from 'node:path'
+import { Database as SQLiteDatabase } from 'bun:sqlite'
+import type { AgentType } from '../shared/types'
+import { isValidSyncedSetting, migrateLegacyAntigravityPreset, type SyncedCommandPreset } from '../shared/syncedSettings'
+import { logger } from './logger'
+import { resolveProjectPath } from './paths'
+import { acquireDatabaseOwner } from './persistence/ownership'
+
+export interface AgentSessionRecord {
+  id: number
+  sessionId: string
+  logFilePath: string
+  projectPath: string
+  slug: string | null
+  agentType: AgentType
+  displayName: string
+  createdAt: string
+  lastActivityAt: string
+  lastUserMessage: string | null
+  currentWindow: string | null
+  isHibernating: boolean
+  lastResumeError: string | null
+  wakeStartedAt: string | null
+  lastKnownLogRevision?: string | null
+  lastKnownLogSize: number | null
+  isCodexExec: boolean
+  launchCommand: string | null
+}
+
+export type NewAgentSessionRecord = Omit<
+  AgentSessionRecord,
+  'id' | 'wakeStartedAt'
+> & { wakeStartedAt?: string | null }
+
+/** Identity fields for every tracked log, cheap enough to load in full. */
+export interface KnownSessionKey {
+  sessionId: string
+  logFilePath: string
+  projectPath: string | null
+  slug: string | null
+  agentType: AgentType | null
+  isCodexExec: boolean
+  lastKnownLogSize?: number | null
+  lastKnownLogRevision?: string | null
+}
+
+// last_user_message is a UI preview; unbounded values (giant pastes, tool
+// dumps) bloated real-world databases into the hundreds of MB and made every
+// full-table read a multi-second event-loop stall.
+export const MAX_LAST_USER_MESSAGE_LENGTH = 8192
+
+function clampLastUserMessage(value: string | null): string | null {
+  if (value && value.length > MAX_LAST_USER_MESSAGE_LENGTH) {
+    return value.slice(0, MAX_LAST_USER_MESSAGE_LENGTH)
+  }
+  return value
+}
+export type ClaimCurrentWindowPatch = Partial<
+  Pick<
+    AgentSessionRecord,
+    'displayName' | 'lastResumeError' | 'wakeStartedAt' | 'launchCommand'
+  >
+>
+
+// Runs on every refresh tick and log poll. `+session_id` keeps SQLite from
+// walking idx_session_id across the whole table (every history row) just to
+// skip a sort; the partial idx_current_window_unique index finds the few
+// windowed rows and the sort is free. Same rows, same order.
+export const ACTIVE_SESSIONS_SQL =
+  'SELECT * FROM agent_sessions WHERE current_window IS NOT NULL ORDER BY +session_id'
+
+export interface SessionDatabase {
+  db: SQLiteDatabase
+  insertSession: (session: NewAgentSessionRecord) => AgentSessionRecord
+  /** Release the observed predecessor and insert its successor in one transaction. */
+  supersedeSession: (expectedPredecessor: AgentSessionRecord, successor: NewAgentSessionRecord) => AgentSessionRecord
+  updateSession: (
+    sessionId: string,
+    patch: Partial<Omit<AgentSessionRecord, 'id' | 'sessionId'>>
+  ) => AgentSessionRecord | null
+  /**
+   * Atomic window claim with two guards: only updates if (a) this row is still
+   * dormant (current_window IS NULL) AND (b) no other row already owns the
+   * target tmuxWindow. Returns the updated record on success, or null when
+   * either guard fails (no-op). Use this from any rematch/wake path that
+   * persists current_window after observing a candidate window externally.
+   */
+  claimCurrentWindow: (
+    sessionId: string,
+    tmuxWindow: string,
+    extraPatch?: ClaimCurrentWindowPatch
+  ) => AgentSessionRecord | null
+  /**
+   * Point a conversation back at the live window its catalog row is running
+   * in. Compare-and-set like orphanSession/claimCurrentWindow: only a row
+   * released by an interruption (current_window IS NULL, is_hibernating = 1)
+   * is touched, and never while another conversation claims the window. A
+   * claimed row is left alone even if it still carries the marker (e.g. the
+   * hibernate handler sets it before killing the window). Deliberate unclaims (log verification mismatch, slug supersede,
+   * duplicate cleanup) leave is_hibernating = 0 and are never undone here.
+   * Clears is_hibernating. Returns null when the guard refuses.
+   */
+  reclaimCurrentWindow: (
+    sessionId: string,
+    tmuxWindow: string
+  ) => AgentSessionRecord | null
+  getSessionById: (sessionId: string) => AgentSessionRecord | null
+  /** Batch lookup — one indexed query instead of N single-row probes. */
+  getSessionsByIds: (sessionIds: string[]) => AgentSessionRecord[]
+  getSessionByLogPath: (logPath: string) => AgentSessionRecord | null
+  getSessionByWindow: (tmuxWindow: string) => AgentSessionRecord | null
+  getActiveSessions: () => AgentSessionRecord[]
+  getHibernatingSessions: () => AgentSessionRecord[]
+  /**
+   * Active + hibernating + history from ONE statement. The three getters
+   * are called together on every poll cycle; separate statements pay the
+   * read page-in cost repeatedly under memory pressure. `maxAgeHours`
+   * bounds the history bucket exactly as in getHistorySessions.
+   */
+  getSessionLists: (options?: { maxAgeHours?: number }) => {
+    active: AgentSessionRecord[]
+    hibernating: AgentSessionRecord[]
+    history: AgentSessionRecord[]
+  }
+  /**
+   * Dormant, non-hibernating rows, newest first. Uncapped unless `limit` is
+   * given: the orphan rematcher and poll snapshots must see every row, while
+   * the sidebar passes its display cap.
+   */
+  getHistorySessions: (options?: { maxAgeHours?: number; limit?: number }) => AgentSessionRecord[]
+  /** All session identity keys without large TEXT columns — safe to load per poll. */
+  getKnownSessionKeys: () => KnownSessionKey[]
+  /**
+   * Clear current_window. With `expectedWindow` it is a compare-and-clear: the
+   * row is only touched while it is dormant or still on that window, so a
+   * stale caller cannot drop a claim another window has since taken. Returns
+   * null when that guard refuses.
+   */
+  orphanSession: (
+    sessionId: string,
+    options?: { hibernate?: boolean; expectedWindow?: string | null }
+  ) => AgentSessionRecord | null
+  displayNameExists: (displayName: string, excludeSessionId?: string) => boolean
+  setHibernating: (sessionId: string, isHibernating: boolean) => AgentSessionRecord | null
+  getActiveSessionBySlugAndProject: (
+    slug: string,
+    projectPath: string
+  ) => AgentSessionRecord | null
+  // App settings
+  getAppSetting: (key: string) => string | null
+  setAppSetting: (key: string, value: string) => void
+  close: () => void
+}
+
+const DEFAULT_DATA_DIR =
+  process.env.AGENTBOARD_DATA_DIR?.trim() ||
+  path.join(process.env.HOME || process.env.USERPROFILE || '', '.agentboard')
+const DEFAULT_DB_PATH = path.join(DEFAULT_DATA_DIR, 'agentboard.db')
+const DB_PATH_ENV = 'AGENTBOARD_DB_PATH'
+
+const AGENT_SESSIONS_COLUMNS_SQL = `
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT UNIQUE,
+  log_file_path TEXT NOT NULL UNIQUE,
+  project_path TEXT,
+  agent_type TEXT NOT NULL CHECK (agent_type IN ('claude', 'claude-rp', 'codex', 'pi', 'devin', 'grok', 'omp', 'antigravity')),
+  display_name TEXT,
+  created_at TEXT NOT NULL,
+  last_activity_at TEXT NOT NULL,
+  last_user_message TEXT,
+  current_window TEXT,
+  is_hibernating INTEGER NOT NULL DEFAULT 0,
+  last_resume_error TEXT,
+  wake_started_at TEXT,
+  -- NULL means "unknown" (e.g., after upgrade). First poll will initialize to actual size.
+  -- This triggers a one-time match check for upgraded sessions.
+  last_known_log_size INTEGER,
+  is_codex_exec INTEGER NOT NULL DEFAULT 0,
+  slug TEXT,
+  launch_command TEXT,
+  last_known_log_revision TEXT
+`
+
+const CREATE_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS agent_sessions (
+${AGENT_SESSIONS_COLUMNS_SQL}
+);
+`
+
+const CREATE_APP_SETTINGS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`
+
+const CREATE_INDEXES_SQL = `
+CREATE INDEX IF NOT EXISTS idx_session_id
+  ON agent_sessions (session_id);
+CREATE INDEX IF NOT EXISTS idx_log_file_path
+  ON agent_sessions (log_file_path);
+-- Cover both name-existence queries without reading transcript-bearing rows.
+-- Non-unique: inherited names and legacy duplicates retain their existing semantics.
+CREATE INDEX IF NOT EXISTS idx_display_name_session_id
+  ON agent_sessions (display_name, session_id);
+CREATE INDEX IF NOT EXISTS idx_current_window
+  ON agent_sessions (current_window);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_current_window_unique
+  ON agent_sessions (current_window)
+  WHERE current_window IS NOT NULL;
+-- Seek dormant buckets and recent history without visiting old payloads.
+CREATE INDEX IF NOT EXISTS idx_dormant_activity
+  ON agent_sessions (is_hibernating, last_activity_at DESC, session_id)
+  WHERE current_window IS NULL;
+-- Covering index for small identity/revision fields, so full known-key scans
+-- never visit the large last_user_message pages.
+CREATE INDEX IF NOT EXISTS idx_session_keys_revision
+  ON agent_sessions (session_id, log_file_path, project_path, slug, agent_type, is_codex_exec, last_known_log_size, last_known_log_revision);
+DROP INDEX IF EXISTS idx_session_keys;
+`
+
+function readJournalMode(db: SQLiteDatabase): string {
+  try {
+    const row = db.query('PRAGMA journal_mode').get() as { journal_mode?: string } | null
+    return String(row?.journal_mode ?? 'unknown').toLowerCase()
+  } catch {
+    return 'unknown'
+  }
+}
+
+export function initDatabase(options: { path?: string; exclusive?: boolean } = {}): SessionDatabase {
+  const envPath = process.env[DB_PATH_ENV]?.trim()
+  const resolvedEnvPath =
+    envPath && envPath !== ':memory:' ? resolveProjectPath(envPath) : envPath
+  const dbPath = options.path ?? resolvedEnvPath ?? DEFAULT_DB_PATH
+  ensureDataDir(dbPath)
+
+  const owner = options.exclusive ? acquireDatabaseOwner(dbPath) : null
+  let connection: SQLiteDatabase | undefined
+  try {
+    connection = new SQLiteDatabase(dbPath)
+    return initializeConnection(connection, dbPath, owner?.release)
+  } catch (error) {
+    try {
+      connection?.close()
+    } finally {
+      owner?.release()
+    }
+    throw error
+  }
+}
+
+function initializeConnection(
+  db: SQLiteDatabase,
+  dbPath: string,
+  releaseOwner?: () => void
+): SessionDatabase {
+  // WAL so readers never block on (or block) a writer; this fixes the
+  // "database is locked" errors seen when an old and new server overlap during
+  // a restart. Under WAL only writers contend, and bun:sqlite waits for the
+  // lock synchronously on the main thread, so busy_timeout is kept short: a
+  // poll can issue ~25 writes, and a long timeout would stall the event loop
+  // for seconds per write while another server holds the lock. 250ms absorbs
+  // a normal overlapping commit; anything longer surfaces as an error instead
+  // of a frozen server. NORMAL is safe under WAL (frame checksums catch torn
+  // writes) and skips the per-commit fsync.
+  // busy_timeout first so the WAL switch itself gets the short wait.
+  db.exec('PRAGMA busy_timeout = 250')
+  // Switching to WAL needs an exclusive lock. If an old (pre-WAL) server is
+  // still mid-write during an upgrade, fail soft: stay on the current journal
+  // mode this run and convert on the next start, instead of crashing.
+  // NORMAL is only safe under WAL, so it is applied only when the switch
+  // actually took (the pragma can also return a different mode silently,
+  // e.g. 'memory' for in-memory databases); otherwise keep the FULL default.
+  let switchError: string | undefined
+  try {
+    db.exec('PRAGMA journal_mode = WAL')
+  } catch (error) {
+    switchError = error instanceof Error ? error.message : String(error)
+  }
+  const journalMode = readJournalMode(db)
+  if (journalMode === 'wal') {
+    db.exec('PRAGMA synchronous = NORMAL')
+  } else if (journalMode !== 'memory') {
+    logger.warn('db_wal_switch_failed', { dbPath, journalMode, error: switchError })
+  }
+  if (dbPath !== ':memory:') restrictDatabaseFiles(dbPath)
+  migrateDatabase(db)
+  db.exec(CREATE_TABLE_SQL)
+  db.exec(CREATE_APP_SETTINGS_TABLE_SQL)
+  migrateLastUserMessageColumn(db)
+  migrateDeduplicateDisplayNames(db)
+  migrateIsPinnedToHibernatingColumn(db)
+  migrateIsHibernatingColumn(db)
+  migrateIsSleepingToHibernatingColumn(db)
+  migrateLastResumeErrorColumn(db)
+  migrateLastKnownLogSizeColumn(db)
+  migrateIsCodexExecColumn(db)
+  migrateSlugColumn(db)
+  migrateAgentTypeConstraint(db)
+  migrateLaunchCommandColumn(db)
+  migrateWakeStartedAtColumn(db)
+  migrateDeduplicateCurrentWindows(db)
+  if (!(db.query("PRAGMA table_info(agent_sessions)").all() as { name: string }[]).some(c => c.name === "last_known_log_revision")) {
+    db.exec("ALTER TABLE agent_sessions ADD COLUMN last_known_log_revision TEXT")
+  }
+  db.exec(CREATE_INDEXES_SQL)
+
+  const insertStmt = db.prepare(
+    `INSERT INTO agent_sessions
+      (session_id, log_file_path, project_path, slug, agent_type, display_name, created_at, last_activity_at, last_user_message, current_window, is_hibernating, last_resume_error, wake_started_at, last_known_log_size, is_codex_exec, launch_command, last_known_log_revision)
+     VALUES ($sessionId, $logFilePath, $projectPath, $slug, $agentType, $displayName, $createdAt, $lastActivityAt, $lastUserMessage, $currentWindow, $isHibernating, $lastResumeError, $wakeStartedAt, $lastKnownLogSize, $isCodexExec, $launchCommand, $lastKnownLogRevision)`
+  )
+
+  const selectBySessionId = db.prepare(
+    'SELECT * FROM agent_sessions WHERE session_id = $sessionId'
+  )
+  const selectByLogPath = db.prepare(
+    'SELECT * FROM agent_sessions WHERE log_file_path = $logFilePath'
+  )
+  const selectByWindow = db.prepare(
+    'SELECT * FROM agent_sessions WHERE current_window = $currentWindow'
+  )
+  const selectActive = db.prepare(ACTIVE_SESSIONS_SQL)
+  const selectHibernating = db.prepare(
+    'SELECT * FROM agent_sessions WHERE current_window IS NULL AND is_hibernating = 1 ORDER BY last_activity_at DESC, session_id'
+  )
+  const selectHistory = db.prepare(
+    'SELECT * FROM agent_sessions WHERE current_window IS NULL AND is_hibernating = 0 ORDER BY last_activity_at DESC, session_id LIMIT $limit'
+  )
+  const selectHistoryRecent = db.prepare(
+    'SELECT * FROM agent_sessions WHERE current_window IS NULL AND is_hibernating = 0 AND last_activity_at > $cutoff ORDER BY last_activity_at DESC, session_id LIMIT $limit'
+  )
+  const selectKnownSessionKeys = db.prepare(
+    'SELECT session_id, log_file_path, project_path, slug, agent_type, is_codex_exec, last_known_log_size, last_known_log_revision FROM agent_sessions'
+  )
+  const selectByDisplayName = db.prepare(
+    'SELECT 1 FROM agent_sessions WHERE display_name = $displayName LIMIT 1'
+  )
+  const selectByDisplayNameExcluding = db.prepare(
+    'SELECT 1 FROM agent_sessions WHERE display_name = $displayName AND session_id != $excludeSessionId LIMIT 1'
+  )
+  const selectActiveBySlugAndProject = db.prepare(
+    'SELECT * FROM agent_sessions WHERE slug = $slug AND project_path = $projectPath AND current_window IS NOT NULL ORDER BY last_activity_at DESC LIMIT 1'
+  )
+
+  const updateStmt = (fields: string[]) =>
+    db.prepare(
+      `UPDATE agent_sessions SET ${fields
+        .map((field) => `${field} = $${field}`)
+        .join(', ')} WHERE session_id = $sessionId`
+    )
+
+  const orphanIfOnWindowStmt = db.prepare(
+    `UPDATE agent_sessions SET current_window = NULL, is_hibernating = $is_hibernating
+     WHERE session_id = $sessionId
+       AND (current_window IS NULL OR current_window = $expectedWindow)`
+  )
+
+  const claimWindowStmt = (fields: string[]) =>
+    db.prepare(
+      `UPDATE agent_sessions SET ${fields
+        .map((field) => `${field} = $${field}`)
+        .join(', ')} WHERE session_id = $sessionId
+         AND current_window IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM agent_sessions
+           WHERE current_window = $current_window
+             AND session_id != $sessionId
+         )`
+    )
+
+  const reclaimWindowStmt = db.prepare(
+    `UPDATE agent_sessions SET current_window = $tmuxWindow, is_hibernating = 0
+     WHERE session_id = $sessionId
+       AND is_hibernating = 1
+       AND current_window IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM agent_sessions
+         WHERE current_window = $tmuxWindow
+           AND session_id != $sessionId
+       )`
+  )
+
+  // App settings prepared statements
+  const selectAppSetting = db.prepare(
+    'SELECT value FROM app_settings WHERE key = $key'
+  )
+  const upsertAppSetting = db.prepare(
+    'INSERT OR REPLACE INTO app_settings (key, value) VALUES ($key, $value)'
+  )
+
+  const api: SessionDatabase = {
+    db,
+    supersedeSession: (expectedPredecessor, successor) => db.transaction(() => {
+      const predecessorId = expectedPredecessor.sessionId
+      const predecessor = api.getSessionById(predecessorId)
+      if (!predecessor || predecessor.currentWindow !== expectedPredecessor.currentWindow ||
+          predecessor.isHibernating !== expectedPredecessor.isHibernating ||
+          predecessor.displayName !== expectedPredecessor.displayName ||
+          predecessor.slug !== expectedPredecessor.slug ||
+          predecessor.projectPath !== expectedPredecessor.projectPath) {
+        throw new Error("Slug predecessor changed before supersession")
+      }
+      api.updateSession(predecessorId, { currentWindow: null, isHibernating: false })
+      return api.insertSession(successor)
+    })(),
+    insertSession: (session) => {
+      insertStmt.run({
+        $sessionId: session.sessionId,
+        $logFilePath: session.logFilePath,
+        $projectPath: session.projectPath,
+        $slug: session.slug ?? null,
+        $agentType: session.agentType,
+        $displayName: session.displayName,
+        $createdAt: session.createdAt,
+        $lastActivityAt: session.lastActivityAt,
+        $lastUserMessage: clampLastUserMessage(session.lastUserMessage),
+        $currentWindow: session.currentWindow,
+        $isHibernating: session.isHibernating ? 1 : 0,
+        $lastResumeError: session.lastResumeError,
+        $wakeStartedAt: session.wakeStartedAt ?? null,
+        $lastKnownLogSize: session.lastKnownLogSize,
+        $lastKnownLogRevision: session.lastKnownLogRevision ?? null,
+        $isCodexExec: session.isCodexExec ? 1 : 0,
+        $launchCommand: session.launchCommand ?? null,
+      })
+      const row = selectBySessionId.get({ $sessionId: session.sessionId }) as
+        | Record<string, unknown>
+        | undefined
+      if (!row) {
+        throw new Error('Failed to insert session')
+      }
+      return mapRow(row)
+    },
+    updateSession: (sessionId, patch) => {
+      const entries = Object.entries(patch).filter(
+        ([, value]) => value !== undefined
+      ) as Array<[string, unknown]>
+      if (entries.length === 0) {
+        return (selectBySessionId.get({ $sessionId: sessionId }) as Record<string, unknown> | undefined)
+          ? mapRow(selectBySessionId.get({ $sessionId: sessionId }) as Record<string, unknown>)
+          : null
+      }
+
+      const fieldMap: Record<string, string> = {
+        logFilePath: 'log_file_path',
+        projectPath: 'project_path',
+        slug: 'slug',
+        agentType: 'agent_type',
+        displayName: 'display_name',
+        createdAt: 'created_at',
+        lastActivityAt: 'last_activity_at',
+        lastUserMessage: 'last_user_message',
+        currentWindow: 'current_window',
+        isHibernating: 'is_hibernating',
+        lastResumeError: 'last_resume_error',
+        wakeStartedAt: 'wake_started_at',
+        lastKnownLogSize: 'last_known_log_size',
+        lastKnownLogRevision: 'last_known_log_revision',
+        isCodexExec: 'is_codex_exec',
+        launchCommand: 'launch_command',
+      }
+
+      const fields: string[] = []
+      const params: Record<string, string | number | null> = {
+        $sessionId: sessionId,
+      }
+      for (const [key, value] of entries) {
+        const field = fieldMap[key]
+        if (!field) continue
+        fields.push(field)
+        // Normalize boolean fields to 0/1 for SQLite
+        if (key === 'isHibernating' || key === 'isCodexExec') {
+          params[`$${field}`] = value ? 1 : 0
+        } else if (key === 'lastUserMessage') {
+          params[`$${field}`] = clampLastUserMessage(value as string | null)
+        } else {
+          params[`$${field}`] = value as string | number | null
+        }
+      }
+
+      if (fields.length === 0) {
+        return null
+      }
+
+      updateStmt(fields).run(params)
+      const row = selectBySessionId.get({ $sessionId: sessionId }) as
+        | Record<string, unknown>
+        | undefined
+      return row ? mapRow(row) : null
+    },
+    claimCurrentWindow: (sessionId, tmuxWindow, extraPatch) => {
+      const fieldMap: Record<string, string> = {
+        displayName: 'display_name',
+        lastResumeError: 'last_resume_error',
+        wakeStartedAt: 'wake_started_at',
+        launchCommand: 'launch_command',
+      }
+      const fields = ['current_window']
+      const params: Record<string, string | number | null> = {
+        $sessionId: sessionId,
+        $current_window: tmuxWindow,
+      }
+      if (extraPatch) {
+        for (const [key, value] of Object.entries(extraPatch)) {
+          if (value === undefined) continue
+          const field = fieldMap[key]
+          if (!field) continue
+          fields.push(field)
+          params[`$${field}`] = value as string | number | null
+        }
+      }
+      const result = claimWindowStmt(fields).run(params)
+      if (result.changes === 0) return null
+      const row = selectBySessionId.get({ $sessionId: sessionId }) as
+        | Record<string, unknown>
+        | undefined
+      return row ? mapRow(row) : null
+    },
+    reclaimCurrentWindow: (sessionId, tmuxWindow) => {
+      const result = reclaimWindowStmt.run({
+        $sessionId: sessionId,
+        $tmuxWindow: tmuxWindow,
+      })
+      if (result.changes === 0) return null
+      const row = selectBySessionId.get({ $sessionId: sessionId }) as
+        | Record<string, unknown>
+        | undefined
+      return row ? mapRow(row) : null
+    },
+    getSessionById: (sessionId) => {
+      const row = selectBySessionId.get({ $sessionId: sessionId }) as
+        | Record<string, unknown>
+        | undefined
+      return row ? mapRow(row) : null
+    },
+    getSessionsByIds: (sessionIds) => {
+      if (sessionIds.length === 0) return []
+      const placeholders = sessionIds.map((_, i) => `$id${i}`).join(', ')
+      const params = Object.fromEntries(
+        sessionIds.map((id, i) => [`$id${i}`, id])
+      )
+      const rows = db
+        .query(
+          `SELECT * FROM agent_sessions WHERE session_id IN (${placeholders})`
+        )
+        .all(params as never) as Record<string, unknown>[]
+      return rows.map(mapRow)
+    },
+    getSessionByLogPath: (logPath) => {
+      const row = selectByLogPath.get({ $logFilePath: logPath }) as
+        | Record<string, unknown>
+        | undefined
+      return row ? mapRow(row) : null
+    },
+    getSessionByWindow: (tmuxWindow) => {
+      const row = selectByWindow.get({ $currentWindow: tmuxWindow }) as
+        | Record<string, unknown>
+        | undefined
+      return row ? mapRow(row) : null
+    },
+    getActiveSessions: () => {
+      const rows = selectActive.all() as Record<string, unknown>[]
+      return rows.map(mapRow)
+    },
+    getHibernatingSessions: () => {
+      const rows = selectHibernating.all() as Record<string, unknown>[]
+      return rows.map(mapRow)
+    },
+    getSessionLists: (options) => readSessionLists(db, options),
+    getHistorySessions: (options?: { maxAgeHours?: number; limit?: number }) => {
+      // SQLite treats a negative LIMIT as no limit.
+      const limit = options?.limit ?? -1
+      if (options?.maxAgeHours) {
+        const cutoff = new Date(Date.now() - options.maxAgeHours * 60 * 60 * 1000).toISOString()
+        const rows = selectHistoryRecent.all({ $cutoff: cutoff, $limit: limit }) as Record<string, unknown>[]
+        return rows.map(mapRow)
+      }
+      const rows = selectHistory.all({ $limit: limit }) as Record<string, unknown>[]
+      return rows.map(mapRow)
+    },
+    getKnownSessionKeys: () => {
+      const rows = selectKnownSessionKeys.all() as Record<string, unknown>[]
+      return rows.map((row) => ({
+        sessionId: row.session_id as string,
+        logFilePath: row.log_file_path as string,
+        projectPath: (row.project_path as string | null) ?? null,
+        slug: (row.slug as string | null) ?? null,
+        agentType: (row.agent_type as AgentType | null) ?? null,
+        isCodexExec: Boolean(row.is_codex_exec),
+        lastKnownLogSize: row.last_known_log_size == null ? null : Number(row.last_known_log_size),
+        lastKnownLogRevision: (row.last_known_log_revision as string | null) ?? null,
+      }))
+    },
+    orphanSession: (sessionId, options) => {
+      const hibernate = options?.hibernate ?? true
+      // Auto-promote to Hibernating on unexpected window loss. Deliberate kills
+      // and explicit mismatch cleanup opt out so those rows still land in
+      // History.
+      if (options?.expectedWindow !== undefined) {
+        const result = orphanIfOnWindowStmt.run({
+          $sessionId: sessionId,
+          $expectedWindow: options.expectedWindow,
+          $is_hibernating: hibernate ? 1 : 0,
+        })
+        if (result.changes === 0) return null
+      } else {
+        updateStmt(['current_window', 'is_hibernating']).run({
+          $sessionId: sessionId,
+          $current_window: null,
+          $is_hibernating: hibernate ? 1 : 0,
+        })
+      }
+      const row = selectBySessionId.get({ $sessionId: sessionId }) as
+        | Record<string, unknown>
+        | undefined
+      return row ? mapRow(row) : null
+    },
+    displayNameExists: (displayName, excludeSessionId) => {
+      const row = excludeSessionId
+        ? selectByDisplayNameExcluding.get({
+            $displayName: displayName,
+            $excludeSessionId: excludeSessionId,
+          })
+        : selectByDisplayName.get({ $displayName: displayName })
+      return row != null
+    },
+    setHibernating: (sessionId, isHibernating) => {
+      updateStmt(['is_hibernating']).run({
+        $sessionId: sessionId,
+        $is_hibernating: isHibernating ? 1 : 0,
+      })
+      const row = selectBySessionId.get({ $sessionId: sessionId }) as
+        | Record<string, unknown>
+        | undefined
+      return row ? mapRow(row) : null
+    },
+    getActiveSessionBySlugAndProject: (slug, projectPath) => {
+      const row = selectActiveBySlugAndProject.get({
+        $slug: slug,
+        $projectPath: projectPath,
+      }) as
+        | Record<string, unknown>
+        | undefined
+      return row ? mapRow(row) : null
+    },
+    // App settings
+    getAppSetting: (key) => {
+      const row = selectAppSetting.get({ $key: key }) as
+        | { value: string }
+        | undefined
+      return row?.value ?? null
+    },
+    setAppSetting: (key, value) => {
+      upsertAppSetting.run({ $key: key, $value: value })
+    },
+    close: () => {
+      try {
+        db.close()
+      } finally {
+        releaseOwner?.()
+      }
+    },
+  }
+  migrateSyncedAntigravityPreset(api)
+  return api
+}
+
+function migrateSyncedAntigravityPreset(db: SessionDatabase) {
+  const marker = 'synced_settings.antigravity_fullscreen_migrated'
+  if (db.getAppSetting(marker) !== null) return
+
+  db.db.transaction(() => {
+    if (db.getAppSetting(marker) !== null) return
+    const key = 'synced_settings.commandPresets'
+    const raw = db.getAppSetting(key)
+    if (raw !== null) {
+      let value: unknown
+      try {
+        value = JSON.parse(raw)
+      } catch {
+        // Leave corrupt settings untouched. The settings endpoint skips them.
+      }
+      if (isValidSyncedSetting('commandPresets', value)) {
+        const presets = value as SyncedCommandPreset[]
+        const migrated = presets.map(migrateLegacyAntigravityPreset)
+        if (migrated.some((preset, index) => preset !== presets[index])) {
+          db.setAppSetting(key, JSON.stringify(migrated))
+        }
+      }
+    }
+    // Later explicit edits to the original command are ordinary synced values.
+    db.setAppSetting(marker, '1')
+  }).immediate()
+}
+
+function ensureDataDir(dbPath: string) {
+  if (dbPath === ':memory:') {
+    return
+  }
+
+  const dir = path.dirname(dbPath)
+  if (!dir) return
+
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  } catch {
+    // Ignore mkdir failures; SQLite will surface errors when opening
+  }
+
+  try {
+    fs.chmodSync(dir, 0o700)
+  } catch {
+    // Ignore chmod failures
+  }
+}
+
+function migrateDatabase(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || !columns.includes('session_source')) {
+    return
+  }
+
+  db.exec('BEGIN')
+  try {
+    db.exec('ALTER TABLE agent_sessions RENAME TO agent_sessions_old')
+    createAgentSessionsTable(db, 'agent_sessions')
+    db.exec(`
+      INSERT INTO agent_sessions (
+        id,
+        session_id,
+        log_file_path,
+        project_path,
+        agent_type,
+        display_name,
+        created_at,
+        last_activity_at,
+        last_user_message,
+        current_window
+      )
+      SELECT
+        id,
+        session_id,
+        log_file_path,
+        project_path,
+        agent_type,
+        display_name,
+        created_at,
+        last_activity_at,
+        NULL AS last_user_message,
+        current_window
+      FROM agent_sessions_old
+      WHERE session_source = 'log'
+    `)
+    db.exec('DROP TABLE agent_sessions_old')
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}
+
+function createAgentSessionsTable(db: SQLiteDatabase, tableName: string) {
+  db.exec(`
+    CREATE TABLE ${tableName} (
+${AGENT_SESSIONS_COLUMNS_SQL}
+    );
+  `)
+}
+
+function migrateLastUserMessageColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || columns.includes('last_user_message')) {
+    return
+  }
+  db.exec('ALTER TABLE agent_sessions ADD COLUMN last_user_message TEXT')
+}
+
+function migrateIsPinnedToHibernatingColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (
+    columns.length === 0 ||
+    !columns.includes('is_pinned') ||
+    columns.includes('is_hibernating')
+  ) {
+    return
+  }
+  db.exec(
+    'ALTER TABLE agent_sessions RENAME COLUMN is_pinned TO is_hibernating'
+  )
+}
+
+function migrateIsHibernatingColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || columns.includes('is_hibernating')) {
+    return
+  }
+  db.exec('ALTER TABLE agent_sessions ADD COLUMN is_hibernating INTEGER NOT NULL DEFAULT 0')
+}
+
+function migrateIsSleepingToHibernatingColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || !columns.includes('is_sleeping')) {
+    return
+  }
+
+  db.exec('BEGIN')
+  try {
+    // Preserve every legacy sleeping row in the derived Hibernating bucket.
+    db.exec('UPDATE agent_sessions SET is_hibernating = 1 WHERE is_sleeping = 1')
+    db.exec('ALTER TABLE agent_sessions DROP COLUMN is_sleeping')
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}
+
+function migrateLastResumeErrorColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || columns.includes('last_resume_error')) {
+    return
+  }
+  db.exec('ALTER TABLE agent_sessions ADD COLUMN last_resume_error TEXT')
+}
+
+function migrateLastKnownLogSizeColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || columns.includes('last_known_log_size')) {
+    return
+  }
+  db.exec('ALTER TABLE agent_sessions ADD COLUMN last_known_log_size INTEGER')
+}
+
+function migrateIsCodexExecColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || columns.includes('is_codex_exec')) {
+    return
+  }
+  db.exec('ALTER TABLE agent_sessions ADD COLUMN is_codex_exec INTEGER NOT NULL DEFAULT 0')
+}
+
+function migrateSlugColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || columns.includes('slug')) {
+    return
+  }
+  db.exec('ALTER TABLE agent_sessions ADD COLUMN slug TEXT')
+}
+
+function migrateLaunchCommandColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || columns.includes('launch_command')) {
+    return
+  }
+  db.exec('ALTER TABLE agent_sessions ADD COLUMN launch_command TEXT')
+}
+
+function migrateWakeStartedAtColumn(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (columns.length === 0 || columns.includes('wake_started_at')) {
+    return
+  }
+  db.exec('ALTER TABLE agent_sessions ADD COLUMN wake_started_at TEXT')
+}
+
+function migrateDeduplicateDisplayNames(db: SQLiteDatabase) {
+  // Find all display names that have duplicates
+  const duplicates = db
+    .prepare(
+      `SELECT display_name, COUNT(*) as count
+       FROM agent_sessions
+       GROUP BY display_name
+       HAVING count > 1`
+    )
+    .all() as Array<{ display_name: string; count: number }>
+
+  if (duplicates.length === 0) {
+    return
+  }
+
+  const updateStmt = db.prepare(
+    'UPDATE agent_sessions SET display_name = $newName WHERE session_id = $sessionId'
+  )
+
+  for (const { display_name } of duplicates) {
+    // Get all sessions with this name, ordered by created_at (oldest first)
+    const sessions = db
+      .prepare(
+        `SELECT session_id, display_name
+         FROM agent_sessions
+         WHERE display_name = $displayName
+         ORDER BY created_at ASC`
+      )
+      .all({ $displayName: display_name }) as Array<{
+      session_id: string
+      display_name: string
+    }>
+
+    // Keep first one as-is, rename the rest
+    for (let i = 1; i < sessions.length; i++) {
+      const suffix = i + 1
+      let newName = `${display_name}-${suffix}`
+
+      // Make sure the new name doesn't already exist
+      while (
+        db
+          .prepare(
+            'SELECT 1 FROM agent_sessions WHERE display_name = $name LIMIT 1'
+          )
+          .get({ $name: newName }) != null
+      ) {
+        newName = `${display_name}-${suffix}-${Date.now().toString(36).slice(-4)}`
+      }
+
+      updateStmt.run({ $newName: newName, $sessionId: sessions[i].session_id })
+    }
+  }
+}
+
+function migrateDeduplicateCurrentWindows(db: SQLiteDatabase) {
+  const columns = getColumnNames(db, 'agent_sessions')
+  if (
+    columns.length === 0 ||
+    !columns.includes('current_window') ||
+    !columns.includes('session_id') ||
+    !columns.includes('last_activity_at') ||
+    !columns.includes('id') ||
+    !columns.includes('is_hibernating')
+  ) {
+    return
+  }
+
+  const duplicates = db
+    .prepare(
+      `SELECT current_window
+       FROM agent_sessions
+       WHERE current_window IS NOT NULL
+       GROUP BY current_window
+       HAVING COUNT(*) > 1`
+    )
+    .all() as Array<{ current_window: string }>
+
+  if (duplicates.length === 0) {
+    return
+  }
+
+  const selectSessions = db.prepare(
+    `SELECT session_id
+     FROM agent_sessions
+     WHERE current_window = $currentWindow
+     ORDER BY last_activity_at DESC, id DESC`
+  )
+  const orphanDuplicate = db.prepare(
+    `UPDATE agent_sessions
+     SET current_window = NULL, is_hibernating = 0
+     WHERE session_id = $sessionId`
+  )
+
+  db.exec('BEGIN')
+  try {
+    for (const { current_window } of duplicates) {
+      const sessions = selectSessions.all({
+        $currentWindow: current_window,
+      }) as Array<{ session_id: string }>
+
+      for (const duplicate of sessions.slice(1)) {
+        orphanDuplicate.run({ $sessionId: duplicate.session_id })
+      }
+    }
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}
+
+/**
+ * Migrate agent_type CHECK constraint to include every current AgentType.
+ * SQLite doesn't support modifying constraints, so we recreate the table.
+ */
+function migrateAgentTypeConstraint(db: SQLiteDatabase) {
+  const tableInfo = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_sessions'")
+    .get() as { sql: string } | undefined
+
+  if (!tableInfo?.sql) {
+    return // Table doesn't exist yet, will be created with correct constraint
+  }
+
+  if (
+    tableInfo.sql.includes("'claude-rp'") &&
+    tableInfo.sql.includes("'pi'") &&
+    tableInfo.sql.includes("'devin'") &&
+    tableInfo.sql.includes("'grok'") &&
+    tableInfo.sql.includes("'omp'") &&
+    tableInfo.sql.includes("'antigravity'")
+  ) {
+    return
+  }
+
+  const existingColumns = getColumnNames(db, 'agent_sessions')
+  const launchCommandSelect = existingColumns.includes('launch_command')
+    ? 'launch_command'
+    : 'NULL AS launch_command'
+  const wakeStartedAtSelect = existingColumns.includes('wake_started_at')
+    ? 'wake_started_at'
+    : 'NULL AS wake_started_at'
+
+  db.exec('BEGIN')
+  try {
+    db.exec('ALTER TABLE agent_sessions RENAME TO agent_sessions_old_agent_type_migrate')
+    createAgentSessionsTable(db, 'agent_sessions')
+    db.exec(`
+      INSERT INTO agent_sessions (
+        id,
+        session_id,
+        log_file_path,
+        project_path,
+        slug,
+        agent_type,
+        display_name,
+        created_at,
+        last_activity_at,
+        last_user_message,
+        current_window,
+        is_hibernating,
+        last_resume_error,
+        wake_started_at,
+        last_known_log_size,
+        is_codex_exec,
+        launch_command,
+        last_known_log_revision
+      )
+      SELECT
+        id,
+        session_id,
+        log_file_path,
+        project_path,
+        slug,
+        agent_type,
+        display_name,
+        created_at,
+        last_activity_at,
+        last_user_message,
+        current_window,
+        is_hibernating,
+        last_resume_error,
+        ${wakeStartedAtSelect},
+        last_known_log_size,
+        is_codex_exec,
+        ${launchCommandSelect},
+        ${existingColumns.includes('last_known_log_revision') ? 'last_known_log_revision' : 'NULL'}
+      FROM agent_sessions_old_agent_type_migrate
+    `)
+    db.exec('DROP TABLE agent_sessions_old_agent_type_migrate')
+    db.exec('COMMIT')
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}
+
+
+function getColumnNames(db: SQLiteDatabase, tableName: string): string[] {
+  const rows = db
+    .prepare(`PRAGMA table_info(${tableName})`)
+    .all() as Array<{ name?: string }>
+  return rows.map((row) => String(row.name ?? '')).filter(Boolean)
+}

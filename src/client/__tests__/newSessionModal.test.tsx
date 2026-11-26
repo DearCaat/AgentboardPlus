@@ -1,0 +1,324 @@
+import { afterEach, describe, expect, test } from 'bun:test'
+import TestRenderer, { act } from 'react-test-renderer'
+import NewSessionModal from '../components/NewSessionModal'
+import { DEFAULT_PRESETS } from '../stores/settingsStore'
+
+const globalAny = globalThis as typeof globalThis & {
+  window?: Window & typeof globalThis
+  document?: Document
+}
+
+const originalWindow = globalAny.window
+const originalDocument = globalAny.document
+
+afterEach(() => {
+  globalAny.window = originalWindow
+  globalAny.document = originalDocument
+})
+
+function setupDom() {
+  const keyHandlers = new Map<string, EventListener>()
+  const textarea = {
+    removeAttribute: () => {},
+    focus: () => {},
+  }
+
+  globalAny.document = {
+    querySelector: () => textarea,
+  } as unknown as Document
+
+  globalAny.window = {
+    addEventListener: (event: string, handler: EventListener) => {
+      keyHandlers.set(event, handler)
+    },
+    removeEventListener: (event: string) => {
+      keyHandlers.delete(event)
+    },
+    setTimeout: (() => 1 as unknown as ReturnType<typeof setTimeout>) as unknown as typeof setTimeout,
+  } as unknown as Window & typeof globalThis
+
+  return { keyHandlers }
+}
+
+describe('NewSessionModal component', () => {
+  test('submits resolved values and closes', () => {
+    setupDom()
+
+    const created: Array<{ path: string; name?: string; command?: string }> = []
+    let closed = 0
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <NewSessionModal
+          isOpen
+          onClose={() => {
+            closed += 1
+          }}
+          onCreate={(path, name, command) => {
+            created.push({ path, name, command })
+          }}
+          defaultProjectDir="/base"
+          commandPresets={DEFAULT_PRESETS}
+          defaultPresetId="claude"
+          lastProjectPath="/last"
+          activeProjectPath="/active"
+        />
+      )
+    })
+
+    // Field order: command (0), yolo checkbox (1), project path (2), name (3)
+    const inputs = renderer.root.findAllByType('input')
+    const projectInput = inputs[2]
+    const nameInput = inputs[3]
+
+    act(() => {
+      projectInput.props.onChange({ target: { value: 'repo' } })
+      nameInput.props.onChange({ target: { value: ' Alpha ' } })
+    })
+
+    const buttons = renderer.root.findAllByType('button')
+    const customButton = buttons.find((button) => {
+      const children = Array.isArray(button.props.children)
+        ? button.props.children
+        : [button.props.children]
+      return children.some((c: unknown) => c === 'Custom')
+    })
+
+    if (!customButton) {
+      throw new Error('Expected custom command button')
+    }
+
+    act(() => {
+      customButton.props.onClick()
+    })
+
+    // Custom command input is now at index 0 (first in the form)
+    const commandInput = renderer.root.findAllByType('input')[0]
+
+    act(() => {
+      commandInput.props.onChange({ target: { value: ' bun run dev ' } })
+    })
+
+    const form = renderer.root.findByType('form')
+
+    act(() => {
+      form.props.onSubmit({ preventDefault: () => {} })
+    })
+
+    expect(created).toEqual([
+      { path: 'repo', name: 'Alpha', command: 'bun run dev' },
+    ])
+    expect(closed).toBe(1)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('closes on overlay click and escape', () => {
+    const { keyHandlers } = setupDom()
+    let closed = 0
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <NewSessionModal
+          isOpen
+          onClose={() => {
+            closed += 1
+          }}
+          onCreate={() => {}}
+          defaultProjectDir="/base"
+          commandPresets={DEFAULT_PRESETS}
+          defaultPresetId="claude"
+        />
+      )
+    })
+
+    const overlay = renderer.root.findByProps({ role: 'dialog' })
+
+    act(() => {
+      overlay.props.onClick({ target: overlay, currentTarget: overlay })
+    })
+
+    act(() => {
+      keyHandlers.get('keydown')?.({ key: 'Escape' } as KeyboardEvent)
+    })
+
+    expect(closed).toBe(2)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('allows editing full command', () => {
+    setupDom()
+
+    const created: Array<{ path: string; name?: string; command?: string }> = []
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <NewSessionModal
+          isOpen
+          onClose={() => {}}
+          onCreate={(path, name, command) => {
+            created.push({ path, name, command })
+          }}
+          defaultProjectDir="/base"
+          commandPresets={DEFAULT_PRESETS}
+          defaultPresetId="claude"
+          lastProjectPath="/last"
+          activeProjectPath="/active"
+        />
+      )
+    })
+
+    // Command input is the first input field
+    const inputs = renderer.root.findAllByType('input')
+    const commandInput = inputs[0]
+
+    // Edit the full command (preset starts with 'claude')
+    act(() => {
+      commandInput.props.onChange({ target: { value: 'claude --model opus --dangerously-skip-permissions' } })
+    })
+
+    const form = renderer.root.findByType('form')
+
+    act(() => {
+      form.props.onSubmit({ preventDefault: () => {} })
+    })
+
+    // Command should be the full edited command
+    expect(created[0].command).toBe('claude --model opus --dangerously-skip-permissions')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('prop changes while open keep the user choices (only opening initializes)', () => {
+    const { keyHandlers } = setupDom()
+    const created: Array<{ path: string; name?: string; command?: string }> = []
+    let renderer!: TestRenderer.ReactTestRenderer
+    const modal = (props: { activeProjectPath: string; presets: typeof DEFAULT_PRESETS; isOpen?: boolean }) => (
+      <NewSessionModal
+        isOpen={props.isOpen ?? true}
+        onClose={() => {}}
+        onCreate={(path, name, command) => {
+          created.push({ path, name, command })
+        }}
+        defaultProjectDir="/base"
+        commandPresets={props.presets}
+        defaultPresetId="claude"
+        activeProjectPath={props.activeProjectPath}
+      />
+    )
+
+    act(() => {
+      renderer = TestRenderer.create(modal({ activeProjectPath: '/a', presets: DEFAULT_PRESETS }))
+    })
+    const inputs = () => renderer.root.findAllByType('input')
+    act(() => {
+      keyHandlers.get('keydown')?.({
+        key: '2',
+        preventDefault: () => {},
+        stopPropagation: () => {},
+      } as unknown as KeyboardEvent)
+    })
+    act(() => {
+      inputs()[2].props.onChange({ target: { value: '/typed' } })
+    })
+    expect(inputs()[0].props.value).toBe('codex')
+
+    // The selected session's window dies (new activeProjectPath) and synced
+    // settings deliver a fresh presets array — neither may reset the form.
+    act(() => {
+      renderer.update(modal({ activeProjectPath: '/b', presets: [...DEFAULT_PRESETS] }))
+    })
+    expect(inputs()[0].props.value).toBe('codex')
+    expect(inputs()[2].props.value).toBe('/typed')
+
+    act(() => {
+      renderer.root.findByType('form').props.onSubmit({ preventDefault: () => {} })
+    })
+    expect(created).toEqual([{ path: '/typed', name: undefined, command: 'codex' }])
+
+    // Reopening still initializes from the current defaults.
+    act(() => {
+      renderer.update(modal({ activeProjectPath: '/b', presets: DEFAULT_PRESETS, isOpen: false }))
+    })
+    act(() => {
+      renderer.update(modal({ activeProjectPath: '/b', presets: DEFAULT_PRESETS }))
+    })
+    expect(inputs()[0].props.value).toBe('claude')
+    expect(inputs()[2].props.value).toBe('/b')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('digit keys select presets, 0 selects custom, digits are ignored in inputs', () => {
+    const { keyHandlers } = setupDom()
+
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <NewSessionModal
+          isOpen
+          onClose={() => {}}
+          onCreate={() => {}}
+          defaultProjectDir="/base"
+          commandPresets={DEFAULT_PRESETS}
+          defaultPresetId="claude"
+        />
+      )
+    })
+
+    const press = (key: string) => {
+      act(() => {
+        keyHandlers.get('keydown')?.({
+          key,
+          preventDefault: () => {},
+          stopPropagation: () => {},
+        } as unknown as KeyboardEvent)
+      })
+    }
+    const commandValue = () =>
+      renderer.root.findAllByType('input')[0].props.value
+
+    // Default preset is claude
+    expect(commandValue()).toBe('claude')
+
+    press('2')
+    expect(commandValue()).toBe('codex')
+
+    press('1')
+    expect(commandValue()).toBe('claude')
+
+    press('0')
+    expect(commandValue()).toBe('')
+
+    // Out-of-range digit is a no-op
+    press('9')
+    expect(commandValue()).toBe('')
+
+    // Digits type normally when an input is focused
+    ;(globalAny.document as unknown as { activeElement: unknown }).activeElement = {
+      tagName: 'INPUT',
+    }
+    press('2')
+    expect(commandValue()).toBe('')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+})

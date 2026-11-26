@@ -1,0 +1,311 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { testProcessEnv } from './test-process-env'
+import { runChild } from './test-runner-child'
+import {
+  type CommandResult,
+  commandFailed,
+  describeEnding,
+  formatRunSummary,
+} from './test-runner-report'
+
+const args = process.argv.slice(2)
+const skipIsolated = args.includes('--skip-isolated')
+const skipRealTmux = args.includes('--skip-real-tmux')
+const passthroughArgs = args.filter(
+  (arg) => arg !== '--skip-isolated' && arg !== '--skip-real-tmux'
+)
+
+function createTempLogDirs() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-tests-'))
+  const claudeDir = path.join(tempRoot, 'claude')
+  const codexDir = path.join(tempRoot, 'codex')
+  fs.mkdirSync(path.join(claudeDir, 'projects'), { recursive: true })
+  fs.mkdirSync(path.join(codexDir, 'sessions'), { recursive: true })
+  return { tempRoot, claudeDir, codexDir }
+}
+
+const results: CommandResult[] = []
+
+/**
+ * Runs one test child (see runChild). A failure does not stop the run: every
+ * child runs, and the summary at the end names each one that failed, so a
+ * failure cannot hide in the noise.
+ */
+async function runCommand(label: string, cmd: string[], env: NodeJS.ProcessEnv) {
+  const result = await runChild({ label, cmd, env })
+  results.push(result)
+  if (commandFailed(result)) {
+    console.error(`\n[test-runner] FAILED ${label}: ${describeEnding(result)}\n`)
+  }
+}
+
+function testFileLabel(file: string) {
+  return `isolated ${file}`
+}
+
+async function main() {
+  const { tempRoot, claudeDir, codexDir } = createTempLogDirs()
+  const tempLogFile = path.join(tempRoot, 'agentboard.log')
+  const tempDbPath = path.join(tempRoot, 'agentboard.db')
+  // A mocked spawn can be restored while async server startup is still running.
+  // Isolate at process creation, before imports/Workers can retain the parent env.
+  const socketRoot = fs.mkdtempSync(path.join(fs.existsSync('/tmp') ? '/tmp' : os.tmpdir(), 'ab-tests-tmux-'))
+  const env: NodeJS.ProcessEnv = {
+    ...testProcessEnv(process.env, socketRoot),
+    // React's act() requires the development build; force NODE_ENV=test
+    // so tests pass even when the shell has NODE_ENV=production.
+    NODE_ENV: process.env.NODE_ENV === 'production' ? 'test' : (process.env.NODE_ENV || 'test'),
+    CLAUDE_CONFIG_DIR: claudeDir,
+    CODEX_HOME: codexDir,
+    AGENTBOARD_ANTIGRAVITY_HOME: path.join(tempRoot, 'antigravity-cli'),
+    LOG_FILE: tempLogFile,
+    AGENTBOARD_DB_PATH: tempDbPath,
+    // Test servers get their own data dir so the single-instance lock
+    // (<dataDir>/server.lock) never collides with a dev's running instance.
+    AGENTBOARD_DATA_DIR: tempRoot,
+    AGENTBOARD_TMUX_PID_FILE: path.join(tempRoot, 'tmux-server.pid'),
+    AGENTBOARD_PERSISTENCE_MAINTENANCE_MS: '0',
+    // General server tests mock process inspection; config tests exercise the default explicitly.
+    AGENTBOARD_OWNERSHIP_MATCHING: 'false',
+    // Default skipMatchingPatterns excludes /tmp/* and /var/folders/* — both
+    // common locations for test working directories (worktrees, CI runners on
+    // some platforms). Tests that exercise matching logic from those paths
+    // would otherwise be silently skipped. Tests that need specific skip
+    // behavior pass patterns explicitly via the matcher API.
+    AGENTBOARD_SKIP_MATCHING_PATTERNS: '',
+  }
+  // A shell LOG_LEVEL (e.g. debug) changes logger defaults that tests assert
+  // on. Tests that need a level set it themselves.
+  delete env.LOG_LEVEL
+  // Children write to a pipe, not the terminal; keep bun's colors when the
+  // runner itself is on a TTY.
+  if (process.stdout.isTTY && env.FORCE_COLOR === undefined && env.NO_COLOR === undefined) {
+    env.FORCE_COLOR = '1'
+  }
+
+  try {
+    await runCommand('node launchd/systemd tests', ['node', '--test', 'launchd/release.test.mjs', 'launchd/scripts.test.mjs', 'systemd/install.test.mjs'], env)
+    await runCommand('script tests', ['bun', 'test', './scripts/verify-platform-lock.test.ts', './scripts/test-process-env.test.ts', './scripts/test-runner-report.test.ts', './scripts/test-runner-child.test.ts'], env)
+
+    // Tests that either mutate globals or are sensitive to global mutations
+    // must run in a separate process so they don't race with other test files.
+    // PipePaneTerminalProxy reads Bun.spawnSync at construction time — if another
+    // test file has patched it, the proxy gets a mock and start() becomes undefined.
+    // hydrateSessionsEmptyGuard imports `../index` with an active Bun.spawnSync /
+    // Bun.serve / setInterval mock; isolation keeps that mock window from
+    // overlapping with any other test that captures globals at module load.
+    const ISOLATED_FILES = new Set([
+      'sessionMetadataViews.test.ts',
+      // Activity scan tests spy on Date.now and file I/O.
+      'sessionActivity.test.ts',
+      'terminalLeases.test.ts',
+      'persistenceOwnership.test.ts',
+      'persistenceRoutes.test.ts',
+      // Entry-point tests patch Bun.serve/Bun.spawnSync/process.exit while
+      // importing the server. Keep them away from real server/tmux tests.
+      'directories.test.ts',
+      'index.test.ts',
+      'indexPortCheck.test.ts',
+      'slug-supersede.integration.test.ts',
+      'sessionRefreshWorker.test.ts',
+      'pipePaneTerminalProxy.test.ts',
+      'pipePaneLifecycle.test.ts',
+      'hydrateSessionsEmptyGuard.test.ts',
+      // terminalProxyFactory.test.ts installs a top-level
+      // mock.module('../config', ...) whose replacement omits many real
+      // config fields. Bun's mock.restore() in afterAll does not fully
+      // unwind module-level mocks, so the stripped config can leak into
+      // any later test file that imports `../config` (notably
+      // logPoller.test.ts, which depends on skipMatchingPatterns).
+      'terminalProxyFactory.test.ts',
+      // fadParity.test.ts repoints agent-discovery env vars
+      // (CLAUDE_CONFIG_DIR, CODEX_HOME, PI_HOME, GROK_HOME,
+      // PI_CODING_AGENT_DIR, AGENTBOARD_DATA_DIR, DEVIN_CLI_DIR) at the
+      // fixture tree; isolation keeps that env from leaking into
+      // concurrently-loaded files.
+      'fadParity.test.ts',
+      // Stubs Bun.spawnSync to script tmux option races.
+      'tmuxIdentityEpoch.test.ts',
+    ])
+
+    // These spawn real servers, PTYs, and tmux clients. They still need process
+    // isolation from global Bun.* mocks, but running them under coverage on
+    // Linux CI can stall PTY attach readiness.
+    const ISOLATED_REAL_TMUX_FILES = new Set([
+      'previewTls.test.ts',
+      'sshPaste.integration.test.ts',
+      'double-attach.integration.test.ts',
+      'pipePaneShared.integration.test.ts',
+      'pipePaneRelay.integration.test.ts',
+      'paneOutputBackpressure.integration.test.ts',
+      'e2eTmuxReap.integration.test.ts',
+      'groupedSessionLeak.integration.test.ts',
+      'hibernation.integration.test.ts',
+      'killWindowGroupedSession.integration.test.ts',
+      'persistence.integration.test.ts',
+      'integration.test.ts',
+      'throttled-reconnect.integration.test.ts',
+      'terminalRelay.integration.test.ts',
+      'originGuard.integration.test.ts',
+    ])
+
+    // Client tests that install top-level mock.module(...) hooks must run in a
+    // separate process — Bun's module mocks persist for the lifetime of the
+    // test process, so they leak into any subsequent file that imports the
+    // same module. app.test.tsx stubs ../components/SessionPreviewContent;
+    // when bun's readdir order puts it before SessionPreviewModal.test.tsx
+    // (e.g. on Linux ext4) the modal test sees the stub and breaks.
+    const ISOLATED_CLIENT_FILES = new Set([
+      // agentIcon.test.tsx stubs the shared components/icons module; a
+      // module stub leaks into every later importer in the same process
+      // (prChips.test.tsx once saw XCloseIcon lose forwarded props).
+      'agentIcon.test.tsx',
+      // PR chip tests replace react-dom, fetch and browser globals across reconnects.
+      'prChips.test.tsx',
+      // Folder picker fixtures replace fetch/window and schedule focus restoration.
+      'DirectoryBrowser.test.tsx',
+      'app.test.tsx',
+      // These fixtures replace document and schedule delayed focus returns.
+      // A preceding dialog's callback can focus the next file's fake textarea
+      // on Linux file order. Keep the strict focus assertions in their own
+      // processes instead of letting unrelated fake documents share timers.
+      'settingsModal.test.tsx',
+      'settingsModalRows.test.tsx',
+      'settingsHooks.test.tsx',
+      // Files that render motion/react (framer-motion) components. The
+      // library keeps module-level projection state (a root node per
+      // document) and schedules async frame callbacks on the global rAF;
+      // both leak across files sharing a process. A leaked frame callback
+      // firing after a file restored its window stub crashes with
+      // "undefined is not an object (evaluating 'window.innerWidth')"
+      // between tests, and the corrupted frameloop then fails unrelated
+      // tests in later files (seen on Linux CI as useTerminal/SessionDrawer
+      // failures; order- and timing-dependent, so macOS rarely hits it).
+      'renderComponents.test.tsx',
+      'sessionListComponent.test.tsx',
+      'sessionDrawer.test.tsx',
+      'sessionListFilters.test.tsx',
+      'sessionListBottomAnchor.test.tsx',
+    ])
+
+    const serverTests: string[] = []
+    const serverGlob = new Bun.Glob('src/server/__tests__/*.test.ts')
+    for await (const file of serverGlob.scan({ onlyFiles: true })) {
+      const basename = path.basename(file)
+      if (!ISOLATED_FILES.has(basename) && !ISOLATED_REAL_TMUX_FILES.has(basename)) {
+        serverTests.push(file)
+      }
+    }
+
+    const clientTests: string[] = []
+    const clientGlob = new Bun.Glob('src/client/__tests__/*.test.{ts,tsx}')
+    for await (const file of clientGlob.scan({ onlyFiles: true })) {
+      if (!ISOLATED_CLIENT_FILES.has(path.basename(file))) {
+        clientTests.push(file)
+      }
+    }
+    const sharedTestsDir = 'src/shared/__tests__'
+
+    await runCommand(
+      `main batch (${serverTests.length + clientTests.length} files + src/shared)`,
+      ['bun', 'test', ...passthroughArgs, ...serverTests, sharedTestsDir, ...clientTests],
+      env
+    )
+
+    // Always run global-mutating tests in a separate process to prevent races.
+    // Each file runs in its own bun process — isolation is from every other
+    // file, not just from the main suite. terminalProxyFactory.test.ts
+    // installs mock.module('../terminal/PipePaneTerminalProxy', ...) that
+    // would otherwise leak into pipePaneTerminalProxy.test.ts on readdir
+    // orderings where it loads first (Linux ext4).
+    for (const file of ISOLATED_FILES) {
+      await runCommand(
+        testFileLabel(`src/server/__tests__/${file}`),
+        ['bun', 'test', ...passthroughArgs, `src/server/__tests__/${file}`],
+        env
+      )
+    }
+
+    if (!skipRealTmux) {
+      const argsWithoutCoverage = stripCoverageArgs(passthroughArgs)
+      for (const file of ISOLATED_REAL_TMUX_FILES) {
+        await runCommand(
+          testFileLabel(`src/server/__tests__/${file}`),
+          ['bun', 'test', ...argsWithoutCoverage, `src/server/__tests__/${file}`],
+          env
+        )
+      }
+    }
+
+    for (const file of ISOLATED_CLIENT_FILES) {
+      await runCommand(
+        testFileLabel(`src/client/__tests__/${file}`),
+        ['bun', 'test', ...passthroughArgs, `src/client/__tests__/${file}`],
+        env
+      )
+    }
+
+    if (!skipIsolated) {
+      // Each file in isolated/ runs in its own process, same as ISOLATED_FILES
+      // above: these files install top-level mock.module(...) hooks (e.g.
+      // indexHandlers.test.ts stubs ../../terminal with a partial factory),
+      // and Bun module mocks persist for the life of the process — on readdir
+      // orderings where the mocking file loads first (Linux ext4), a shared
+      // process poisons every later import of the same module.
+      const isolatedTests: string[] = []
+      const isolatedGlob = new Bun.Glob('src/server/__tests__/isolated/*.test.ts')
+      for await (const file of isolatedGlob.scan({ onlyFiles: true })) {
+        isolatedTests.push(file)
+      }
+      isolatedTests.sort()
+      for (const file of isolatedTests) {
+        await runCommand(testFileLabel(file), ['bun', 'test', ...passthroughArgs, file], env)
+      }
+    }
+  } finally {
+    // Close only windows on the socket created by this invocation. Never target
+    // a default server or rely on the caller's TMUX environment during cleanup.
+    const socket = path.join(socketRoot, `tmux-${os.userInfo().uid}`, 'default')
+    if (Bun.which('tmux')) {
+      const windows = Bun.spawnSync(['tmux', '-S', socket, 'list-windows', '-a', '-F', '#{window_id}'], { env, stdout: 'pipe', stderr: 'ignore' })
+      if (windows.exitCode === 0) {
+        for (const window of new Set(windows.stdout.toString().trim().split('\n').filter(Boolean))) {
+          Bun.spawnSync(['tmux', '-S', socket, 'kill-window', '-t', window], { env, stdout: 'ignore', stderr: 'ignore' })
+        }
+      }
+    }
+    fs.rmSync(socketRoot, { recursive: true, force: true })
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+}
+
+function finish(code: number, error?: unknown) {
+  let text = formatRunSummary(results, { loadAverage: os.loadavg()[0], cpus: os.cpus().length })
+  if (error !== undefined) text += `\n[test-runner] runner error: ${error instanceof Error ? error.stack : String(error)}`
+  // Exit only after the summary is flushed; a piped stderr (CI) would
+  // otherwise drop queued writes.
+  process.stderr.write(`${text}\n`, () => process.exit(code))
+}
+
+main().then(
+  () => finish(results.some(commandFailed) ? 1 : 0),
+  (error) => finish(1, error)
+)
+
+function stripCoverageArgs(args: string[]) {
+  const stripped: string[] = []
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === '--coverage') continue
+    if (arg.startsWith('--coverage=')) continue
+    if (arg.startsWith('--coverage-reporter=')) continue
+    if (arg === '--coverage-reporter') {
+      index += 1
+      continue
+    }
+    stripped.push(arg)
+  }
+  return stripped
+}

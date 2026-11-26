@@ -1,0 +1,1113 @@
+import { describe, expect, test, afterEach } from 'bun:test'
+import { Database as SQLiteDatabase } from 'bun:sqlite'
+import { ACTIVE_SESSIONS_SQL, initDatabase } from '../db'
+import { sessionListsSql } from '../sessionReads'
+import { logger } from '../logger'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import type { AgentType } from '../../shared/types'
+
+const now = new Date('2026-01-01T00:00:00.000Z').toISOString()
+
+function withLegacySyncedPresets(raw: string, run: (dbPath: string) => void) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-synced-presets-'))
+  const dbPath = path.join(dir, 'legacy.db')
+  try {
+    const legacy = new SQLiteDatabase(dbPath)
+    try {
+      legacy.exec('CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+      legacy.run("INSERT INTO app_settings VALUES ('synced_settings.commandPresets', ?)", [raw])
+    } finally {
+      legacy.close()
+    }
+    run(dbPath)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+function makeSession(overrides: Partial<{
+  sessionId: string
+  logFilePath: string
+  projectPath: string
+  slug: string | null
+  agentType: AgentType
+  displayName: string
+  createdAt: string
+  lastActivityAt: string
+  lastUserMessage: string | null
+  currentWindow: string | null
+  isHibernating: boolean
+  lastResumeError: string | null
+  wakeStartedAt: string | null
+  lastKnownLogSize: number | null
+  isCodexExec: boolean
+  launchCommand: string | null
+}> = {}) {
+  return {
+    sessionId: 'session-abc',
+    logFilePath: '/tmp/session-abc.jsonl',
+    projectPath: '/tmp/alpha',
+    slug: null as string | null,
+    agentType: 'claude' as const,
+    displayName: 'alpha',
+    createdAt: now,
+    lastActivityAt: now,
+    lastUserMessage: null,
+    currentWindow: 'agentboard:1',
+    isHibernating: false,
+    lastResumeError: null,
+    wakeStartedAt: null,
+    lastKnownLogSize: null,
+    isCodexExec: false,
+    launchCommand: null,
+    ...overrides,
+  }
+}
+
+describe('db', () => {
+  const db = initDatabase({ path: ':memory:' })
+
+  afterEach(() => {
+    db.db.exec('DELETE FROM agent_sessions')
+  })
+
+  test('migrates the stock synced Antigravity launcher once and preserves later edits', () => {
+    const key = 'synced_settings.commandPresets'
+    const stock = { id: 'antigravity', label: 'Antigravity', command: 'agy', isBuiltIn: true, agentType: 'antigravity' }
+    const custom = { ...stock, id: 'custom-agy', isBuiltIn: false }
+    const raw = JSON.stringify([stock, custom])
+    withLegacySyncedPresets(raw, dbPath => {
+      const upgraded = initDatabase({ path: dbPath })
+      try {
+        expect(JSON.parse(upgraded.getAppSetting(key)!)).toEqual([
+          { ...stock, command: `agy --settings '{"altScreenMode":"always"}'` },
+          custom,
+        ])
+        // The setup screen can save the old command explicitly after migration.
+        upgraded.setAppSetting(key, raw)
+      } finally {
+        upgraded.close()
+      }
+
+      const reopened = initDatabase({ path: dbPath })
+      try {
+        expect(reopened.getAppSetting(key)).toBe(raw)
+      } finally {
+        reopened.close()
+      }
+    })
+  })
+
+  test.each([
+    '{corrupt',
+    '[null]',
+    '[{"id":"antigravity","label":"Antigravity","command":"agy --model gemini","isBuiltIn":true,"agentType":"antigravity"}]',
+  ])('preserves malformed and customized synced preset values (%s)', raw => {
+    withLegacySyncedPresets(raw, dbPath => {
+      const upgraded = initDatabase({ path: dbPath })
+      try {
+        expect(upgraded.getAppSetting('synced_settings.commandPresets')).toBe(raw)
+      } finally {
+        upgraded.close()
+      }
+    })
+  })
+
+  test('active-session lookup uses the windowed-row index, not a full scan', () => {
+    const plan = (
+      db.db.query(`EXPLAIN QUERY PLAN ${ACTIVE_SESSIONS_SQL}`).all() as { detail: string }[]
+    ).map((row) => row.detail)
+    expect(plan.some((detail) => detail.includes('idx_current_window_unique'))).toBe(true)
+    expect(plan.some((detail) => detail.startsWith('SCAN'))).toBe(false)
+  })
+
+  test('active sessions come back ordered by session id', () => {
+    for (const id of ['c', 'a', 'b']) {
+      db.insertSession(
+        makeSession({ sessionId: id, logFilePath: `/tmp/${id}.jsonl`, currentWindow: `agentboard:${id}` })
+      )
+    }
+    db.insertSession(
+      makeSession({ sessionId: 'aa', logFilePath: '/tmp/aa.jsonl', currentWindow: null })
+    )
+    expect(db.getActiveSessions().map((s) => s.sessionId)).toEqual(['a', 'b', 'c'])
+  })
+
+  test('insert/get/update/orphan session records', () => {
+    const session = makeSession()
+    const inserted = db.insertSession(session)
+    expect(inserted.id).toBeGreaterThan(0)
+    expect(inserted.sessionId).toBe(session.sessionId)
+
+    const byId = db.getSessionById(session.sessionId)
+    expect(byId?.logFilePath).toBe(session.logFilePath)
+
+    const byPath = db.getSessionByLogPath(session.logFilePath)
+    expect(byPath?.sessionId).toBe(session.sessionId)
+
+    const byWindow = db.getSessionByWindow(session.currentWindow ?? '')
+    expect(byWindow?.sessionId).toBe(session.sessionId)
+
+    const updated = db.updateSession(session.sessionId, {
+      displayName: 'beta',
+      currentWindow: null,
+    })
+    expect(updated?.displayName).toBe('beta')
+    expect(updated?.currentWindow).toBeNull()
+
+    const active = db.getActiveSessions()
+    const history = db.getHistorySessions()
+    expect(active).toHaveLength(0)
+    expect(history).toHaveLength(1)
+
+    const orphaned = db.orphanSession(session.sessionId)
+    expect(orphaned?.currentWindow).toBeNull()
+  })
+
+  test('stores claude-rp agent sessions', () => {
+    const inserted = db.insertSession(makeSession({
+      sessionId: 'claude-rp-session',
+      logFilePath: '/tmp/claude-rp-session.jsonl',
+      agentType: 'claude-rp',
+      currentWindow: null,
+    }))
+
+    expect(inserted.agentType).toBe('claude-rp')
+    expect(db.getSessionById('claude-rp-session')?.agentType).toBe(
+      'claude-rp'
+    )
+  })
+
+  test('enforces one active session per tmux window', () => {
+    db.insertSession(makeSession({
+      sessionId: 'active-a',
+      logFilePath: '/tmp/active-a.jsonl',
+      currentWindow: 'agentboard:unique',
+    }))
+
+    expect(() =>
+      db.insertSession(makeSession({
+        sessionId: 'active-b',
+        logFilePath: '/tmp/active-b.jsonl',
+        currentWindow: 'agentboard:unique',
+      }))
+    ).toThrow()
+
+    db.insertSession(makeSession({
+      sessionId: 'history-a',
+      logFilePath: '/tmp/history-a.jsonl',
+      currentWindow: null,
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'history-b',
+      logFilePath: '/tmp/history-b.jsonl',
+      currentWindow: null,
+    }))
+
+    expect(db.getHistorySessions().map((session) => session.sessionId)).toEqual([
+      'history-a',
+      'history-b',
+    ])
+  })
+
+  test('getSessionLists matches the three separate getters exactly', () => {
+    const old = '2020-01-01T00:00:00.000Z'
+    const mid = '2020-06-01T00:00:00.000Z'
+    const recent = new Date().toISOString()
+    const seed = [
+      // Active (window claimed) — active order is by session_id text.
+      makeSession({ sessionId: 'c-active', logFilePath: '/tmp/c.jsonl', currentWindow: 'agentboard:3' }),
+      makeSession({ sessionId: 'a-active', logFilePath: '/tmp/a.jsonl', currentWindow: 'agentboard:1' }),
+      makeSession({ sessionId: 'b-active', logFilePath: '/tmp/b.jsonl', currentWindow: 'agentboard:2' }),
+      // Dormant hibernating.
+      makeSession({ sessionId: 'h-1', logFilePath: '/tmp/h1.jsonl', currentWindow: null, isHibernating: true, lastActivityAt: mid }),
+      makeSession({ sessionId: 'h-2', logFilePath: '/tmp/h2.jsonl', currentWindow: null, isHibernating: true, lastActivityAt: recent }),
+      // Dormant history rows at varied ages.
+      makeSession({ sessionId: 'hist-new', logFilePath: '/tmp/hn.jsonl', currentWindow: null, lastActivityAt: recent }),
+      makeSession({ sessionId: 'hist-mid', logFilePath: '/tmp/hm.jsonl', currentWindow: null, lastActivityAt: mid }),
+      makeSession({ sessionId: 'hist-old', logFilePath: '/tmp/ho.jsonl', currentWindow: null, lastActivityAt: old }),
+      // Timestamp ties exercise the session_id BINARY tiebreaker.
+      makeSession({ sessionId: 'tie-b', logFilePath: '/tmp/tb.jsonl', currentWindow: null, lastActivityAt: mid }),
+      makeSession({ sessionId: 'tie-a', logFilePath: '/tmp/ta.jsonl', currentWindow: null, lastActivityAt: mid }),
+    ]
+    for (const record of seed) db.insertSession(record)
+
+    const lists = db.getSessionLists()
+    expect(lists.active).toEqual(db.getActiveSessions())
+    expect(lists.hibernating).toEqual(db.getHibernatingSessions())
+    expect(lists.history).toEqual(db.getHistorySessions())
+    expect(lists.active.map((s) => s.sessionId)).toEqual(['a-active', 'b-active', 'c-active'])
+    expect(lists.hibernating.map((s) => s.sessionId)).toEqual(['h-2', 'h-1'])
+    expect(lists.history.map((s) => s.sessionId)).toEqual([
+      'hist-new',
+      'hist-mid',
+      'tie-a',
+      'tie-b',
+      'hist-old',
+    ])
+
+    const aged = db.getSessionLists({ maxAgeHours: 24 * 365 })
+    expect(aged.history.map((s) => s.sessionId)).toEqual(
+      db.getHistorySessions({ maxAgeHours: 24 * 365 }).map((s) => s.sessionId)
+    )
+    expect(aged.active).toEqual(db.getActiveSessions())
+    expect(aged.hibernating).toEqual(db.getHibernatingSessions())
+  })
+
+  test('bounded polling seeks each bucket without scanning archived payloads', () => {
+    const plan = db.db.query(`EXPLAIN QUERY PLAN ${sessionListsSql(true)}`)
+      .all({ $cutoff: now }) as { detail: string }[]
+    const details = plan.map((row) => row.detail).join('\n')
+    expect(details).toContain('idx_current_window_unique')
+    expect(details).toContain('idx_dormant_activity (is_hibernating=? AND last_activity_at>?)')
+    expect(details).not.toMatch(/SCAN agent_sessions/)
+  })
+
+  test('getSessionsByIds batch-returns the same records as getSessionById', () => {
+    for (const id of ['c', 'a', 'b']) {
+      db.insertSession(
+        makeSession({ sessionId: id, logFilePath: `/tmp/${id}.jsonl`, currentWindow: `agentboard:${id}` })
+      )
+    }
+    const batch = db.getSessionsByIds(['b', 'missing', 'a'])
+    expect(batch.map((s) => s.sessionId).sort()).toEqual(['a', 'b'])
+    expect(db.getSessionsByIds([])).toEqual([])
+    for (const record of batch) {
+      expect(record).toEqual(db.getSessionById(record.sessionId)!)
+    }
+  })
+
+  test('setHibernating updates hibernation marker flag', () => {
+    const session = makeSession()
+    db.insertSession(session)
+
+    // Initially not marked for hibernation
+    expect(db.getSessionById(session.sessionId)?.isHibernating).toBe(false)
+
+    // Mark it for hibernation
+    const marked = db.setHibernating(session.sessionId, true)
+    expect(marked?.isHibernating).toBe(true)
+    expect(db.getSessionById(session.sessionId)?.isHibernating).toBe(true)
+
+    // Clear the hibernation marker
+    const cleared = db.setHibernating(session.sessionId, false)
+    expect(cleared?.isHibernating).toBe(false)
+    expect(db.getSessionById(session.sessionId)?.isHibernating).toBe(false)
+  })
+
+  test('getHibernatingSessions returns marked sessions without window', () => {
+    // Marked + orphaned (should be returned)
+    db.insertSession(makeSession({
+      sessionId: 'a',
+      logFilePath: '/tmp/a.jsonl',
+      isHibernating: true,
+      currentWindow: null,
+    }))
+    // Marked + active (should NOT be returned)
+    db.insertSession(makeSession({
+      sessionId: 'b',
+      logFilePath: '/tmp/b.jsonl',
+      isHibernating: true,
+      currentWindow: 'agentboard:1',
+    }))
+    // Unmarked + orphaned (should NOT be returned)
+    db.insertSession(makeSession({
+      sessionId: 'c',
+      logFilePath: '/tmp/c.jsonl',
+      isHibernating: false,
+      currentWindow: null,
+    }))
+
+    const hibernating = db.getHibernatingSessions()
+    expect(hibernating).toHaveLength(1)
+    expect(hibernating[0].sessionId).toBe('a')
+  })
+
+  test('hibernating sessions are derived from marked sessions without windows', () => {
+    db.insertSession(makeSession({
+      sessionId: 'hibernating-one',
+      logFilePath: '/tmp/hibernating-one.jsonl',
+      currentWindow: null,
+      isHibernating: true,
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'history-one',
+      logFilePath: '/tmp/history-one.jsonl',
+      currentWindow: null,
+      isHibernating: false,
+    }))
+
+    const hibernating = db.getHibernatingSessions()
+    const history = db.getHistorySessions()
+
+    expect(hibernating.map((session) => session.sessionId)).toEqual(['hibernating-one'])
+    expect(history.map((session) => session.sessionId)).toEqual(['history-one'])
+  })
+
+  test('orphanSession preserves hibernation marker state', () => {
+    db.insertSession(makeSession({
+      sessionId: 'marked-to-orphan',
+      logFilePath: '/tmp/marked-to-orphan.jsonl',
+      currentWindow: 'agentboard:9',
+      isHibernating: true,
+    }))
+
+    const orphaned = db.orphanSession('marked-to-orphan')
+
+    expect(orphaned?.currentWindow).toBeNull()
+    expect(orphaned?.isHibernating).toBe(true)
+    expect(db.getHibernatingSessions().map((session) => session.sessionId)).toEqual([
+      'marked-to-orphan',
+    ])
+    expect(db.getHistorySessions()).toEqual([])
+  })
+
+  test('orphanSession auto-promotes unmarked active sessions to hibernating', () => {
+    db.insertSession(makeSession({
+      sessionId: 'unmarked-to-orphan',
+      logFilePath: '/tmp/unmarked-to-orphan.jsonl',
+      currentWindow: 'agentboard:10',
+      isHibernating: false,
+    }))
+
+    const orphaned = db.orphanSession('unmarked-to-orphan')
+
+    expect(orphaned?.currentWindow).toBeNull()
+    expect(orphaned?.isHibernating).toBe(true)
+    expect(db.getHistorySessions()).toEqual([])
+    expect(db.getHibernatingSessions().map((session) => session.sessionId)).toEqual([
+      'unmarked-to-orphan',
+    ])
+  })
+
+  test('orphanSession with expectedWindow only clears that window', () => {
+    db.insertSession(makeSession({
+      sessionId: 'moved-elsewhere',
+      logFilePath: '/tmp/moved-elsewhere.jsonl',
+      currentWindow: 'agentboard:@9',
+    }))
+
+    expect(db.orphanSession('moved-elsewhere', { expectedWindow: 'agentboard:@10' })).toBeNull()
+    expect(db.getSessionById('moved-elsewhere')?.currentWindow).toBe('agentboard:@9')
+
+    const orphaned = db.orphanSession('moved-elsewhere', { expectedWindow: 'agentboard:@9' })
+    expect(orphaned?.currentWindow).toBeNull()
+  })
+
+  test('orphanSession can move mismatch cleanup to history', () => {
+    db.insertSession(makeSession({
+      sessionId: 'mismatch-to-history',
+      logFilePath: '/tmp/mismatch-to-history.jsonl',
+      currentWindow: 'agentboard:11',
+      isHibernating: true,
+    }))
+
+    const orphaned = db.orphanSession('mismatch-to-history', { hibernate: false })
+
+    expect(orphaned?.currentWindow).toBeNull()
+    expect(orphaned?.isHibernating).toBe(false)
+    expect(db.getHibernatingSessions()).toEqual([])
+    expect(db.getHistorySessions().map((session) => session.sessionId)).toEqual([
+      'mismatch-to-history',
+    ])
+  })
+
+  test('accepts devin agent type', () => {
+    const session = makeSession({
+      sessionId: `devin-${Date.now()}`,
+      logFilePath: `/tmp/devin-${Date.now()}.jsonl`,
+      agentType: 'devin',
+    })
+    const inserted = db.insertSession(session)
+    expect(inserted.agentType).toBe('devin')
+  })
+
+  test('displayNameExists returns true for existing names', () => {
+    const uniqueName = `test-name-${Date.now()}`
+    const session = makeSession({
+      sessionId: `session-${Date.now()}`,
+      logFilePath: `/tmp/session-${Date.now()}.jsonl`,
+      displayName: uniqueName,
+    })
+    db.insertSession(session)
+
+    expect(db.displayNameExists(uniqueName)).toBe(true)
+    expect(db.displayNameExists('definitely-nonexistent-xyz123')).toBe(false)
+  })
+
+  test('name checks use a covering search, including self-exclusion', () => {
+    for (const suffix of ['', ' AND session_id != $excludeSessionId']) {
+      const plan = db.db.query(`EXPLAIN QUERY PLAN SELECT 1 FROM agent_sessions
+        WHERE display_name = $displayName${suffix} LIMIT 1`).all(
+        suffix ? { $displayName: 'missing', $excludeSessionId: 'self' } : { $displayName: 'missing' }
+      ) as { detail: string }[]
+      expect(plan.some(({ detail }) => detail.includes('SEARCH agent_sessions USING COVERING INDEX idx_display_name_session_id'))).toBe(true)
+      expect(plan.some(({ detail }) => detail.startsWith('SCAN'))).toBe(false)
+    }
+  })
+
+  test('name checks preserve exact matching, self-exclusion, duplicates, and updates', () => {
+    db.insertSession(makeSession({ sessionId: 'a', displayName: 'Name 🙂', currentWindow: null }))
+    expect(db.displayNameExists('Name 🙂')).toBe(true)
+    expect(db.displayNameExists('Name 🙂', 'a')).toBe(false)
+    expect(db.displayNameExists('name 🙂')).toBe(false)
+    expect(db.displayNameExists('Name 🙂 ')).toBe(false)
+    db.insertSession(makeSession({ sessionId: 'b', logFilePath: '/tmp/b.jsonl', displayName: 'Name 🙂', currentWindow: null }))
+    expect(db.displayNameExists('Name 🙂', 'a')).toBe(true)
+    db.updateSession('b', { displayName: 'new name' })
+    expect(db.displayNameExists('Name 🙂', 'a')).toBe(false)
+    expect(db.displayNameExists('new name')).toBe(true)
+    db.db.exec("DELETE FROM agent_sessions WHERE session_id='b'")
+    expect(db.displayNameExists('new name')).toBe(false)
+  })
+
+  test('adds the name index to an existing database and preserves records on reopen', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-name-index-'))
+    const filename = path.join(dir, 'agentboard.db')
+    try {
+      const original = initDatabase({ path: filename })
+      original.insertSession(makeSession())
+      original.db.exec('DROP INDEX IF EXISTS idx_display_name_session_id')
+      const before = original.getSessionById('session-abc')
+      original.db.close()
+      for (let i = 0; i < 2; i++) {
+        const reopened = initDatabase({ path: filename })
+        try {
+          expect(reopened.getSessionById('session-abc')).toEqual(before)
+          expect(reopened.displayNameExists('alpha')).toBe(true)
+          expect(reopened.displayNameExists('alpha', 'session-abc')).toBe(false)
+          expect(reopened.db.query("SELECT name FROM sqlite_master WHERE name='idx_display_name_session_id'").get()).not.toBeNull()
+        } finally { reopened.db.close() }
+      }
+    } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  test('migrates legacy schema without session_source', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-'))
+    const dbPath = path.join(tempDir, 'agentboard.db')
+    const legacyDb = new SQLiteDatabase(dbPath)
+
+    legacyDb.exec(`
+      CREATE TABLE agent_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT UNIQUE,
+        log_file_path TEXT NOT NULL UNIQUE,
+        project_path TEXT,
+        agent_type TEXT NOT NULL CHECK (agent_type IN ('claude', 'codex', 'pi')),
+        display_name TEXT,
+        created_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        current_window TEXT,
+        session_source TEXT NOT NULL CHECK (session_source IN ('log', 'synthetic'))
+      );
+    `)
+
+    legacyDb.exec(`
+      INSERT INTO agent_sessions (
+        session_id,
+        log_file_path,
+        project_path,
+        agent_type,
+        display_name,
+        created_at,
+        last_activity_at,
+        current_window,
+        session_source
+      ) VALUES
+        ('session-log', '/tmp/log.jsonl', '/tmp/project', 'claude', 'log', '${now}', '${now}', null, 'log'),
+        ('session-synthetic', '/tmp/synth.jsonl', '/tmp/project', 'claude', 'synthetic', '${now}', '${now}', null, 'synthetic');
+    `)
+    legacyDb.close()
+
+    const migrated = initDatabase({ path: dbPath })
+    const columns = migrated.db
+      .prepare('PRAGMA table_info(agent_sessions)')
+      .all() as Array<{ name?: string }>
+    const columnNames = columns.map((column) => String(column.name ?? ''))
+
+    expect(columnNames).not.toContain('session_source')
+    expect(columnNames).toContain('last_user_message')
+    expect(migrated.getSessionById('session-log')).not.toBeNull()
+    expect(migrated.getSessionById('session-synthetic')).toBeNull()
+
+    migrated.close()
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  test('migrates agent type constraint and preserves launchCommand during table rebuild', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-'))
+    const dbPath = path.join(tempDir, 'agentboard.db')
+    const legacyDb = new SQLiteDatabase(dbPath)
+
+    legacyDb.exec(`
+      CREATE TABLE agent_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT UNIQUE,
+        log_file_path TEXT NOT NULL UNIQUE,
+        project_path TEXT,
+        slug TEXT,
+        agent_type TEXT NOT NULL CHECK (agent_type IN ('claude', 'codex')),
+        display_name TEXT,
+        created_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        last_user_message TEXT,
+        current_window TEXT,
+        is_sleeping INTEGER NOT NULL DEFAULT 0,
+        is_hibernating INTEGER NOT NULL DEFAULT 0,
+        last_resume_error TEXT,
+        last_known_log_size INTEGER,
+        is_codex_exec INTEGER NOT NULL DEFAULT 0,
+        launch_command TEXT
+      );
+    `)
+
+    legacyDb.exec(`
+      INSERT INTO agent_sessions (
+        session_id,
+        log_file_path,
+        project_path,
+        slug,
+        agent_type,
+        display_name,
+        created_at,
+        last_activity_at,
+        last_user_message,
+        current_window,
+        is_sleeping,
+        is_hibernating,
+        last_resume_error,
+        last_known_log_size,
+        is_codex_exec,
+        launch_command
+      ) VALUES (
+        'legacy-launch-command',
+        '/tmp/legacy-launch-command.jsonl',
+        '/tmp/project',
+        null,
+        'claude',
+        'legacy',
+        '${now}',
+        '${now}',
+        'continue',
+        null,
+        0,
+        0,
+        null,
+        null,
+        0,
+        'codex --dangerously-bypass-approvals-and-sandbox'
+      );
+    `)
+    legacyDb.close()
+
+    const migrated = initDatabase({ path: dbPath })
+    const session = migrated.getSessionById('legacy-launch-command')
+    const tableInfo = migrated.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_sessions'"
+      )
+      .get() as { sql: string } | undefined
+
+    expect(session?.launchCommand).toBe(
+      'codex --dangerously-bypass-approvals-and-sandbox'
+    )
+    expect(tableInfo?.sql).toContain("'pi'")
+    expect(tableInfo?.sql).toContain("'claude-rp'")
+    expect(
+      migrated.insertSession(makeSession({
+        sessionId: 'legacy-rp-session',
+        logFilePath: '/tmp/legacy-rp-session.jsonl',
+        agentType: 'claude-rp',
+        currentWindow: null,
+      })).agentType
+    ).toBe('claude-rp')
+
+    migrated.close()
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  test('deduplicates current windows before creating unique index', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-'))
+    const dbPath = path.join(tempDir, 'agentboard.db')
+    const legacyDb = new SQLiteDatabase(dbPath)
+    const older = new Date('2026-01-01T00:00:00.000Z').toISOString()
+    const newer = new Date('2026-01-02T00:00:00.000Z').toISOString()
+
+    legacyDb.exec(`
+      CREATE TABLE agent_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT UNIQUE,
+        log_file_path TEXT NOT NULL UNIQUE,
+        project_path TEXT,
+        slug TEXT,
+        agent_type TEXT NOT NULL CHECK (agent_type IN ('claude', 'claude-rp', 'codex', 'pi')),
+        display_name TEXT,
+        created_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        last_user_message TEXT,
+        current_window TEXT,
+        is_hibernating INTEGER NOT NULL DEFAULT 0,
+        last_resume_error TEXT,
+        last_known_log_size INTEGER,
+        is_codex_exec INTEGER NOT NULL DEFAULT 0,
+        launch_command TEXT
+      );
+    `)
+
+    legacyDb.exec(`
+      INSERT INTO agent_sessions (
+        session_id,
+        log_file_path,
+        project_path,
+        slug,
+        agent_type,
+        display_name,
+        created_at,
+        last_activity_at,
+        last_user_message,
+        current_window,
+        is_hibernating,
+        last_resume_error,
+        last_known_log_size,
+        is_codex_exec,
+        launch_command
+      ) VALUES
+        ('older-dupe', '/tmp/older-dupe.jsonl', '/tmp/project', null, 'claude', 'older-dupe', '${older}', '${older}', null, 'agentboard:dupe', 1, null, null, 0, null),
+        ('newer-dupe', '/tmp/newer-dupe.jsonl', '/tmp/project', null, 'claude', 'newer-dupe', '${older}', '${newer}', null, 'agentboard:dupe', 0, null, null, 0, null);
+    `)
+    legacyDb.close()
+
+    const migrated = initDatabase({ path: dbPath })
+
+    expect(migrated.getSessionById('newer-dupe')).toMatchObject({
+      currentWindow: 'agentboard:dupe',
+      isHibernating: false,
+    })
+    expect(migrated.getSessionById('older-dupe')).toMatchObject({
+      currentWindow: null,
+      isHibernating: false,
+    })
+    expect(migrated.getHibernatingSessions()).toEqual([])
+    expect(() =>
+      migrated.insertSession(makeSession({
+        sessionId: 'post-migration-dupe',
+        logFilePath: '/tmp/post-migration-dupe.jsonl',
+        currentWindow: 'agentboard:dupe',
+      }))
+    ).toThrow()
+
+    migrated.close()
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  test('migrates legacy sleeping flag into hibernating marker state', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-'))
+    const dbPath = path.join(tempDir, 'agentboard.db')
+    const legacyDb = new SQLiteDatabase(dbPath)
+
+    legacyDb.exec(`
+      CREATE TABLE agent_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT UNIQUE,
+        log_file_path TEXT NOT NULL UNIQUE,
+        project_path TEXT,
+        slug TEXT,
+        agent_type TEXT NOT NULL CHECK (agent_type IN ('claude', 'codex', 'pi')),
+        display_name TEXT,
+        created_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        last_user_message TEXT,
+        current_window TEXT,
+        is_sleeping INTEGER NOT NULL DEFAULT 0,
+        is_hibernating INTEGER NOT NULL DEFAULT 0,
+        last_resume_error TEXT,
+        last_known_log_size INTEGER,
+        is_codex_exec INTEGER NOT NULL DEFAULT 0,
+        launch_command TEXT
+      );
+    `)
+
+    legacyDb.exec(`
+      INSERT INTO agent_sessions (
+        session_id,
+        log_file_path,
+        project_path,
+        slug,
+        agent_type,
+        display_name,
+        created_at,
+        last_activity_at,
+        last_user_message,
+        current_window,
+        is_sleeping,
+        is_hibernating,
+        last_resume_error,
+        last_known_log_size,
+        is_codex_exec,
+        launch_command
+      ) VALUES
+        ('legacy-hibernating', '/tmp/legacy-hibernating.jsonl', '/tmp/project', null, 'claude', 'hibernating', '${now}', '${now}', null, null, 1, 0, null, null, 0, null),
+        ('legacy-history', '/tmp/legacy-history.jsonl', '/tmp/project', null, 'claude', 'history', '${now}', '${now}', null, null, 0, 0, null, null, 0, null);
+    `)
+    legacyDb.close()
+
+    const migrated = initDatabase({ path: dbPath })
+    const columns = migrated.db
+      .prepare('PRAGMA table_info(agent_sessions)')
+      .all() as Array<{ name?: string }>
+    const columnNames = columns.map((column) => String(column.name ?? ''))
+    const tableInfo = migrated.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_sessions'"
+      )
+      .get() as { sql: string } | undefined
+
+    expect(columnNames).not.toContain('is_sleeping')
+    expect(columnNames).not.toContain('last_resume_attempt_at')
+    expect(tableInfo?.sql).toContain("'claude-rp'")
+    expect(migrated.getSessionById('legacy-hibernating')?.isHibernating).toBe(true)
+    expect(migrated.getHibernatingSessions().map((session) => session.sessionId)).toEqual([
+      'legacy-hibernating',
+    ])
+    expect(migrated.getHistorySessions().map((session) => session.sessionId)).toEqual([
+      'legacy-history',
+    ])
+
+    migrated.close()
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  test('renames pin-era is_pinned column into hibernating marker state', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-'))
+    const dbPath = path.join(tempDir, 'agentboard.db')
+    const legacyDb = new SQLiteDatabase(dbPath)
+
+    legacyDb.exec(`
+      CREATE TABLE agent_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT UNIQUE,
+        log_file_path TEXT NOT NULL UNIQUE,
+        project_path TEXT,
+        agent_type TEXT NOT NULL CHECK (agent_type IN ('claude', 'claude-rp', 'codex', 'pi', 'devin', 'grok', 'omp')),
+        display_name TEXT,
+        created_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        last_user_message TEXT,
+        current_window TEXT,
+        is_pinned INTEGER NOT NULL DEFAULT 0,
+        last_resume_error TEXT,
+        wake_started_at TEXT,
+        last_known_log_size INTEGER,
+        is_codex_exec INTEGER NOT NULL DEFAULT 0,
+        slug TEXT,
+        launch_command TEXT
+      );
+    `)
+
+    legacyDb.exec(`
+      INSERT INTO agent_sessions (
+        session_id,
+        log_file_path,
+        project_path,
+        agent_type,
+        display_name,
+        created_at,
+        last_activity_at,
+        current_window,
+        is_pinned
+      ) VALUES
+        ('pin-era-hibernating', '/tmp/pin-era-hibernating.jsonl', '/tmp/project', 'claude', 'hibernating', '${now}', '${now}', null, 1),
+        ('pin-era-history', '/tmp/pin-era-history.jsonl', '/tmp/project', 'claude', 'history', '${now}', '${now}', null, 0),
+        ('pin-era-active', '/tmp/pin-era-active.jsonl', '/tmp/project', 'claude', 'active', '${now}', '${now}', 'agentboard:1', 0);
+    `)
+    legacyDb.exec("ALTER TABLE agent_sessions ADD COLUMN last_known_log_revision TEXT")
+    legacyDb.exec("UPDATE agent_sessions SET last_known_log_revision='stored-revision' WHERE session_id='pin-era-active'")
+    legacyDb.close()
+
+    const migrated = initDatabase({ path: dbPath })
+    const columns = migrated.db
+      .prepare('PRAGMA table_info(agent_sessions)')
+      .all() as Array<{ name?: string }>
+    const columnNames = columns.map((column) => String(column.name ?? ''))
+
+    expect(columnNames).toContain('is_hibernating')
+    expect(columnNames).not.toContain('is_pinned')
+    expect(migrated.getSessionById('pin-era-active')?.lastKnownLogRevision).toBe('stored-revision')
+    expect(migrated.getSessionById('pin-era-hibernating')?.isHibernating).toBe(true)
+    expect(migrated.getSessionById('pin-era-history')?.isHibernating).toBe(false)
+    expect(migrated.getHibernatingSessions().map((session) => session.sessionId)).toEqual([
+      'pin-era-hibernating',
+    ])
+    expect(migrated.getHistorySessions().map((session) => session.sessionId)).toEqual([
+      'pin-era-history',
+    ])
+    expect(migrated.getActiveSessions().map((session) => session.sessionId)).toEqual([
+      'pin-era-active',
+    ])
+
+    expect(migrated.insertSession(makeSession({
+      sessionId: 'antigravity-id', agentType: 'antigravity', currentWindow: null, isHibernating: false,
+      lastActivityAt: '2000-01-01T00:00:00Z',
+    })).agentType).toBe('antigravity')
+    migrated.close()
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  test('launchCommand is stored and retrieved', () => {
+    const session = makeSession({
+      sessionId: 'launch-cmd-test',
+      logFilePath: '/tmp/launch-cmd.jsonl',
+      launchCommand: 'claude --dangerously-skip-permissions',
+    })
+    const inserted = db.insertSession(session)
+    expect(inserted.launchCommand).toBe('claude --dangerously-skip-permissions')
+
+    const fetched = db.getSessionById('launch-cmd-test')
+    expect(fetched?.launchCommand).toBe('claude --dangerously-skip-permissions')
+
+    // Update launchCommand
+    const updated = db.updateSession('launch-cmd-test', {
+      launchCommand: 'claude --model opus --dangerously-skip-permissions',
+    })
+    expect(updated?.launchCommand).toBe('claude --model opus --dangerously-skip-permissions')
+
+    // Null launchCommand (default)
+    const session2 = makeSession({
+      sessionId: 'no-launch-cmd',
+      logFilePath: '/tmp/no-launch-cmd.jsonl',
+      currentWindow: null,
+      launchCommand: null,
+    })
+    const inserted2 = db.insertSession(session2)
+    expect(inserted2.launchCommand).toBeNull()
+  })
+
+  test('getActiveSessions returns results in deterministic order by session_id', () => {
+    // Insert sessions with session_ids that would sort differently than insertion order
+    db.insertSession(makeSession({
+      sessionId: 'zebra',
+      logFilePath: '/tmp/zebra.jsonl',
+      displayName: 'zebra',
+      currentWindow: 'agentboard:3',
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'alpha',
+      logFilePath: '/tmp/alpha.jsonl',
+      displayName: 'alpha',
+      currentWindow: 'agentboard:1',
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'middle',
+      logFilePath: '/tmp/middle.jsonl',
+      displayName: 'middle',
+      currentWindow: 'agentboard:2',
+    }))
+
+    const active = db.getActiveSessions()
+    expect(active).toHaveLength(3)
+    expect(active[0].sessionId).toBe('alpha')
+    expect(active[1].sessionId).toBe('middle')
+    expect(active[2].sessionId).toBe('zebra')
+  })
+
+  test('getHistorySessions is uncapped unless a limit is passed', () => {
+    for (let i = 0; i < 105; i++) {
+      db.insertSession(makeSession({
+        sessionId: `history-${i}`,
+        logFilePath: `/tmp/history-${i}.jsonl`,
+        currentWindow: null,
+        lastActivityAt: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+      }))
+    }
+    expect(db.getHistorySessions()).toHaveLength(105)
+    expect(db.getHistorySessions({ maxAgeHours: 24 * 365 * 100 })).toHaveLength(105)
+    const capped = db.getHistorySessions({ limit: 100 })
+    expect(capped).toHaveLength(100)
+    expect(capped[0]?.sessionId).toBe('history-104')
+  })
+
+  test('getHistorySessions returns results ordered by last_activity_at DESC with session_id tiebreaker', () => {
+    const recent = '2026-01-02T00:00:00.000Z'
+    const older = '2026-01-01T00:00:00.000Z'
+
+    // Two sessions with the same last_activity_at to test the tiebreaker
+    db.insertSession(makeSession({
+      sessionId: 'tie-zebra',
+      logFilePath: '/tmp/tie-zebra.jsonl',
+      displayName: 'tie-zebra',
+      currentWindow: null,
+      lastActivityAt: older,
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'tie-alpha',
+      logFilePath: '/tmp/tie-alpha.jsonl',
+      displayName: 'tie-alpha',
+      currentWindow: null,
+      lastActivityAt: older,
+    }))
+    // One session with more recent activity (should come first)
+    db.insertSession(makeSession({
+      sessionId: 'recent-one',
+      logFilePath: '/tmp/recent.jsonl',
+      displayName: 'recent',
+      currentWindow: null,
+      lastActivityAt: recent,
+    }))
+
+    const history = db.getHistorySessions()
+    expect(history).toHaveLength(3)
+    // Most recent activity first
+    expect(history[0].sessionId).toBe('recent-one')
+    // Same activity timestamp: alphabetical session_id tiebreaker
+    expect(history[1].sessionId).toBe('tie-alpha')
+    expect(history[2].sessionId).toBe('tie-zebra')
+  })
+
+  test('getHistorySessions with maxAgeHours also uses session_id tiebreaker', () => {
+    const now = new Date()
+    const recentTime = new Date(now.getTime() - 30 * 60 * 1000).toISOString() // 30 min ago
+
+    db.insertSession(makeSession({
+      sessionId: 'age-zebra',
+      logFilePath: '/tmp/age-zebra.jsonl',
+      displayName: 'age-zebra',
+      currentWindow: null,
+      lastActivityAt: recentTime,
+    }))
+    db.insertSession(makeSession({
+      sessionId: 'age-alpha',
+      logFilePath: '/tmp/age-alpha.jsonl',
+      displayName: 'age-alpha',
+      currentWindow: null,
+      lastActivityAt: recentTime,
+    }))
+
+    const history = db.getHistorySessions({ maxAgeHours: 1 })
+    expect(history).toHaveLength(2)
+    // Same timestamp: alphabetical session_id tiebreaker
+    expect(history[0].sessionId).toBe('age-alpha')
+    expect(history[1].sessionId).toBe('age-zebra')
+  })
+
+  test('app settings get/set', () => {
+    // Initially null
+    expect(db.getAppSetting('test_key')).toBeNull()
+
+    // Set a value
+    db.setAppSetting('test_key', 'test_value')
+    expect(db.getAppSetting('test_key')).toBe('test_value')
+
+    // Update the value
+    db.setAppSetting('test_key', 'updated_value')
+    expect(db.getAppSetting('test_key')).toBe('updated_value')
+
+    // Different key
+    db.setAppSetting('another_key', 'another_value')
+    expect(db.getAppSetting('another_key')).toBe('another_value')
+    expect(db.getAppSetting('test_key')).toBe('updated_value')
+
+    // Cleanup
+    db.db.exec("DELETE FROM app_settings WHERE key = 'test_key'")
+    db.db.exec("DELETE FROM app_settings WHERE key = 'another_key'")
+  })
+
+  test('wakeStartedAt is stored and cleared by window claim', () => {
+    const wakeStartedAt = '2026-01-01T00:01:00.000Z'
+    const inserted = db.insertSession(makeSession({
+      sessionId: 'session-wake-marker',
+      logFilePath: '/tmp/session-wake-marker.jsonl',
+      currentWindow: null,
+      isHibernating: true,
+      wakeStartedAt,
+    }))
+
+    expect(inserted.wakeStartedAt).toBe(wakeStartedAt)
+
+    const claimed = db.claimCurrentWindow(
+      inserted.sessionId,
+      'agentboard:77',
+      {
+        wakeStartedAt: null,
+        lastResumeError: null,
+      }
+    )
+
+    expect(claimed?.currentWindow).toBe('agentboard:77')
+    expect(claimed?.wakeStartedAt).toBeNull()
+    expect(db.getSessionById(inserted.sessionId)?.wakeStartedAt).toBeNull()
+  })
+
+  test('fresh database uses WAL with a short busy_timeout', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-db-pragma-'))
+    try {
+      const fresh = initDatabase({ path: path.join(tempDir, 'fresh.db') })
+      try {
+        const journal = fresh.db.prepare('PRAGMA journal_mode').get() as {
+          journal_mode: string
+        }
+        const busy = fresh.db.prepare('PRAGMA busy_timeout').get() as Record<
+          string,
+          number
+        >
+        expect(journal.journal_mode).toBe('wal')
+        expect(Object.values(busy)[0]).toBe(250)
+        const sync = fresh.db.query('PRAGMA synchronous').get() as {
+          synchronous: number
+        }
+        expect(sync.synchronous).toBe(1) // NORMAL
+      } finally {
+        fresh.close()
+      }
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  test('WAL switch blocked by another writer warns instead of throwing', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentboard-db-walswitch-'))
+    const dbPath = path.join(tempDir, 'upgrade.db')
+    const originalWarn = logger.warn
+    const warnings: string[] = []
+    let oldServer: SQLiteDatabase | null = null
+    try {
+      // Build the full schema in a separate process so no connection from
+      // this process lingers, then flip it back to a pre-WAL journal.
+      const dbModule = path.join(import.meta.dir, '..', 'db.ts')
+      const build = Bun.spawnSync([
+        process.execPath,
+        '-e',
+        `import { initDatabase } from ${JSON.stringify(dbModule)}; initDatabase({ path: ${JSON.stringify(dbPath)} }).close()`,
+      ])
+      expect(build.exitCode).toBe(0)
+      oldServer = new SQLiteDatabase(dbPath)
+      oldServer.exec('PRAGMA journal_mode = DELETE')
+      // Old server mid-write: holds the lock the WAL switch needs.
+      oldServer.exec('BEGIN IMMEDIATE')
+      oldServer.exec("INSERT INTO app_settings (key, value) VALUES ('k', 'v')")
+
+      logger.warn = (event) => warnings.push(event)
+      const upgraded = initDatabase({ path: dbPath })
+      try {
+        const journal = upgraded.db.prepare('PRAGMA journal_mode').get() as {
+          journal_mode: string
+        }
+        expect(journal.journal_mode).toBe('delete')
+        expect(warnings).toContain('db_wal_switch_failed')
+        // NORMAL is unsafe outside WAL: synchronous stays at FULL (2).
+        const sync = upgraded.db.query('PRAGMA synchronous').get() as {
+          synchronous: number
+        }
+        expect(sync.synchronous).toBe(2)
+      } finally {
+        upgraded.close()
+      }
+    } finally {
+      logger.warn = originalWarn
+      oldServer?.exec('ROLLBACK')
+      oldServer?.close()
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+})

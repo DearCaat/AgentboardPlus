@@ -1,0 +1,487 @@
+/// <reference lib="webworker" />
+import { isAntigravityAuxiliaryFile } from './antigravityLogs'
+import os from 'node:os'
+import { statSync, accessSync, constants } from 'node:fs'
+import path from 'node:path'
+import { performance } from 'node:perf_hooks'
+import {
+  getLogSearchDirs,
+  getLogTimes,
+  inferAgentTypeFromPath,
+  isCodexExec,
+  isCodexSubagent,
+  isPiSubagent,
+} from './logDiscovery'
+import {
+  DEFAULT_SCROLLBACK_LINES,
+  createExactMatchProfiler,
+  extractLastUserMessageFromLog,
+  getLogTokenCount,
+  isToolNotificationText,
+  matchWindowsToLogsByExactRg,
+  verifyWindowsBatch,
+} from './logMatcher'
+import { getEntriesNeedingMatch, shouldSkipMatching } from './logMatchGate'
+import { scanCodexSubagentLinks } from './subagentLogs'
+import {
+  collectLogEntriesForPaths,
+  collectLogEntryBatch,
+  type LogEntrySnapshot,
+} from './logPollData'
+import type {
+  CodexSubagentLink,
+  LastMessageCandidate,
+  MatchWorkerRequest,
+  MatchWorkerResponse,
+  NoMessageWindow,
+  OrphanCandidate,
+} from './logMatchWorkerTypes'
+
+// lineLimit 0: the backward scan is bounded by maxByteLimit alone — a long
+// autonomous run can put thousands of tool-result lines after the last user
+// message, and a line cap would stop the scan before reaching it.
+const LAST_USER_MESSAGE_READ_OPTIONS = {
+  lineLimit: 0,
+  byteLimit: 32 * 1024,
+  maxByteLimit: 2 * 1024 * 1024,
+}
+
+const ctx =
+  typeof self === 'undefined'
+    ? null
+    : (self as DedicatedWorkerGlobalScope | null)
+
+export function handleMatchWorkerRequest(
+  payload: MatchWorkerRequest
+): MatchWorkerResponse {
+  try {
+    const search = payload.search ?? {}
+    const logDirs = payload.logDirs ?? getLogSearchDirs()
+    const normalizedLogDirs = logDirs.map((logDir) => path.resolve(logDir))
+
+    // Startup verification is its own request — a dedicated batch that shares
+    // rg passes across windows. Skip the poll pipeline entirely.
+    if (payload.verifyJobs && payload.verifyJobs.length > 0) {
+      const verifyStart = performance.now()
+      const verifyProfile = search.profile
+        ? createExactMatchProfiler()
+        : undefined
+      const verifyMap = verifyWindowsBatch(
+        payload.verifyJobs.map((job) => ({
+          sessionId: job.sessionId,
+          tmuxWindow: job.tmuxWindow,
+          expectedLogPath: job.logFilePath,
+          context: job.context,
+          excludeLogPaths: job.excludeLogPaths,
+        })),
+        normalizedLogDirs,
+        payload.scrollbackLines ?? DEFAULT_SCROLLBACK_LINES,
+        {
+          rgThreads: search.rgThreads,
+          tailBytes: search.tailBytes,
+          profile: verifyProfile,
+        }
+      )
+      const verifyResults = payload.verifyJobs.map((job) => ({
+        sessionId: job.sessionId,
+        verification: verifyMap.get(job.sessionId) ?? {
+          status: 'inconclusive' as const,
+          bestMatch: null,
+          reason: 'no_match' as const,
+        },
+      }))
+      return {
+        id: payload.id,
+        type: 'result',
+        verifyResults,
+        verifyMs: performance.now() - verifyStart,
+        profile: verifyProfile,
+      }
+    }
+    let entries: LogEntrySnapshot[]
+    let scanMs = 0
+    let sortMs = 0
+
+    if (payload.preFilteredPaths && payload.preFilteredPaths.length > 0) {
+      // Validate watcher paths before enrichment.
+      // We only accept jsonl paths under known log roots.
+      const validPaths = payload.preFilteredPaths.filter((filePath) => {
+        if (!filePath.endsWith('.jsonl')) return false
+        const resolvedPath = path.resolve(filePath)
+        return normalizedLogDirs.some((logDir) => {
+          const root = logDir.endsWith(path.sep) ? logDir : `${logDir}${path.sep}`
+          return resolvedPath.startsWith(root)
+        })
+      })
+
+      entries = collectLogEntriesForPaths(validPaths, payload.knownSessions ?? [])
+    } else {
+      const batch = collectLogEntryBatch(payload.maxLogsPerPoll, {
+        knownSessions: payload.knownSessions,
+      })
+      entries = batch.entries
+      scanMs = batch.scanMs
+      sortMs = batch.sortMs
+    }
+
+    const profile = search.profile ? createExactMatchProfiler() : undefined
+    let matchMs = 0
+    let matchWindowCount = 0
+    let matchLogCount = 0
+    let matchSkipped = false
+    let resolved: Array<{ logPath: string; tmuxWindow: string }> = []
+    let noMessageWindows: NoMessageWindow[] = []
+    let orphanEntries: LogEntrySnapshot[] = []
+    let orphanMatches: Array<{ logPath: string; tmuxWindow: string }> = []
+    let orphanScanMs = 0
+    let orphanMatchMs = 0
+    const sessionByLogPath = new Map(
+      payload.sessions
+        .filter((session) => session.logFilePath)
+        .map((session) => [session.logFilePath, session] as const)
+    )
+    // Revision-aware matching must see the current identity, including for old
+    // known sessions omitted from the bounded full-record snapshot.
+    const messageAttachedPaths = new Set<string>()
+    for (const entry of entries) {
+      attachLastUserMessage(entry, sessionByLogPath)
+      messageAttachedPaths.add(entry.logPath)
+    }
+    const windowsByTmux = new Map(
+      payload.windows.map((w) => [w.tmuxWindow, w] as const)
+    )
+
+    // Only match against unclaimed windows — claimed windows would be
+    // rejected by the main thread anyway (logPoller refuses to steal),
+    // so capturing their scrollback and running rg is wasted work.
+    const claimedWindows = new Set(
+      payload.sessions
+        .map((s) => s.currentWindow)
+        .filter(Boolean) as string[]
+    )
+    const unclaimedWindows = payload.windows.filter(
+      (w) => !claimedWindows.has(w.tmuxWindow)
+    )
+
+    let matchingError: string | undefined
+    try {
+    const entriesToMatch = getEntriesNeedingMatch(entries, payload.sessions, {
+      minTokens: payload.minTokensForMatch ?? 0,
+      skipMatchingPatterns: payload.skipMatchingPatterns ?? [],
+    })
+    if (entriesToMatch.length === 0 || unclaimedWindows.length === 0) {
+      matchSkipped = true
+    } else {
+      const matchStart = performance.now()
+      const matchLogPaths = entriesToMatch.map((entry) => entry.logPath)
+      const matchResult = matchWindowsToLogsByExactRg(
+        unclaimedWindows,
+        logDirs,
+        payload.scrollbackLines ?? DEFAULT_SCROLLBACK_LINES,
+        {
+          logPaths: matchLogPaths,
+          tailBytes: search.tailBytes,
+          rgThreads: search.rgThreads,
+          profile,
+        }
+      )
+      matchMs = performance.now() - matchStart
+      matchWindowCount = unclaimedWindows.length
+      matchLogCount = matchLogPaths.length
+      resolved = Array.from(matchResult.matches.entries()).map(([logPath, window]) => ({
+        logPath,
+        tmuxWindow: window.tmuxWindow,
+      }))
+      noMessageWindows = Array.from(matchResult.noMessageWindows).map((tmuxWindow) => {
+        const w = windowsByTmux.get(tmuxWindow)
+        return { tmuxWindow, projectPath: w?.projectPath ?? null, agentType: w?.agentType ?? null, source: w?.source ?? null }
+      })
+    }
+
+    const orphanCandidates = payload.orphanCandidates ?? []
+    if (payload.forceOrphanRematch && orphanCandidates.length > 0) {
+      const skipPatterns = payload.skipMatchingPatterns ?? []
+      const orphanScanStart = performance.now()
+      orphanEntries = buildOrphanEntries(orphanCandidates, entries, {
+        minTokens: payload.minTokensForMatch ?? 0,
+        skipPatterns,
+      })
+      orphanScanMs = performance.now() - orphanScanStart
+      if (orphanEntries.length > 0) {
+        const startupRgThreads = Math.max(
+          search.rgThreads ?? 1,
+          Math.min(os.cpus().length, 4)
+        )
+        const orphanMatchStart = performance.now()
+        const orphanMatchResult = matchWindowsToLogsByExactRg(
+          unclaimedWindows,
+          logDirs,
+          payload.scrollbackLines ?? DEFAULT_SCROLLBACK_LINES,
+          {
+            logPaths: orphanEntries.map((entry) => entry.logPath),
+            rgThreads: startupRgThreads,
+            profile,
+          }
+        )
+        orphanMatchMs = performance.now() - orphanMatchStart
+        orphanMatches = Array.from(orphanMatchResult.matches.entries()).map(
+          ([logPath, window]) => ({
+            logPath,
+            tmuxWindow: window.tmuxWindow,
+          })
+        )
+      }
+    }
+
+    } catch(error) {
+      // Discovery is independently useful even when tmux/ripgrep matching fails.
+      matchingError=error instanceof Error ? error.message : String(error)
+    }
+    const lastMessageCandidates = payload.lastMessageCandidates ?? []
+    if (lastMessageCandidates.length > 0) {
+      const lastMessageEntries = buildLastMessageEntries(
+        lastMessageCandidates,
+        entries,
+        orphanEntries
+      )
+      if (lastMessageEntries.length > 0) {
+        entries = [...entries, ...lastMessageEntries]
+      }
+    }
+
+    for (const entry of entries) {
+      if (!messageAttachedPaths.has(entry.logPath)) attachLastUserMessage(entry, sessionByLogPath)
+    }
+    for (const entry of orphanEntries) {
+      attachLastUserMessage(entry, sessionByLogPath)
+    }
+
+    let codexSubagents: CodexSubagentLink[] | undefined
+    let codexIndexMs: number | undefined
+    if (payload.buildCodexSubagentIndex) {
+      const indexStart = performance.now()
+      codexSubagents = scanCodexSubagentLinks()
+      codexIndexMs = performance.now() - indexStart
+    }
+
+    return {
+      id: payload.id,
+      type: 'result',
+      matchingError,
+      entries,
+      orphanEntries,
+      scanMs,
+      sortMs,
+      matchMs,
+      matchWindowCount,
+      matchLogCount,
+      matchSkipped,
+      matches: resolved,
+      orphanMatches,
+      orphanScanMs,
+      orphanMatchMs,
+      noMessageWindows,
+      codexSubagents,
+      codexIndexMs,
+      profile,
+    }
+  } catch (error) {
+    return {
+      id: payload.id,
+      type: 'error',
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+interface BuildOrphanEntriesOptions {
+  minTokens: number
+  skipPatterns: string[]
+}
+
+function buildOrphanEntries(
+  candidates: OrphanCandidate[],
+  _entries: LogEntrySnapshot[],
+  { minTokens, skipPatterns }: BuildOrphanEntriesOptions
+): LogEntrySnapshot[] {
+  // Note: We intentionally don't skip logs that are in `entries`.
+  // For orphan rematch, we want to match ALL orphan candidates to windows,
+  // even if their logs were scanned in the regular batch but not matched
+  // (e.g., because they didn't have new activity).
+  const orphanEntries: LogEntrySnapshot[] = []
+
+  for (const record of candidates) {
+    const logPath = record.logFilePath
+    if (!logPath || isAntigravityAuxiliaryFile(logPath)) continue
+
+    const agentType = record.agentType
+    if (agentType === 'codex' && isCodexSubagent(logPath)) {
+      continue
+    }
+    const piSubagent =
+      agentType === 'pi' || agentType === 'omp' ? isPiSubagent(logPath) : false
+    if (piSubagent) {
+      continue
+    }
+
+    const times = getLogTimes(logPath)
+    if (!times) continue
+
+    // Check skip patterns BEFORE expensive token counting
+    const codexExec = agentType === 'codex' ? isCodexExec(logPath) : false
+    // Always skip exec sessions - they are headless and should never match windows
+    if (codexExec) {
+      continue
+    }
+    if (skipPatterns.length > 0) {
+      const preEntry: LogEntrySnapshot = {
+        logPath,
+        mtime: times.mtime.getTime(),
+        birthtime: times.birthtime.getTime(),
+        size: times.size,
+        sessionId: record.sessionId,
+        projectPath: record.projectPath ?? null,
+        slug: null,
+        agentType: agentType ?? null,
+        isCodexSubagent: false,
+        isCodexExec: codexExec,
+        isPiSubagent: piSubagent,
+        logTokenCount: 0,
+      }
+      if (shouldSkipMatching(preEntry, skipPatterns)) {
+        continue
+      }
+    }
+
+    const logTokenCount = getLogTokenCount(logPath)
+    if (minTokens > 0 && logTokenCount < minTokens) {
+      continue
+    }
+
+    orphanEntries.push({
+      logPath,
+      mtime: times.mtime.getTime(),
+      birthtime: times.birthtime.getTime(),
+      size: times.size,
+      sessionId: record.sessionId,
+      projectPath: record.projectPath ?? null,
+      slug: null,
+      agentType: agentType ?? null,
+      isCodexSubagent: false,
+      isCodexExec: codexExec,
+      isPiSubagent: piSubagent,
+      logTokenCount,
+    })
+  }
+
+  return orphanEntries
+}
+
+function buildLastMessageEntries(
+  candidates: LastMessageCandidate[],
+  entries: LogEntrySnapshot[],
+  orphanEntries: LogEntrySnapshot[]
+): LogEntrySnapshot[] {
+  const existingLogPaths = new Set(
+    [...entries, ...orphanEntries].map((entry) => entry.logPath)
+  )
+  const nextEntries: LogEntrySnapshot[] = []
+
+  for (const record of candidates) {
+    const logPath = record.logFilePath
+    if (!logPath || existingLogPaths.has(logPath) || isAntigravityAuxiliaryFile(logPath)) continue
+
+    const resolvedAgentType =
+      record.agentType ?? inferAgentTypeFromPath(logPath) ?? null
+    const codexSubagent =
+      resolvedAgentType === 'codex' ? isCodexSubagent(logPath) : false
+    if (resolvedAgentType === 'codex' && codexSubagent) {
+      continue
+    }
+    const piSubagent =
+      resolvedAgentType === 'pi' || resolvedAgentType === 'omp'
+        ? isPiSubagent(logPath)
+        : false
+    if (piSubagent) {
+      continue
+    }
+
+    const times = getLogTimes(logPath)
+    if (!times) continue
+
+    const codexExec = resolvedAgentType === 'codex' ? isCodexExec(logPath) : false
+    nextEntries.push({
+      logPath,
+      mtime: times.mtime.getTime(),
+      birthtime: times.birthtime.getTime(),
+      size: times.size,
+      sessionId: record.sessionId,
+      projectPath: record.projectPath ?? null,
+      slug: null,
+      agentType: resolvedAgentType,
+      isCodexSubagent: codexSubagent,
+      isCodexExec: codexExec,
+      isPiSubagent: piSubagent,
+      logTokenCount: 0,
+    })
+  }
+
+  return nextEntries
+}
+
+export function attachLastUserMessage(
+  entry: LogEntrySnapshot,
+  sessionByLogPath: Map<string, {
+    lastActivityAt: string
+    logFilePath: string
+    currentWindow: string | null
+    lastUserMessage?: string | null
+    lastKnownLogSize?: number | null
+    lastKnownLogRevision?: string | null
+  }>
+) {
+  // Stat revision detects replacement and in-place rewrites without reading the
+  // entire transcript on every append. Parsing remains bounded by the existing
+  // last-message byte limit. mtime alone is not evidence of new activity.
+  let revision: string
+  try {
+    const stat = statSync(entry.logPath, { bigint: true })
+    accessSync(entry.logPath, constants.R_OK)
+    entry.size = Number(stat.size)
+    entry.mtime = Number(stat.mtimeMs)
+    revision = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
+  } catch {
+    // Discovery races with transcript rotation. Leave metadata unacknowledged
+    // so a later poll retries, rather than clearing a prompt on a read failure.
+    return
+  }
+  const snapshot = sessionByLogPath.get(entry.logPath)
+  if ((snapshot?.lastKnownLogRevision === revision &&
+      snapshot.lastUserMessage && !isToolNotificationText(snapshot.lastUserMessage)) ||
+      (!snapshot && entry.previousRevision === revision)) {
+    entry.revision = revision
+    return
+  }
+  const message = extractLastUserMessageFromLog(entry.logPath, LAST_USER_MESSAGE_READ_OPTIONS)
+  try {
+    const after = statSync(entry.logPath, { bigint: true })
+    if (`${after.dev}:${after.ino}:${after.size}:${after.mtimeNs}:${after.ctimeNs}` !== revision) return
+  } catch { return }
+  entry.revision = revision
+  // A bounded tail scan cannot prove absence in a larger transcript.
+  if (message) entry.lastUserMessage = message
+  else if (entry.size <= LAST_USER_MESSAGE_READ_OPTIONS.maxByteLimit) entry.lastUserMessage = null
+}
+
+if (ctx) {
+  ctx.onmessage = (event: MessageEvent<MatchWorkerRequest>) => {
+    const payload = event.data
+    if (!payload || !payload.id) {
+      return
+    }
+    const response = handleMatchWorkerRequest(payload)
+    ctx.postMessage(response)
+  }
+  // Signal that the worker is ready to receive messages
+  ctx.postMessage({ type: 'ready' })
+}

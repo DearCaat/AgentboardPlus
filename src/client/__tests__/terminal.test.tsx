@@ -1,0 +1,1122 @@
+import { afterEach, beforeEach, describe, expect, test, mock } from 'bun:test'
+import TestRenderer, { act } from 'react-test-renderer'
+import type { AgentSession, ServerMessage, Session } from '@shared/types'
+import { useThemeStore } from '../stores/themeStore'
+import { useSessionStore } from '../stores/sessionStore'
+
+const globalAny = globalThis as typeof globalThis & {
+  document?: Document
+  localStorage?: Storage
+  navigator?: Navigator
+  window?: Window & typeof globalThis
+  ResizeObserver?: typeof ResizeObserver
+}
+
+const originalWindow = globalAny.window
+const originalDocument = globalAny.document
+const originalLocalStorage = globalAny.localStorage
+const originalNavigator = globalAny.navigator
+const originalResizeObserver = globalAny.ResizeObserver
+const originalFetch = globalThis.fetch
+
+class TerminalMock {
+  static instances: TerminalMock[] = []
+  cols = 80
+  rows = 24
+  options: Record<string, unknown> = {}
+  buffer = { active: { viewportY: 0, baseY: 0 } }
+  element: HTMLElement | null = null
+  scrollCalls = 0
+  private wheelHandler?: (event: WheelEvent) => boolean
+
+  constructor() {
+    TerminalMock.instances.push(this)
+  }
+
+  loadAddon() {}
+
+  open(container: HTMLElement) {
+    this.element = container
+  }
+
+  reset() {}
+
+  get modes() {
+    return { mouseTrackingMode: 'none' }
+  }
+
+  onData() {}
+
+  attachCustomKeyEventHandler() {
+    return true
+  }
+
+  attachCustomWheelEventHandler(handler: (event: WheelEvent) => boolean) {
+    this.wheelHandler = handler
+    return true
+  }
+
+  write(_data: string, callback?: () => void) { callback?.() }
+
+  scrollToBottom() {
+    this.scrollCalls += 1
+  }
+
+  focus() {}
+
+  hasSelection() {
+    return false
+  }
+
+  getSelection() {
+    return ''
+  }
+
+  dispose() {}
+
+  refresh() {}
+
+  emitWheel(event: WheelEvent) {
+    return this.wheelHandler?.(event)
+  }
+}
+
+mock.module('@xterm/xterm', () => ({ Terminal: TerminalMock }))
+mock.module('@xterm/addon-fit', () => ({
+  FitAddon: class { fit() {} },
+}))
+mock.module('@xterm/addon-clipboard', () => ({
+  ClipboardAddon: class {},
+}))
+mock.module('@xterm/addon-webgl', () => ({
+  WebglAddon: class { dispose() {} },
+}))
+mock.module('@xterm/addon-search', () => ({
+  SearchAddon: class {},
+}))
+mock.module('@xterm/addon-serialize', () => ({
+  SerializeAddon: class {},
+}))
+mock.module('@xterm/addon-progress', () => ({
+  ProgressAddon: class {},
+}))
+mock.module('@xterm/addon-web-links', () => ({
+  WebLinksAddon: class {},
+}))
+
+const { default: Terminal } = await import('../components/Terminal')
+
+const baseSession: Session = {
+  id: 'session-1',
+  name: 'alpha',
+  tmuxWindow: 'agentboard:1',
+  projectPath: '/tmp/alpha',
+  status: 'working',
+  lastActivity: new Date().toISOString(),
+  createdAt: new Date().toISOString(),
+  source: 'managed',
+}
+
+const secondSession: Session = {
+  id: 'session-2',
+  name: 'beta',
+  tmuxWindow: 'agentboard:2',
+  projectPath: '/tmp/beta',
+  status: 'waiting',
+  lastActivity: new Date().toISOString(),
+  createdAt: new Date().toISOString(),
+  source: 'managed',
+}
+
+const hibernatingSession: AgentSession = {
+  sessionId: 'hibernating-1',
+  logFilePath: '/tmp/hibernating-1.jsonl',
+  projectPath: '/tmp/alpha',
+  agentType: 'claude',
+  displayName: 'alpha-hibernating',
+  createdAt: '2024-01-01T00:00:00.000Z',
+  lastActivityAt: '2024-01-01T00:00:00.000Z',
+  isActive: false,
+  isHibernating: true,
+}
+
+function createStorage(): Storage {
+  const store = new Map<string, string>()
+  return {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      store.set(key, value)
+    },
+    removeItem: (key: string) => {
+      store.delete(key)
+    },
+    clear: () => {
+      store.clear()
+    },
+    key: (index: number) => Array.from(store.keys())[index] ?? null,
+    get length() {
+      return store.size
+    },
+  } as Storage
+}
+
+function createContainerMock() {
+  const listeners = new Map<string, EventListener>()
+  const input = {
+    focus: () => {},
+    select: () => {},
+  } as unknown as HTMLInputElement
+  let focusCalls = 0
+  const textarea = {
+    addEventListener: (_event: string, _handler: EventListener) => {},
+    removeEventListener: (_event: string, _handler: EventListener) => {},
+    setAttribute: () => {},
+    removeAttribute: () => {},
+    focus: () => { focusCalls++ },
+  } as unknown as HTMLTextAreaElement
+
+  const container = {
+    innerHTML: '',
+    addEventListener: (event: string, handler: EventListener) => {
+      listeners.set(event, handler)
+    },
+    removeEventListener: (event: string, handler: EventListener) => {
+      if (listeners.get(event) === handler) {
+        listeners.delete(event)
+      }
+    },
+    contains: () => false,
+    focus: () => {},
+    querySelector: (selector: string) =>
+      selector === '.xterm-helper-textarea' ? textarea : null,
+  } as unknown as HTMLDivElement
+
+  const createNodeMock = (element: { type?: unknown }) => {
+    if (element.type === 'input') return input
+    if (element.type === 'div') return container
+    return null
+  }
+
+  return { container, createNodeMock, listeners, getFocusCalls: () => focusCalls }
+}
+
+beforeEach(() => {
+  TerminalMock.instances = []
+
+  globalAny.localStorage = createStorage()
+  globalAny.navigator = {
+    userAgent: 'Chrome',
+    platform: 'MacIntel',
+    maxTouchPoints: 0,
+    clipboard: { writeText: () => Promise.resolve() },
+    vibrate: () => true,
+  } as unknown as Navigator
+
+  globalAny.window = {
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    setTimeout: (() => 1 as unknown as ReturnType<typeof setTimeout>) as unknown as typeof setTimeout,
+    clearTimeout: (() => {}) as typeof clearTimeout,
+    scrollY: 0,
+    scrollTo: () => {},
+    matchMedia: () => ({
+      matches: false,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+    devicePixelRatio: 1,
+  } as unknown as Window & typeof globalThis
+
+  globalAny.document = {
+    fonts: { ready: Promise.resolve() },
+    body: { style: {} },
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    querySelector: () => null,
+  } as unknown as Document
+
+  globalAny.ResizeObserver = class ResizeObserverMock {
+    private callback: ResizeObserverCallback
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback
+    }
+    observe() {
+      this.callback([], this as unknown as ResizeObserver)
+    }
+    unobserve() {}
+    disconnect() {}
+  }
+
+  useThemeStore.setState({ theme: 'dark' })
+  useSessionStore.setState({ preferWindowName: false })
+})
+
+afterEach(() => {
+  globalAny.window = originalWindow
+  globalAny.document = originalDocument
+  globalAny.localStorage = originalLocalStorage
+  globalAny.navigator = originalNavigator
+  globalAny.ResizeObserver = originalResizeObserver
+  globalThis.fetch = originalFetch
+})
+
+describe('Terminal', () => {
+  test('image paste exits copy mode before sending image input', () => {
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const sentMessages: unknown[] = []
+    const { createNodeMock } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={baseSession}
+          sessions={[baseSession]}
+          connectionStatus="connected"
+          sendMessage={(message) => { sentMessages.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        { createNodeMock },
+      )
+    })
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: baseSession.id,
+        inCopyMode: true,
+        appMouse: true,
+      })
+    })
+
+    act(() => {
+      listeners[0]?.({ type: 'terminal-ready', sessionId: baseSession.id })
+    })
+    const controls = renderer.root.find((node) => typeof node.props.onPasteImage === 'function')
+    act(() => { controls.props.onPasteImage('image path') })
+    expect(sentMessages.slice(-2)).toEqual([
+      { type: 'tmux-cancel-copy-mode', sessionId: baseSession.id },
+      { type: 'terminal-input', sessionId: baseSession.id, data: 'image path' },
+    ])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('shows an explicit exit control for externally entered tmux copy mode', () => {
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const sentMessages: unknown[] = []
+    const { createNodeMock } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={baseSession}
+          sessions={[baseSession]}
+          connectionStatus="connected"
+          sendMessage={(message) => { sentMessages.push(message) }}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        { createNodeMock },
+      )
+    })
+
+    act(() => {
+      listeners[0]?.({
+        type: 'tmux-copy-mode-status',
+        sessionId: baseSession.id,
+        inCopyMode: true,
+        appMouse: true,
+      })
+    })
+
+    // Copy mode shows both the mobile floating pill and the desktop rail segment.
+    const exitButton = renderer.root.findAllByProps({ title: 'Exit tmux copy mode and return to live output' })[0]
+    expect(exitButton.props['aria-label']).toBe('Exit copy mode')
+    expect(renderer.root.findAllByProps({ title: 'Scroll to bottom' })).toHaveLength(0)
+
+    act(() => {
+      exitButton.props.onClick()
+    })
+
+    expect(sentMessages[sentMessages.length - 1]).toEqual({
+      type: 'tmux-cancel-copy-mode',
+      sessionId: baseSession.id,
+    })
+    expect(renderer.root.findAllByProps({ title: 'Exit tmux copy mode and return to live output' })).toHaveLength(0)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('shows scroll button and handles more menu actions', () => {
+    let openSettingsCalls = 0
+
+    const { createNodeMock } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    const sentMessages: unknown[] = []
+    let terminalListener: ((message: ServerMessage) => void) | undefined
+    act(() => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={baseSession}
+          sessions={[baseSession]}
+          connectionStatus="connected"
+          sendMessage={(msg) => { sentMessages.push(msg) }}
+          subscribe={(listener) => { terminalListener = listener; return () => {} }}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {
+            openSettingsCalls += 1
+          }}
+        />,
+        {
+          createNodeMock,
+        }
+      )
+    })
+
+    act(() => { terminalListener?.({ type: 'terminal-ready', sessionId: baseSession.id }) })
+
+    const terminalInstance = TerminalMock.instances[0]
+    if (!terminalInstance) {
+      throw new Error('Expected terminal instance')
+    }
+
+    act(() => {
+      terminalInstance.emitWheel({ deltaY: -30 } as WheelEvent)
+    })
+
+    const scrollButton = renderer.root.findAllByType('button').find(
+      (button) => button.props.title === 'Exit tmux copy mode and return to live output'
+    )
+    if (!scrollButton) {
+      throw new Error('Expected copy-mode exit button')
+    }
+
+    const initialMessageCount = sentMessages.length
+
+    act(() => {
+      scrollButton.props.onClick()
+    })
+
+    // Scroll to bottom now sends tmux-cancel-copy-mode to exit copy-mode
+    expect(sentMessages.length).toBe(initialMessageCount + 1)
+    expect(sentMessages[sentMessages.length - 1]).toEqual({
+      type: 'tmux-cancel-copy-mode',
+      sessionId: baseSession.id,
+    })
+
+    const moreButton = renderer.root.findByProps({ title: 'More options' })
+
+    act(() => {
+      moreButton.props.onClick()
+    })
+
+    // Find settings button (now has icon + text as children)
+    const settingsButton = renderer.root.findAllByType('button').find(
+      (button) => {
+        const children = button.props.children
+        if (Array.isArray(children)) {
+          return children.some((child: unknown) => child === 'Settings')
+        }
+        return children === 'Settings'
+      }
+    )
+
+    if (!settingsButton) {
+      throw new Error('Expected settings button')
+    }
+
+    act(() => {
+      settingsButton.props.onClick()
+    })
+
+    expect(openSettingsCalls).toBe(1)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('renames and kills session', () => {
+    const renamed: Array<{ id: string; name: string }> = []
+    const killed: Array<{ id: string; source: string | undefined }> = []
+
+    const { createNodeMock } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={baseSession}
+          sessions={[baseSession]}
+          connectionStatus="connected"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={(id, source) => killed.push({ id, source })}
+          onRenameSession={(id, name) => renamed.push({ id, name })}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        {
+          createNodeMock,
+        }
+      )
+    })
+
+    const moreButton = renderer.root.findByProps({ title: 'More options' })
+
+    act(() => {
+      moreButton.props.onClick()
+    })
+
+    // Find rename button (now has icon + text as children)
+    const renameButton = renderer.root.findAllByType('button').find(
+      (button) => {
+        const children = button.props.children
+        if (Array.isArray(children)) {
+          return children.some((child: unknown) => child === 'Rename')
+        }
+        return children === 'Rename'
+      }
+    )
+
+    if (!renameButton) {
+      throw new Error('Expected rename button')
+    }
+
+    act(() => {
+      renameButton.props.onClick()
+    })
+
+    const input = renderer.root.findByProps({ type: 'text' })
+
+    act(() => {
+      input.props.onChange({ target: { value: ' beta ' } })
+    })
+
+    act(() => {
+      input.props.onKeyDown({
+        key: 'Enter',
+        preventDefault: () => {},
+      })
+    })
+
+    expect(renamed).toEqual([{ id: baseSession.id, name: 'beta' }])
+
+    const killButton = renderer.root.findAllByType('button').find(
+      (button) =>
+        typeof button.props.title === 'string' &&
+        button.props.title.includes('Kill session')
+    )
+
+    if (!killButton) {
+      throw new Error('Expected kill button')
+    }
+
+    act(() => {
+      killButton.props.onClick()
+    })
+
+    const confirmButton = renderer.root.findAllByType('button').find(
+      (button) => button.props.children === 'Kill Session'
+    )
+
+    if (!confirmButton) {
+      throw new Error('Expected confirm button')
+    }
+
+    act(() => {
+      confirmButton.props.onClick()
+    })
+
+    expect(killed).toEqual([
+      { id: baseSession.id, source: 'terminal_confirm_modal' },
+    ])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('mobile layout opens drawer and switches sessions', () => {
+    let selectCalls: string[] = []
+
+    globalAny.navigator = {
+      userAgent: 'Chrome',
+      platform: 'MacIntel',
+      maxTouchPoints: 0,
+      clipboard: { writeText: () => Promise.resolve() },
+      vibrate: () => {
+        return true
+      },
+    } as unknown as Navigator
+
+    if (globalAny.window) {
+      globalAny.window.matchMedia = (() => ({
+        matches: true,
+        media: '',
+        onchange: null,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+        dispatchEvent: () => false,
+      })) as unknown as typeof window.matchMedia
+    }
+
+    const { createNodeMock } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={baseSession}
+          sessions={[baseSession, secondSession]}
+          connectionStatus="connected"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          onClose={() => {}}
+          onSelectSession={(id) => selectCalls.push(id)}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        {
+          createNodeMock,
+        }
+      )
+    })
+
+    const openButton = renderer.root.findByProps({ 'aria-label': 'Open session menu' })
+    expect(String(openButton.props.className)).toContain('size-[44px]')
+
+    const mobileStatus = renderer.root.findAllByType('span').find((span) =>
+      span.props.children === 'Working' &&
+      String(span.props.className ?? '').includes('text-[10px]')
+    )
+    expect(mobileStatus).toBeDefined()
+
+    const mobileKillButton = renderer.root
+      .findAllByProps({ 'aria-label': 'Kill session' })
+      .find((button) => String(button.props.className ?? '').includes('size-[44px]'))
+    expect(mobileKillButton).toBeDefined()
+
+    act(() => {
+      openButton.props.onClick()
+    })
+
+    let html = JSON.stringify(renderer.toJSON())
+    expect(html).toContain('session-drawer open')
+
+    const backdrop = renderer.root.findAllByProps({ className: 'session-drawer-backdrop open' })[0]
+    if (!backdrop) {
+      throw new Error('Expected drawer backdrop')
+    }
+
+    act(() => {
+      backdrop.props.onClick()
+    })
+
+    html = JSON.stringify(renderer.toJSON())
+    expect(html).not.toContain('session-drawer open')
+
+    const peek = renderer.root.findByProps({ 'data-testid': 'session-peek' })
+    act(() => { peek.props.onClick() })
+    expect(selectCalls).toEqual([])
+    expect(JSON.stringify(renderer.toJSON())).toContain('session-drawer open')
+    const row = renderer.root.findAllByProps({ 'data-testid': 'session-card' })
+      .find((node) => node.props['data-session-id'] === secondSession.id)!
+    act(() => { row.props.onClick() })
+    expect(selectCalls).toEqual([secondSession.id])
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('session-drawer open')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('exit copy mode remains available without the keyboard toggle', () => {
+    const sentMessages: unknown[] = []
+    let terminalListener: ((message: ServerMessage) => void) | undefined
+
+    const { createNodeMock } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={baseSession}
+          sessions={[baseSession]}
+          connectionStatus="connected"
+          sendMessage={(msg) => { sentMessages.push(msg) }}
+          subscribe={(listener) => { terminalListener = listener; return () => {} }}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        {
+          createNodeMock,
+        }
+      )
+    })
+
+    act(() => { terminalListener?.({ type: 'terminal-ready', sessionId: baseSession.id }) })
+
+    const terminalInstance = TerminalMock.instances[0]
+    if (!terminalInstance) {
+      throw new Error('Expected terminal instance')
+    }
+
+    act(() => {
+      terminalInstance.emitWheel({ deltaY: -60 } as WheelEvent)
+    })
+
+    const exitButton = renderer.root.findAllByProps({ 'aria-label': 'Exit copy mode' })[0]
+    act(() => {
+      exitButton.props.onClick()
+    })
+
+    expect(
+      sentMessages.some(
+        (msg) =>
+          msg &&
+          typeof msg === 'object' &&
+          (msg as { type?: string }).type === 'tmux-cancel-copy-mode'
+      )
+    ).toBe(true)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('shows pending clipboard offer and copies it on tap', () => {
+    globalAny.navigator = {
+      userAgent: 'iPhone',
+      platform: 'iPhone',
+      maxTouchPoints: 5,
+      clipboard: { writeText: () => Promise.reject(new Error('gesture required')) },
+      vibrate: () => true,
+    } as unknown as Navigator
+    globalAny.window = {
+      ...globalAny.window,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      requestAnimationFrame: ((callback: FrameRequestCallback) => {
+        callback(0)
+        return 1
+      }) as typeof requestAnimationFrame,
+      cancelAnimationFrame: (() => {}) as typeof cancelAnimationFrame,
+    } as unknown as Window & typeof globalThis
+
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const { createNodeMock } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={baseSession}
+          sessions={[baseSession]}
+          connectionStatus="connected"
+          sendMessage={() => {}}
+          subscribe={(listener) => {
+            listeners.push(listener)
+            return () => {}
+          }}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        { createNodeMock }
+      )
+    })
+
+    act(() => {
+      listeners[0]?.({
+        type: 'clipboard-offer',
+        sessionId: baseSession.id,
+        text: 'copied-from-claude',
+        source: 'tmux-buffer',
+      })
+    })
+
+    let copiedText = ''
+    let appendedTextarea: { value: string } | null = null
+    globalAny.document = {
+      ...globalAny.document,
+      createElement: ((tagName: string) => {
+        if (tagName === 'textarea') {
+          return {
+            value: '',
+            style: {},
+            focus: () => {},
+            select: () => {},
+          }
+        }
+        return {
+          className: '',
+          style: {},
+          appendChild: () => {},
+          remove: () => {},
+          textContent: '',
+        }
+      }) as unknown as Document['createElement'],
+      body: {
+        appendChild: (node: Node) => {
+          appendedTextarea = node as unknown as { value: string }
+          return node
+        },
+        removeChild: (node: Node) => node,
+      } as unknown as HTMLElement,
+      execCommand: ((command: string) => {
+        if (command === 'copy' && appendedTextarea) {
+          copiedText = appendedTextarea.value
+          return true
+        }
+        return false
+      }) as unknown as Document['execCommand'],
+    } as unknown as Document
+
+    // Offer shows in both the mobile floating pill and the desktop rail segment.
+    const copyButton = renderer.root.findAllByProps({ 'aria-label': 'Copy selection' })[0]
+    act(() => {
+      copyButton.props.onClick()
+    })
+
+    expect(copiedText).toBe('copied-from-claude')
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('shows connection status and new session button triggers callback', () => {
+    const { createNodeMock } = createContainerMock()
+    let newSessionCalls = 0
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={baseSession}
+          sessions={[baseSession]}
+          connectionStatus="reconnecting"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {
+            newSessionCalls += 1
+          }}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        {
+          createNodeMock,
+        }
+      )
+    })
+
+    const html = JSON.stringify(renderer.toJSON())
+    expect(html).toContain('reconnecting')
+
+    const newSessionButton = renderer.root.findByProps({ 'aria-label': 'New session' })
+    act(() => {
+      newSessionButton.props.onClick()
+    })
+
+    expect(newSessionCalls).toBe(1)
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('rename submits only when name changes', () => {
+    const renamed: Array<{ id: string; name: string }> = []
+    const { createNodeMock } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    act(() => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={baseSession}
+          sessions={[baseSession]}
+          connectionStatus="connected"
+          sendMessage={() => {}}
+          subscribe={() => () => {}}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={(id, name) => renamed.push({ id, name })}
+          onResumeSession={() => {}}
+          onOpenSettings={() => {}}
+        />,
+        {
+          createNodeMock,
+        }
+      )
+    })
+
+    const moreButton = renderer.root.findByProps({ title: 'More options' })
+    act(() => {
+      moreButton.props.onClick()
+    })
+
+    const renameButton = renderer.root.findAllByType('button').find((button) => {
+      const children = button.props.children
+      if (Array.isArray(children)) {
+        return children.some((child: unknown) => child === 'Rename')
+      }
+      return children === 'Rename'
+    })
+
+    if (!renameButton) {
+      throw new Error('Expected rename button')
+    }
+
+    act(() => {
+      renameButton.props.onClick()
+    })
+
+    const input = renderer.root.findByProps({ type: 'text' })
+    act(() => {
+      input.props.onKeyDown({
+        key: 'Enter',
+        preventDefault: () => {},
+      })
+    })
+
+    expect(renamed).toEqual([])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+
+  test('renders hibernating placeholder and wakes without attaching terminal', async () => {
+    const resumeCalls: string[] = []
+    const sentMessages: unknown[] = []
+    globalThis.fetch = ((async () =>
+      new Response(
+        JSON.stringify({
+          sessionId: hibernatingSession.sessionId,
+          displayName: hibernatingSession.displayName,
+          projectPath: hibernatingSession.projectPath,
+          agentType: hibernatingSession.agentType,
+          lastActivityAt: hibernatingSession.lastActivityAt,
+          totalLines: 1,
+          startLine: 0,
+          endLine: 1,
+          hasMoreBefore: false,
+          lines: [
+            JSON.stringify({
+              type: 'user',
+              message: { role: 'user', content: [{ type: 'text', text: 'wake me later' }] },
+            }),
+          ],
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      )) as unknown as typeof fetch)
+
+    const { createNodeMock } = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <Terminal
+          session={null}
+          hibernatingSession={hibernatingSession}
+          sessions={[]}
+          connectionStatus="connected"
+          sendMessage={(msg) => { sentMessages.push(msg) }}
+          subscribe={() => () => {}}
+          onClose={() => {}}
+          onSelectSession={() => {}}
+          onNewSession={() => {}}
+          onKillSession={() => {}}
+          onRenameSession={() => {}}
+          onResumeSession={(sessionId) => {
+            resumeCalls.push(sessionId)
+          }}
+          onOpenSettings={() => {}}
+        />,
+        {
+          createNodeMock,
+        }
+      )
+    })
+
+    const html = JSON.stringify(renderer.toJSON())
+    expect(html).toContain('Hibernating')
+    expect(html).toContain('Wake')
+    expect(
+      sentMessages.some(
+        (message) =>
+          typeof message === 'object' &&
+          message !== null &&
+          (message as { type?: string }).type === 'terminal-attach'
+      )
+    ).toBe(false)
+
+    const wakeButton = renderer.root.findAllByType('button').find(
+      (button) => button.props.children === 'Wake'
+    )
+    if (!wakeButton) {
+      throw new Error('Expected wake button')
+    }
+
+    act(() => {
+      wakeButton.props.onClick()
+    })
+
+    expect(resumeCalls).toEqual([hibernatingSession.sessionId])
+
+    act(() => {
+      renderer.unmount()
+    })
+  })
+})
+
+
+test('recovery terminal tap can focus locally while commands stay gated', () => {
+  globalAny.window!.getComputedStyle = (() => ({ getPropertyValue: () => '16px' })) as unknown as typeof window.getComputedStyle
+  globalAny.window!.matchMedia = (() => ({ matches: true, addEventListener() {}, removeEventListener() {} })) as unknown as typeof window.matchMedia
+  const sent: unknown[] = []
+  const nodes = createContainerMock()
+  let renderer!: TestRenderer.ReactTestRenderer
+  act(() => { renderer = TestRenderer.create(<Terminal session={baseSession} sessions={[baseSession]}
+    connectionStatus="reconnecting" sendMessage={message => { sent.push(message); return false }}
+    subscribe={() => () => {}} onClose={() => {}} onSelectSession={() => {}} onNewSession={() => {}}
+    onKillSession={() => {}} onRenameSession={() => {}} onResumeSession={() => {}} onOpenSettings={() => {}} />,
+    { createNodeMock: nodes.createNodeMock }) })
+  const controls = renderer.root.find(node => typeof node.props.onPasteImage === 'function')
+  expect(controls.props.disabled).toBe(true)
+  const before = nodes.getFocusCalls()
+  const sentBefore = sent.length
+  const touch = { clientX: 120, clientY: 100 }
+  act(() => {
+    nodes.listeners.get('touchstart')!({ touches: [touch] } as unknown as Event)
+    nodes.listeners.get('touchend')!({ touches: [], changedTouches: [touch] } as unknown as Event)
+  })
+  expect(nodes.getFocusCalls()).toBe(before + 1)
+  expect(sent).toHaveLength(sentBefore)
+  act(() => renderer.unmount())
+})
+
+for (const gesture of ['key', 'paste'] as const) {
+  test(`rejected mobile ${gesture} stays for review and failed manual send retains it`, () => {
+    const listeners: Array<(message: ServerMessage) => void> = []
+    const accepted: unknown[] = []
+    let reject = true
+    const nodes = createContainerMock()
+    let renderer!: TestRenderer.ReactTestRenderer
+    act(() => { renderer = TestRenderer.create(<Terminal session={baseSession} sessions={[baseSession]}
+      connectionStatus="connected" sendMessage={message => {
+        if (reject && (message.type === 'terminal-input' || message.type === 'terminal-paste')) return false
+        accepted.push(message); return true
+      }} subscribe={listener => { listeners.push(listener); return () => {} }}
+      onClose={() => {}} onSelectSession={() => {}} onNewSession={() => {}} onKillSession={() => {}}
+      onRenameSession={() => {}} onResumeSession={() => {}} onOpenSettings={() => {}} />,
+      { createNodeMock: nodes.createNodeMock }) })
+    act(() => listeners[0]?.({ type: 'terminal-ready', sessionId: baseSession.id }))
+    const controls = () => renderer.root.find(node => typeof node.props.onPasteImage === 'function')
+    act(() => {
+      if (gesture === 'key') controls().props.onSendKey('retained')
+      else controls().props.onPasteText('retained')
+    })
+    expect(renderer.root.findByProps({ id: 'recovery-draft' }).props.value).toBe('retained')
+    const send = () => renderer.root.findAllByType('button').find(node => node.props.children === 'Send text')!
+    act(() => send().props.onClick())
+    expect(renderer.root.findByProps({ id: 'recovery-draft' }).props.value).toBe('retained')
+    reject = false
+    expect(controls().props.disabled).toBe(true)
+    // Upload results must never be added to a text draft or sent past it.
+    act(() => controls().props.onPasteImage('image-path'))
+    expect(renderer.root.findByProps({ id: 'recovery-draft' }).props.value).toBe('retained')
+    expect(accepted.filter((m: any) => m.type === 'terminal-paste' || m.type === 'terminal-input')).toHaveLength(0)
+    act(() => send().props.onClick())
+    expect(renderer.root.findAllByProps({ id: 'recovery-draft' })).toHaveLength(0)
+    expect(controls().props.disabled).toBe(false)
+    expect(accepted.filter((m: any) => m.type === 'terminal-paste')).toEqual([
+      { type: 'terminal-paste', sessionId: baseSession.id, data: 'retained', pasteId: expect.any(Number) },
+    ])
+    expect(JSON.stringify(renderer.toJSON())).toContain('Pasting…')
+    act(() => controls().props.onPasteText('retained'))
+    const pastes = accepted.filter((m): m is { type: 'terminal-paste'; pasteId: number } =>
+      (m as { type?: string }).type === 'terminal-paste'
+    )
+    expect(pastes).toHaveLength(1)
+    act(() => listeners[0]?.({ type: 'terminal-paste-result', sessionId: baseSession.id, pasteId: pastes[0].pasteId, ok: true }))
+    expect(JSON.stringify(renderer.toJSON())).not.toContain('Pasting…')
+    act(() => renderer.unmount())
+  })
+}
+
+
+test('failed attachment shows unavailable input status instead of hiding it', () => {
+  let listener!: (message: ServerMessage) => void
+  const nodes = createContainerMock()
+  let renderer!: TestRenderer.ReactTestRenderer
+  act(() => { renderer = TestRenderer.create(<Terminal session={baseSession} sessions={[baseSession]}
+    connectionStatus="connected" sendMessage={() => true} subscribe={value => { listener = value; return () => {} }}
+    onClose={() => {}} onSelectSession={() => {}} onNewSession={() => {}} onKillSession={() => {}}
+    onRenameSession={() => {}} onResumeSession={() => {}} onOpenSettings={() => {}} />,
+    { createNodeMock: nodes.createNodeMock }) })
+  act(() => listener({ type: 'terminal-error', sessionId: baseSession.id,
+    code: 'ERR_TMUX_ATTACH_FAILED', message: 'Attachment failed', retryable: true }))
+  const status = renderer.root.findByProps({ 'data-testid': 'terminal-recovery-status' })
+  expect(status.props.children).toContain('Terminal unavailable')
+  expect(status.findByType('span').props.children).toContain('Input paused')
+  act(() => renderer.unmount())
+})

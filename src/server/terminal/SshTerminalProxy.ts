@@ -1,0 +1,585 @@
+// SshTerminalProxy — routes tmux commands through SSH for remote sessions.
+// Mirrors PtyTerminalProxy but creates a standalone session on the remote host
+// and tunnels all tmux interactions via SSH.
+
+import { logger } from '../logger'
+import { shellQuote } from '../shellQuote'
+import { buildTmuxFormat, splitTmuxFields, splitTmuxLines, withTmuxUtf8Flag } from '../tmuxFormat'
+import { sanitizedTmuxEnv } from '../tmuxEnv'
+import {
+  syncFeatureEnabled,
+  TerminalProxyBase,
+  tmuxSupportsClientFeatures,
+} from './TerminalProxyBase'
+import { TerminalProxyError, TerminalState } from './types'
+
+class SshTerminalProxy extends TerminalProxyBase {
+  /** Maximum time (ms) to wait for SSH startup before aborting. */
+  static STARTUP_TIMEOUT_MS = 30_000
+
+  private process: ReturnType<typeof Bun.spawn> | null = null
+  private decoder = new TextDecoder()
+  private encoder = new TextEncoder()
+  private cols = 80
+  private rows = 24
+  private clientTty: string | null = null
+  private sshArgs: string[]
+  private sshCommandTimeoutMs: number
+  private startAttemptId = 0
+  private pasteTargetResolution: Promise<void> = Promise.resolve()
+
+  constructor(options: ConstructorParameters<typeof TerminalProxyBase>[0]) {
+    super(options)
+    const host = this.options.host ?? ''
+    const sshOptions = this.options.sshOptions ?? []
+    this.sshCommandTimeoutMs = this.options.commandTimeoutMs ?? 10_000
+    this.sshArgs = ['ssh', ...sshOptions, host]
+  }
+
+  getMode(): 'ssh' {
+    return 'ssh'
+  }
+
+  getClientTty(): string | null {
+    return this.clientTty
+  }
+
+  write(data: string): void {
+    this.process?.terminal?.write(this.encoder.encode(data))
+  }
+
+  async paste(data: string): Promise<boolean> {
+    if (!data || this.state === TerminalState.DEAD) {
+      return false
+    }
+    const tty = this.clientTty
+    // No selected recipient during startup or a switch. An empty client
+    // selector lets tmux choose another client, so fail closed instead.
+    if (!tty || !this.currentWindow || this.state !== TerminalState.READY) {
+      this.logPasteFailure(this.currentWindow ?? '', 'resolve-pane', data.length, new Error('Terminal recipient not ready'))
+      return false
+    }
+    // Typed input still uses the interactive PTY: Enter can overtake this
+    // asynchronous side channel on a slow link, as before.
+    const attemptId = this.startAttemptId
+    const bufferName = this.nextPasteBufferName()
+    const normalized = this.normalizePasteData(data)
+    // Start resolving at acceptance. Later switches wait only for this lookup,
+    // while slow buffer uploads can finish after the client changes sessions.
+    // display-message -c does not scope its pane format context to that
+    // client. list-clients expands per client; match the exact captured tty.
+    const recipient = this.runParsedTmuxNonBlocking([
+      'list-clients', '-F', buildTmuxFormat(['#{client_tty}', '#{pane_id}']),
+    ]).then(output => {
+      for (const line of splitTmuxLines(output)) {
+        const fields = splitTmuxFields(line, 2)
+        if (!fields || fields[0] !== tty) continue
+        if (!/^%[0-9]+$/.test(fields[1])) throw new Error('Invalid terminal pane')
+        return fields[1]
+      }
+      throw new Error('Terminal client not found')
+    })
+    // A failed later lookup must still wait for earlier pending recipients.
+    this.pasteTargetResolution = Promise.allSettled([this.pasteTargetResolution, recipient]).then(() => {})
+    let target: string
+    try {
+      target = await recipient
+    } catch (error) {
+      this.logPasteFailure(tty, 'resolve-pane', normalized.length, error)
+      return false
+    }
+    if (!this.isStartAttemptCurrent(attemptId)) return false
+    try {
+      await this.runTmuxAsync([
+        'load-buffer', '-b', bufferName, '-', ';',
+        'paste-buffer', '-d', '-p', '-b', bufferName, '-t', target,
+      ], normalized)
+      return true
+    } catch (error) {
+      this.logPasteFailure(target, 'paste-buffer', normalized.length, error)
+      void this.runTmuxAsync(['delete-buffer', '-b', bufferName]).catch(() => {})
+      return false
+    }
+  }
+
+  resize(cols: number, rows: number): void {
+    this.cols = cols
+    this.rows = rows
+
+    try {
+      this.process?.terminal?.resize(cols, rows)
+    } catch {
+      // Ignore resize errors
+    }
+  }
+
+  async dispose(): Promise<void> {
+    // Invalidate any in-flight start attempt so doStartCore bails out before
+    // mutating state after we've disposed.
+    this.startAttemptId += 1
+    this.state = TerminalState.DEAD
+    this.outputSuppressed = false
+    await this.drainSizeParticipation()
+
+    if (this.process) {
+      try {
+        this.process.kill()
+        this.process.terminal?.close()
+      } catch {
+        // Ignore if already exited
+      }
+      this.process = null
+    }
+
+    try {
+      await this.runTmuxAsync(['kill-session', '-t', this.options.sessionName])
+      this.logEvent('terminal_session_cleanup', {
+        sessionName: this.options.sessionName,
+      })
+    } catch {
+      // Ignore cleanup failures
+    }
+
+    this.clientTty = null
+    this.currentWindow = null
+    this.readyAt = null
+    this.startPromise = null
+  }
+
+  /**
+   * Run a tmux command on the remote host via SSH (async).
+   * Uses Bun.spawn instead of spawnSync so the event loop is not blocked
+   * while waiting for SSH round-trips.
+   */
+  protected async runTmuxAsync(args: string[], input?: string): Promise<string> {
+    const remoteCmd = `tmux ${args.map(a => shellQuote(a)).join(' ')}`
+    const proc = this.spawn([...this.sshArgs, remoteCmd], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: sanitizedTmuxEnv(),
+      ...(input !== undefined ? { stdin: Buffer.from(input) } : {}),
+    })
+
+    const timeout = setTimeout(() => {
+      try { proc.kill() } catch {}
+    }, this.sshCommandTimeoutMs)
+
+    let exitCode: number
+    let stdoutText: string
+    let stderrText: string
+    try {
+      [exitCode, stdoutText, stderrText] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout as ReadableStream).text(),
+        new Response(proc.stderr as ReadableStream).text(),
+      ])
+    } finally {
+      clearTimeout(timeout)
+    }
+
+    if (exitCode !== 0) {
+      const stderr = stderrText || 'tmux command failed'
+      logger.warn('ssh_tmux_command_failed', {
+        remoteCmd,
+        exitCode,
+        stderr: stderr.slice(0, 500),
+        sessionName: this.options.sessionName,
+        connectionId: this.options.connectionId,
+      })
+      throw new Error(stderr)
+    }
+
+    return stdoutText
+  }
+
+  protected async runParsedTmuxNonBlocking(args: string[]): Promise<string> {
+    return this.runTmuxAsync(withTmuxUtf8Flag(args))
+  }
+
+  protected async doStart(): Promise<void> {
+    if (this.process) {
+      return
+    }
+
+    const attemptId = ++this.startAttemptId
+    const core = this.doStartCore(attemptId)
+    core.catch(() => {}) // Prevent unhandled rejection if timeout wins
+
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        if (attemptId !== this.startAttemptId) return
+        // Invalidate this attempt so any in-flight core path bails out before mutating state.
+        this.startAttemptId += 1
+
+        logger.error('ssh_start_timeout', {
+          sessionName: this.options.sessionName,
+          host: this.options.host,
+          timeoutMs: SshTerminalProxy.STARTUP_TIMEOUT_MS,
+        })
+        if (this.process) {
+          try {
+            this.process.kill()
+            this.process.terminal?.close()
+          } catch {
+            // Ignore if already exited
+          }
+          this.process = null
+        }
+        this.state = TerminalState.DEAD
+        reject(
+          new TerminalProxyError(
+            'ERR_START_TIMEOUT',
+            `SSH startup timed out after ${SshTerminalProxy.STARTUP_TIMEOUT_MS}ms`,
+            true
+          )
+        )
+      }, SshTerminalProxy.STARTUP_TIMEOUT_MS)
+    })
+
+    try {
+      await Promise.race([core, timeout])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  /**
+   * `-T sync` args for the remote attach when the remote tmux supports the
+   * flag (>= 3.2; it aborts the attach on older versions). The version
+   * normally arrives free with the session-create round-trip (`knownVersion`);
+   * only the duplicate-session recovery path — where create fails before
+   * printing it — queries the running server version. Both are plain remote commands
+   * rather than shell logic so this works under any login shell.
+   */
+  private async clientFeatureArgs(
+    knownVersion: string | null
+  ): Promise<string[]> {
+    const sync = syncFeatureEnabled()
+    if (!sync && this.options.initialSizeParticipation !== false) return []
+    try {
+      const version = knownVersion ?? (await this.runTmuxAsync(['display-message', '-p', '#{version}']))
+      this.sizeParticipationSupported = tmuxSupportsClientFeatures(version)
+      return sync && tmuxSupportsClientFeatures(version) ? ['-T', 'sync'] : []
+    } catch {
+      // runTmuxAsync already logs ssh_tmux_command_failed; degrade to no sync.
+      return []
+    }
+  }
+
+  private isStartAttemptCurrent(attemptId: number): boolean {
+    return attemptId === this.startAttemptId
+  }
+
+  private async doStartCore(attemptId: number): Promise<void> {
+    const startedAt = this.now()
+    this.state = TerminalState.ATTACHING
+
+    this.logEvent('terminal_proxy_start', {
+      sessionName: this.options.sessionName,
+      baseSession: this.options.baseSession,
+      mode: this.getMode(),
+      host: this.options.host,
+    })
+
+    // -P -F prints the remote server version with the create output, so the
+    // sync-feature gate below needs no extra SSH round-trip.
+    let remoteVersion: string | null = null
+    try {
+      try {
+        remoteVersion = await this.runTmuxAsync([
+          'new-session',
+          '-d',
+          '-s',
+          this.options.sessionName,
+          '-P',
+          '-F',
+          '#{version}',
+        ])
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        // Session name is per-WS-connection; if a previous proxy didn't clean up,
+        // treat duplicate sessions as recoverable and try to proceed.
+        if (!message.includes('duplicate session')) {
+          throw error
+        }
+      }
+      if (!this.isStartAttemptCurrent(attemptId)) {
+        await this.dispose()
+        return
+      }
+      logger.info('ssh_session_created', {
+        sessionName: this.options.sessionName,
+        host: this.options.host,
+      })
+    } catch (error) {
+      logger.error('ssh_session_create_failed', {
+        sessionName: this.options.sessionName,
+        host: this.options.host,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      this.state = TerminalState.DEAD
+      throw new TerminalProxyError(
+        'ERR_SESSION_CREATE_FAILED',
+        error instanceof Error
+          ? error.message
+          : 'Failed to create remote session',
+        true
+      )
+    }
+
+    // Pass the remote tmux attach command as a single string to SSH. Force
+    // UTF-8 because the remote login may inherit a non-UTF-8 service locale.
+    const featureArgs = await this.clientFeatureArgs(remoteVersion)
+    const attachCmd = [
+      'tmux',
+      ...withTmuxUtf8Flag([
+        ...featureArgs,
+        'new-session',
+        '-A',
+        ...(this.sizeParticipationSupported && this.options.initialSizeParticipation === false ? ['-f', 'ignore-size'] : []),
+        '-s',
+      ]),
+    ].join(' ') + ` ${shellQuote(this.options.sessionName)}`
+    const spawnArgs = [
+      'ssh',
+      '-tt',
+      ...(this.options.sshOptions ?? []),
+      this.options.host!,
+      attachCmd,
+    ]
+
+    logger.info('ssh_attach_spawn', {
+      sessionName: this.options.sessionName,
+      spawnArgs: spawnArgs.join(' '),
+    })
+
+    let proc: ReturnType<typeof Bun.spawn>
+    try {
+      if (!this.isStartAttemptCurrent(attemptId)) {
+        await this.dispose()
+        return
+      }
+      proc = this.spawn(
+        spawnArgs,
+        {
+          env: {
+            ...sanitizedTmuxEnv(),
+            TERM: 'xterm-256color',
+          },
+          terminal: {
+            cols: this.cols,
+            rows: this.rows,
+            name: 'xterm-256color',
+            data: (_terminal, data) => {
+              const text = this.decoder.decode(data, { stream: true })
+              if (!text || this.outputSuppressed) {
+                return
+              }
+              this.options.onData(text)
+            },
+            exit: () => {
+              const tail = this.decoder.decode()
+              if (tail && !this.outputSuppressed) {
+                this.options.onData(tail)
+              }
+            },
+          },
+        }
+      )
+    } catch (error) {
+      logger.error('ssh_attach_spawn_failed', {
+        sessionName: this.options.sessionName,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      this.state = TerminalState.DEAD
+      throw new TerminalProxyError(
+        'ERR_TMUX_ATTACH_FAILED',
+        error instanceof Error ? error.message : 'Failed to attach tmux client via SSH',
+        true
+      )
+    }
+
+    if (!this.isStartAttemptCurrent(attemptId)) {
+      try {
+        proc.kill()
+        proc.terminal?.close()
+      } catch {
+        // Ignore if already exited
+      }
+      await this.dispose()
+      return
+    }
+
+    this.process = proc
+
+    proc.exited.then((exitCode) => {
+      if (this.process !== proc) return
+      this.process = null
+      this.startAttemptId += 1
+      this.state = TerminalState.DEAD
+      logger.warn('ssh_proxy_exited', {
+        sessionName: this.options.sessionName,
+        mode: this.getMode(),
+        exitCode,
+        connectionId: this.options.connectionId,
+      })
+      this.options.onExit?.()
+    })
+
+    try {
+      const tty = await this.discoverClientTty(attemptId)
+      if (tty === null || !this.isStartAttemptCurrent(attemptId)) {
+        await this.dispose()
+        return
+      }
+      this.clientTty = tty
+      this.readyAt = this.now()
+      this.state = TerminalState.READY
+      logger.info('ssh_proxy_ready', {
+        sessionName: this.options.sessionName,
+        clientTty: tty,
+        durationMs: this.readyAt - startedAt,
+        mode: this.getMode(),
+      })
+    } catch (error) {
+      logger.error('ssh_tty_discovery_failed', {
+        sessionName: this.options.sessionName,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      this.state = TerminalState.DEAD
+      await this.dispose()
+      throw error
+    }
+  }
+
+  protected async doSwitch(target: string, onReady?: () => void): Promise<boolean> {
+    if (!this.clientTty || this.state === TerminalState.DEAD) {
+      throw new TerminalProxyError(
+        'ERR_NOT_READY',
+        'Terminal client not ready',
+        true
+      )
+    }
+
+    const attemptId = this.startAttemptId
+    this.state = TerminalState.SWITCHING
+    await this.pasteTargetResolution
+    if (!this.isStartAttemptCurrent(attemptId) || !this.clientTty) return false
+    this.outputSuppressed = true
+    const startedAt = this.now()
+
+    this.logEvent('terminal_switch_attempt', {
+      sessionName: this.options.sessionName,
+      tmuxWindow: target,
+      clientTty: this.clientTty,
+      mode: this.getMode(),
+    })
+
+    try {
+      if (this.options.isolateRemoteWindow) {
+        // Two clients attached to one tmux session share its selected window.
+        // Replace only this proxy's temporary window with a link to the target.
+        const view = this.options.sessionName
+        const index = (await this.runTmuxAsync(['display-message', '-p', '-t', view, '#{window_index}'])).trim()
+        if (!this.isStartAttemptCurrent(attemptId)) return false
+        if (!/^\d+$/.test(index)) throw new Error('Cannot resolve the temporary SSH window')
+        const viewWindow = view + ':' + index
+        await this.runTmuxAsync(['link-window', '-k', '-s', target, '-t', viewWindow, ';',
+          'switch-client', '-c', this.clientTty, '-t', viewWindow])
+      } else {
+        await this.runTmuxAsync(['switch-client', '-c', this.clientTty, '-t', target])
+      }
+      if (!this.isStartAttemptCurrent(attemptId)) return false
+      if (onReady) {
+        try {
+          onReady()
+        } catch {
+          // Ignore onReady failures
+        }
+      }
+      this.outputSuppressed = false
+      this.setCurrentWindow(target)
+      try {
+        await this.runTmuxAsync(['refresh-client', '-t', this.clientTty])
+      } catch {
+        // Ignore refresh failures
+      }
+      if (!this.isStartAttemptCurrent(attemptId)) return false
+      const durationMs = this.now() - startedAt
+      this.logEvent('terminal_switch_success', {
+        sessionName: this.options.sessionName,
+        tmuxWindow: target,
+        clientTty: this.clientTty,
+        durationMs,
+        mode: this.getMode(),
+      })
+      this.state = TerminalState.READY
+      return true
+    } catch (error) {
+      if (!this.isStartAttemptCurrent(attemptId)) return false
+      this.outputSuppressed = false
+      this.state = TerminalState.READY
+      this.logEvent('terminal_switch_failure', {
+        sessionName: this.options.sessionName,
+        tmuxWindow: target,
+        clientTty: this.clientTty,
+        error: error instanceof Error ? error.message : 'tmux switch failed',
+        mode: this.getMode(),
+      })
+      throw new TerminalProxyError(
+        'ERR_TMUX_SWITCH_FAILED',
+        error instanceof Error ? error.message : 'Unable to switch tmux client',
+        true
+      )
+    }
+  }
+
+  /**
+   * Poll for the attached client's TTY. Returns null as soon as the start
+   * attempt is superseded (startup timeout, dispose) so a cancelled attempt
+   * stops issuing SSH round-trips instead of polling out the full window and
+   * running its cleanup seconds later.
+   */
+  private async discoverClientTty(attemptId: number): Promise<string | null> {
+    const start = this.now()
+    let delay = 50
+    const maxWaitMs = 4000
+
+    while (this.now() - start <= maxWaitMs) {
+      if (!this.isStartAttemptCurrent(attemptId)) {
+        return null
+      }
+      let output = ''
+      try {
+        output = await this.runParsedTmuxNonBlocking([
+          'list-clients',
+          '-t',
+          this.options.sessionName,
+          '-F',
+          '#{client_tty}',
+        ])
+      } catch {
+        output = ''
+      }
+      for (const line of output.split('\n')) {
+        const trimmed = line.trim()
+        if (trimmed) {
+          return trimmed
+        }
+      }
+
+      await this.wait(delay)
+      delay = Math.min(delay * 2, 800)
+    }
+
+    throw new TerminalProxyError(
+      'ERR_TTY_DISCOVERY_TIMEOUT',
+      'Unable to discover tmux client TTY',
+      true
+    )
+  }
+}
+
+export { SshTerminalProxy }
+export { shellQuote } from '../shellQuote'

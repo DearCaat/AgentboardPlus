@@ -1,0 +1,2496 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import fs from 'node:fs/promises'
+import fsSync from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import type { Session } from '../../shared/types'
+import {
+  normalizeText,
+  matchWindowsToLogsByExactRg,
+  matchWindowsToLogsByExactRgAsync,
+  tryExactMatchWindowToLog,
+  getLogTokenCount,
+  verifyWindowLogAssociation,
+  verifyWindowLogAssociationDetailed,
+  verifyWindowLogAssociationDetailedAsync,
+  verifyWindowsBatch,
+  extractRecentTraceLinesFromTmux,
+  extractRecentUserMessagesFromTmux,
+  extractAskUserQuestionAnswers,
+  extractPiUserMessagesFromAnsi,
+  extractActionFromUserAction,
+  extractCommandInvocation,
+  extractLastUserMessageFromLog,
+  hasMessageInValidUserContext,
+  isToolNotificationText,
+  extractLastEntryTimestamp,
+  extractLastResponseTimestamp,
+  captureTerminalScrollback,
+  iterateLogLinesBackward,
+  stripPastePlaceholders,
+} from '../logMatcher'
+
+const bunAny = Bun as typeof Bun & {
+  spawn: typeof Bun.spawn
+  spawnSync: typeof Bun.spawnSync
+}
+const originalSpawn = bunAny.spawn
+const originalSpawnSync = bunAny.spawnSync
+
+const tmuxOutputs = new Map<string, string>()
+const commandCalls: string[][] = []
+
+function setTmuxOutput(target: string, content: string) {
+  tmuxOutputs.set(target, content)
+}
+
+function findJsonlFiles(dir: string): string[] {
+  const results: string[] = []
+  if (!fsSync.existsSync(dir)) return results
+  const entries = fsSync.readdirSync(dir, { withFileTypes: true })
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name)
+    if (entry.isDirectory()) {
+      results.push(...findJsonlFiles(fullPath))
+    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      results.push(fullPath)
+    }
+  }
+  return results
+}
+
+function runRg(args: string[]) {
+  // Union semantics: a file/line matches when ANY -e pattern matches.
+  const patterns: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-e' && args[i + 1] !== undefined) {
+      patterns.push(args[i + 1] as string)
+      i++
+    }
+  }
+  const regexes = patterns.map((p) => new RegExp(p, 'm'))
+  const matchesAny = (text: string) => regexes.some((r) => r.test(text))
+  const firstPatternIndex = args.indexOf('-e')
+
+  if (args.includes('--json')) {
+    const filePath = args[args.length - 1] ?? ''
+    if (!filePath || regexes.length === 0 || !fsSync.existsSync(filePath)) {
+      return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+    }
+    const lines = fsSync.readFileSync(filePath, 'utf8').split('\n')
+    const output: string[] = []
+    lines.forEach((line, index) => {
+      if (matchesAny(line)) {
+        output.push(
+          JSON.stringify({ type: 'match', data: { line_number: index + 1 } })
+        )
+      }
+    })
+    const exitCode = output.length > 0 ? 0 : 1
+    return {
+      exitCode,
+      stdout: Buffer.from(output.join('\n')),
+      stderr: Buffer.from(''),
+    }
+  }
+
+  if (args.includes('-l')) {
+    if (regexes.length === 0) {
+      return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+    }
+    const targets: string[] = []
+    let skipNext = false
+    for (let i = firstPatternIndex + 2; i < args.length; i += 1) {
+      const arg = args[i] ?? ''
+      if (skipNext) {
+        skipNext = false
+        continue
+      }
+      if (!arg) continue
+      if (arg === '--glob') {
+        skipNext = true
+        continue
+      }
+      if (arg === '--threads') {
+        skipNext = true
+        continue
+      }
+      if (arg === '-e') {
+        skipNext = true
+        continue
+      }
+      if (arg.startsWith('-')) {
+        continue
+      }
+      targets.push(arg)
+    }
+    const files: string[] = []
+    for (const target of targets) {
+      if (!fsSync.existsSync(target)) continue
+      const stat = fsSync.statSync(target)
+      if (stat.isDirectory()) {
+        files.push(...findJsonlFiles(target))
+      } else if (stat.isFile()) {
+        files.push(target)
+      }
+    }
+    const matches = files.filter((file) => {
+      const content = fsSync.readFileSync(file, 'utf8')
+      return matchesAny(content)
+    })
+    return {
+      exitCode: matches.length > 0 ? 0 : 1,
+      stdout: Buffer.from(matches.join('\n')),
+      stderr: Buffer.from(''),
+    }
+  }
+
+  // Content mode: rg -n -e <pattern> <files...> → "N:line" per match
+  if (args.includes('-n')) {
+    if (regexes.length === 0) {
+      return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+    }
+    const targets = args.slice(firstPatternIndex + 2).filter((arg) => arg && !arg.startsWith('-'))
+    const output: string[] = []
+    for (const target of targets) {
+      if (!fsSync.existsSync(target) || !fsSync.statSync(target).isFile()) continue
+      const lines = fsSync.readFileSync(target, 'utf8').split('\n')
+      lines.forEach((line, index) => {
+        if (matchesAny(line)) output.push(`${index + 1}:${line}`)
+      })
+    }
+    return {
+      exitCode: output.length > 0 ? 0 : 1,
+      stdout: Buffer.from(output.join('\n')),
+      stderr: Buffer.from(''),
+    }
+  }
+
+  // Plain content mode: rg -e <patterns...> <file> → the matched line, once per
+  // matching line (used by the batch scan's per-file attribution pass).
+  if (regexes.length > 0) {
+    const targets: string[] = []
+    let skip = false
+    for (const arg of args) {
+      if (skip) { skip = false; continue }
+      if (arg === '-e' || arg === '--threads' || arg === '--glob') { skip = true; continue }
+      if (arg.startsWith('-') || arg === 'rg') continue
+      targets.push(arg)
+    }
+    const output: string[] = []
+    for (const target of targets) {
+      if (!fsSync.existsSync(target) || !fsSync.statSync(target).isFile()) continue
+      for (const line of fsSync.readFileSync(target, 'utf8').split('\n')) {
+        if (matchesAny(line)) output.push(line)
+      }
+    }
+    return {
+      exitCode: output.length > 0 ? 0 : 1,
+      stdout: Buffer.from(output.join('\n')),
+      stderr: Buffer.from(''),
+    }
+  }
+
+  return { exitCode: 1, stdout: Buffer.from(''), stderr: Buffer.from('') }
+}
+
+function runCommand(args: string[]) {
+  commandCalls.push(args)
+  const tmuxSubcommand = args[1] === '-u' ? args[2] : args[1]
+  if (args[0] === 'tmux' && tmuxSubcommand === 'capture-pane') {
+    const targetIndex = args.indexOf('-t')
+    const target = targetIndex >= 0 ? args[targetIndex + 1] : ''
+    const output = tmuxOutputs.get(target ?? '') ?? ''
+    return {
+      exitCode: 0,
+      stdout: Buffer.from(output),
+      stderr: Buffer.from(''),
+    }
+  }
+  if (args[0] === 'rg') {
+    return runRg(args)
+  }
+  return {
+    exitCode: 0,
+    stdout: Buffer.from(''),
+    stderr: Buffer.from(''),
+  }
+}
+
+function toReadableStream(buffer: Buffer): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(buffer)
+      controller.close()
+    },
+  })
+}
+
+function buildPromptScrollback(
+  messages: string[],
+  options: { prefix?: string; glyph?: string } = {}
+): string {
+  const prefix = options.prefix ?? ''
+  const glyph = options.glyph ?? '❯'
+  return messages
+    .map((message) => `${prefix}${glyph} ${message}\n⏺ ok`)
+    .join('\n')
+    .concat('\n')
+}
+
+/**
+ * Build a log entry in proper Claude/Codex format with "text" field.
+ * This format is required for the JSON field pattern matching.
+ */
+function buildUserLogEntry(message: string): string {
+  return JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text: message }] }
+  })
+}
+
+/**
+ * AskUserQuestion answers land in the log as tool_result content inside a
+ * type:'user' entry, wrapped in a "…answered:" envelope.
+ */
+function buildAskAnswerLogEntry(question: string, answer: string): string {
+  return JSON.stringify({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'toolu_test_1',
+          content: `Your questions have been answered: "${question}"="${answer}". You can now continue with these answers in mind.`,
+        },
+      ],
+    },
+  })
+}
+
+/**
+ * A screen showing only submitted-answer recap lines plus an active
+ * AskUserQuestion card — no ❯ user prompt anywhere.
+ */
+function buildAskAnswerScrollback(pairs: Array<[string, string]>): string {
+  const recaps = pairs
+    .map(([q, a]) => `⏺ User answered Claude's questions:\n  ⎿ \u00a0· ${q} → ${a}`)
+    .join('\n')
+  return [
+    '⏺ Working…',
+    recaps,
+    '────────────────────────────',
+    ' ☐ Session',
+    'Another question for you?',
+    '❯ 1. 24 hours (Recommended)',
+    '  2. 8 hours',
+    'Enter to select · ↑/↓ to navigate · Esc to cancel',
+    '',
+  ].join('\n')
+}
+
+beforeEach(() => {
+  commandCalls.length = 0
+  bunAny.spawn = ((args: string[]) => {
+    const result = runCommand(args)
+    return {
+      exited: Promise.resolve(result.exitCode),
+      stdout: toReadableStream(result.stdout),
+      stderr: toReadableStream(result.stderr),
+      kill: () => {},
+      pid: 12345,
+    } as unknown as ReturnType<typeof Bun.spawn>
+  }) as typeof Bun.spawn
+
+  bunAny.spawnSync = ((args: string[]) => {
+    return runCommand(args) as ReturnType<typeof Bun.spawnSync>
+  }) as typeof Bun.spawnSync
+})
+
+afterEach(() => {
+  bunAny.spawn = originalSpawn
+  bunAny.spawnSync = originalSpawnSync
+  tmuxOutputs.clear()
+})
+
+describe('logMatcher', () => {
+  test('captures tmux scrollback through a UTF-8 client', () => {
+    setTmuxOutput('agentboard:1', '你好 🚀')
+
+    expect(captureTerminalScrollback('agentboard:1', 20)).toEqual({
+      ok: true,
+      content: '你好 🚀',
+    })
+    expect(commandCalls[0]?.slice(0, 3)).toEqual([
+      'tmux',
+      '-u',
+      'capture-pane',
+    ])
+  })
+
+  test('normalizeText strips ANSI and control characters', () => {
+    const input = '\u001b[31mHello\u001b[0m\u0007\nWorld'
+    expect(normalizeText(input)).toBe('hello world')
+  })
+
+  test('extractLastUserMessageFromLog preserves user_action extraction via normalized events', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-last-user-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [
+              {
+                type: 'input_text',
+                text:
+                  '<user_action><context>User requested review</context><action>review</action></user_action>',
+              },
+            ],
+          },
+        }),
+      ].join('\n')
+    )
+
+    expect(extractLastUserMessageFromLog(logPath)).toBe('review')
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('extractLastUserMessageFromLog skips Claude <local-command-stdout> auto-compact entries and falls back to prior real user message', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-last-user-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+
+    // Real on-disk format from ~/.claude/projects/*.jsonl after ctrl+o auto-compact:
+    // user-role JSONL entry whose content is `<local-command-stdout>[2mCompacted...[22m</local-command-stdout>`.
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'fix the login bug' },
+          timestamp: '2026-05-04T10:00:00.000Z',
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content:
+              '<local-command-stdout>[2mCompacted (ctrl+o to see full summary)[22m</local-command-stdout>',
+          },
+          timestamp: '2026-05-04T10:05:00.000Z',
+        }),
+      ].join('\n')
+    )
+
+    expect(extractLastUserMessageFromLog(logPath)).toBe('fix the login bug')
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('extractLastUserMessageFromLog returns null when only <local-command-stdout> exists', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-last-user-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+
+    await fs.writeFile(
+      logPath,
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content:
+            '<local-command-stdout>[2mCompacted (ctrl+o to see full summary)[22m</local-command-stdout>',
+        },
+      })
+    )
+
+    expect(extractLastUserMessageFromLog(logPath)).toBeNull()
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('extractLastUserMessageFromLog strips ANSI escapes from real user messages', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-last-user-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+
+    await fs.writeFile(
+      logPath,
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: '[31mfix the login bug[0m',
+        },
+      })
+    )
+
+    expect(extractLastUserMessageFromLog(logPath)).toBe('fix the login bug')
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('extractCommandInvocation returns "/cmd args" form for slash-command messages', () => {
+    const text =
+      '<command-message>mcp__RepoPrompt__rp-review</command-message>\n<command-name>/mcp__RepoPrompt__rp-review</command-name>\n<command-args>the pr</command-args>'
+    expect(extractCommandInvocation(text)).toBe('/mcp__RepoPrompt__rp-review the pr')
+  })
+
+  test('extractCommandInvocation handles empty args', () => {
+    const text =
+      '<command-message>mcp</command-message>\n<command-name>/mcp</command-name>\n<command-args></command-args>'
+    expect(extractCommandInvocation(text)).toBe('/mcp')
+  })
+
+  test('extractCommandInvocation returns null for non-command text', () => {
+    expect(extractCommandInvocation('please fix the login bug')).toBeNull()
+  })
+
+  test('extractCommandInvocation requires <command-message> wrapper (rejects pasted command-name fragments)', () => {
+    // User pasting a fragment of a Claude log without the full block shape — should not be misinterpreted.
+    const text = 'see this log line: <command-name>/cmd</command-name><command-args>args</command-args>'
+    expect(extractCommandInvocation(text)).toBeNull()
+  })
+
+  test('extractCommandInvocation requires slash-prefixed name (rejects bare names)', () => {
+    const text =
+      '<command-message>foo</command-message><command-name>just-a-name</command-name><command-args>args</command-args>'
+    expect(extractCommandInvocation(text)).toBeNull()
+  })
+
+  test('extractLastUserMessageFromLog renders slash-command invocations as readable preview', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-last-user-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+
+    // Real on-disk format from ~/.claude/projects/*.jsonl when a user runs a slash command:
+    // type:"user" entry whose content wraps <command-message>/<command-name>/<command-args>.
+    await fs.writeFile(
+      logPath,
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content:
+            '<command-message>mcp__RepoPrompt__rp-review</command-message>\n<command-name>/mcp__RepoPrompt__rp-review</command-name>\n<command-args>the pr</command-args>',
+        },
+      })
+    )
+
+    expect(extractLastUserMessageFromLog(logPath)).toBe('/mcp__RepoPrompt__rp-review the pr')
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('extractLastUserMessageFromLog filters tool-notification markers wrapped in ANSI escapes', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-last-user-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const ESC = String.fromCharCode(27)
+
+    // Hypothetical future format where Claude wraps a marker tag in ANSI dim.
+    // The fix must strip ANSI before the marker check so this still gets filtered.
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'real prior message' },
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: `${ESC}[2m<local-command-stdout>compacted${ESC}[22m</local-command-stdout>`,
+          },
+        }),
+      ].join('\n')
+    )
+
+    expect(extractLastUserMessageFromLog(logPath)).toBe('real prior message')
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('extractLastUserMessageFromLog skips Claude isMeta system-reminder entries', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-last-user-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'doesnt have to be repos' },
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content:
+              '<system-reminder>Respond with just the action or changes…</system-reminder>',
+          },
+          isMeta: true,
+        }),
+      ].join('\n')
+    )
+
+    expect(extractLastUserMessageFromLog(logPath)).toBe('doesnt have to be repos')
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('extractLastUserMessageFromLog handles mixed Codex response_item and event_msg schemas', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-last-user-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'older response item user message' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: {
+              role: 'user',
+              content: [{ type: 'input_text', text: 'latest structured event user message' }],
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'assistant_message',
+            message: 'assistant follows user',
+          },
+        }),
+      ].join('\n')
+    )
+
+    expect(extractLastUserMessageFromLog(logPath)).toBe('latest structured event user message')
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog uses ordered prompts to disambiguate', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPathA = path.join(tempDir, 'session-a.jsonl')
+    const logPathB = path.join(tempDir, 'session-b.jsonl')
+    const messages = ['alpha one', 'alpha two', 'alpha three']
+    const logALines = messages.map((message) => buildUserLogEntry(message))
+    const logBLines = [
+      buildUserLogEntry(messages[0]),
+      buildUserLogEntry(messages[2]),
+      buildUserLogEntry(messages[1]),
+    ]
+
+    await fs.writeFile(logPathA, logALines.join('\n'))
+    await fs.writeFile(logPathB, logBLines.join('\n'))
+
+    setTmuxOutput('agentboard:1', buildPromptScrollback(messages))
+
+    const result = tryExactMatchWindowToLog('agentboard:1', tempDir)
+    expect(result?.logPath).toBe(logPathA)
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog detects decorated Claude prompts', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const message = 'decorated claude prompt'
+
+    await fs.writeFile(logPath, buildUserLogEntry(message))
+    setTmuxOutput(
+      'agentboard:1',
+      buildPromptScrollback([message], { prefix: '> ' })
+    )
+
+    const result = tryExactMatchWindowToLog('agentboard:1', tempDir)
+    expect(result?.logPath).toBe(logPath)
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog detects decorated Codex prompts', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const message = 'decorated codex prompt'
+
+    await fs.writeFile(logPath, buildUserLogEntry(message))
+    setTmuxOutput(
+      'agentboard:1',
+      buildPromptScrollback([message], { prefix: '* ', glyph: '›' })
+    )
+
+    const result = tryExactMatchWindowToLog('agentboard:1', tempDir)
+    expect(result?.logPath).toBe(logPath)
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog refuses a log of a different agent type than the window', async () => {
+    // Same prompt pasted into a claude window and a codex window seconds apart:
+    // the claude log flushes first, so for a moment it is the only log containing
+    // the codex pane's text. The codex window must wait, not claim the claude log.
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const claudeDir = path.join(tempDir, '.claude', 'projects', 'proj')
+    await fs.mkdir(claudeDir, { recursive: true })
+    const claudeLog = path.join(claudeDir, 'claude-session.jsonl')
+    const message = 'look at this slack convo and tell me what you think'
+    await fs.writeFile(claudeLog, buildUserLogEntry(message))
+    setTmuxOutput('agentboard:1', buildPromptScrollback([message]))
+
+    expect(
+      tryExactMatchWindowToLog('agentboard:1', tempDir, undefined, { agentType: 'codex' })
+    ).toBeNull()
+    // Unknown window type fails open
+    expect(
+      tryExactMatchWindowToLog('agentboard:1', tempDir, undefined, {})?.logPath
+    ).toBe(claudeLog)
+    expect(
+      tryExactMatchWindowToLog('agentboard:1', tempDir, undefined, { agentType: 'claude' })?.logPath
+    ).toBe(claudeLog)
+
+    // Once the codex log catches up, the codex window picks it over the claude log
+    const codexDir = path.join(tempDir, '.codex', 'sessions')
+    await fs.mkdir(codexDir, { recursive: true })
+    const codexLog = path.join(codexDir, 'rollout-codex.jsonl')
+    await fs.writeFile(codexLog, buildUserLogEntry(message))
+    expect(
+      tryExactMatchWindowToLog('agentboard:1', tempDir, undefined, { agentType: 'codex' })?.logPath
+    ).toBe(codexLog)
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('extractAskUserQuestionAnswers parses recap lines and dedupes', () => {
+    const scrollback = [
+      '⏺ User answered Claude\'s questions:',
+      '  ⎿ \u00a0· First question here? → first answer',
+      '⏺ Working…',
+      '⏺ User answered Claude\'s questions:',
+      '  ⎿ \u00a0· First question here? → first answer',
+      '  ⎿ \u00a0· Second question? → second answer',
+      '  ⎿  == plain tool detail, not an answer',
+      '· a bullet without an arrow',
+      '· stray bullet → with arrow but no ⎿ prefix',
+      '❯ 1. An option (Recommended)',
+      'Enter to select · ↑/↓ to navigate · Esc to cancel',
+      '',
+    ].join('\n')
+    const answers = extractAskUserQuestionAnswers(scrollback)
+    expect(answers).toEqual([
+      { question: 'Second question?', answer: 'second answer' },
+      { question: 'First question here?', answer: 'first answer' },
+    ])
+  })
+
+  test('tryExactMatchWindowToLog matches a window parked on AskUserQuestion cards', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const pairs: Array<[string, string]> = [
+      ['Which identity provider signs staff in?', 'hmm we need mfa on each login?'],
+      ['Session duration?', '24 hours (Recommended)'],
+    ]
+    await fs.writeFile(
+      logPath,
+      pairs.map(([q, a]) => buildAskAnswerLogEntry(q, a)).join('\n')
+    )
+
+    // Screen shows only recap lines and an active card — no ❯ user prompt.
+    setTmuxOutput('agentboard:1', buildAskAnswerScrollback(pairs))
+
+    const result = tryExactMatchWindowToLog('agentboard:1', tempDir)
+    expect(result?.logPath).toBe(logPath)
+    expect(result?.matchedCount).toBe(2)
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog rejects a Q→A needle outside the tool_result envelope', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const pairs: Array<[string, string]> = [
+      ['Which identity provider signs staff in?', 'hmm we need mfa on each login?'],
+    ]
+    // The "Q"="A" fragment appears verbatim, but as a plain user text message —
+    // not inside an AskUserQuestion tool_result envelope.
+    await fs.writeFile(
+      logPath,
+      buildUserLogEntry(
+        `Your questions have been answered: "${pairs[0][0]}"="${pairs[0][1]}".`
+      )
+    )
+    setTmuxOutput('agentboard:1', buildAskAnswerScrollback(pairs))
+
+    expect(tryExactMatchWindowToLog('agentboard:1', tempDir)).toBeNull()
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog returns null when two logs tie on the same answers', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPathA = path.join(tempDir, 'session-a.jsonl')
+    const logPathB = path.join(tempDir, 'session-b.jsonl')
+    const pairs: Array<[string, string]> = [
+      ['Which identity provider signs staff in?', 'hmm we need mfa on each login?'],
+    ]
+    const body = buildAskAnswerLogEntry(pairs[0][0], pairs[0][1])
+    await fs.writeFile(logPathA, body)
+    await fs.writeFile(logPathB, body)
+    setTmuxOutput('agentboard:1', buildAskAnswerScrollback(pairs))
+
+    expect(tryExactMatchWindowToLog('agentboard:1', tempDir)).toBeNull()
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog does not mark an answer-rich window as no-message', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPath = path.join(tempDir, 'unrelated.jsonl')
+    await fs.writeFile(logPath, buildUserLogEntry('completely different session'))
+    const pairs: Array<[string, string]> = [
+      ['Which identity provider signs staff in?', 'hmm we need mfa on each login?'],
+    ]
+    setTmuxOutput('agentboard:1', buildAskAnswerScrollback(pairs))
+
+    const noMessageWindows = new Set<string>()
+    const result = tryExactMatchWindowToLog(
+      'agentboard:1',
+      tempDir,
+      undefined,
+      {},
+      {},
+      noMessageWindows
+    )
+    expect(result).toBeNull()
+    expect(noMessageWindows.size).toBe(0)
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('getLogTokenCount survives a single message line larger than the tail read window', async () => {
+    // A 150KB+ pasted message followed by its item_completed echo: the 200KB
+    // tail slice starts mid-way through the paste line, so the tail parse sees
+    // only an unparseable fragment plus a non-message event.
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPath = path.join(tempDir, 'rollout.jsonl')
+    const hugeText = 'pasted transcript line\n'.repeat(8000)
+    const userLine = JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: hugeText }],
+      },
+    })
+    const echoLine = JSON.stringify({
+      type: 'event_msg',
+      payload: { type: 'item_completed', item: { type: 'user_message', text: hugeText } },
+    })
+    expect(userLine.length).toBeGreaterThan(150 * 1024)
+    await fs.writeFile(
+      logPath,
+      [JSON.stringify({ type: 'session_meta', payload: { id: 'x' } }), userLine, echoLine].join('\n')
+    )
+    expect(getLogTokenCount(logPath)).toBeGreaterThan(0)
+
+    const emptyPath = path.join(tempDir, 'empty.jsonl')
+    await fs.writeFile(emptyPath, JSON.stringify({ type: 'session_meta', payload: { id: 'y' } }))
+    expect(getLogTokenCount(emptyPath)).toBe(0)
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog falls back to trace lines and skips subagents', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPathMain = path.join(tempDir, 'session-main.jsonl')
+    const logPathSub = path.join(tempDir, 'session-sub.jsonl')
+    const traceLine =
+      'The new last-user-message feature can get stuck showing stale values because log updates are ignored once a message is set.'
+
+    await fs.writeFile(
+      logPathMain,
+      [
+        JSON.stringify({ type: 'session_meta', payload: { source: 'cli' } }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'agent_reasoning', text: traceLine },
+        }),
+      ].join('\n')
+    )
+    await fs.writeFile(
+      logPathSub,
+      [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { source: { subagent: 'review' } },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'agent_reasoning', text: traceLine },
+        }),
+      ].join('\n')
+    )
+
+    setTmuxOutput('agentboard:1', CODEX_REVIEW_SCROLLBACK)
+
+    const result = tryExactMatchWindowToLog('agentboard:1', tempDir)
+    expect(result?.logPath).toBe(logPathMain)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('matchWindowsToLogsByExactRg returns unique matches', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const logPathA = path.join(tempDir, 'session-a.jsonl')
+    const logPathB = path.join(tempDir, 'session-b.jsonl')
+    const messagesA = ['alpha one', 'alpha two']
+    const messagesB = ['beta one', 'beta two']
+
+    await fs.writeFile(
+      logPathA,
+      messagesA.map((message) => buildUserLogEntry(message)).join('\n')
+    )
+    await fs.writeFile(
+      logPathB,
+      messagesB.map((message) => buildUserLogEntry(message)).join('\n')
+    )
+
+    const windows: Session[] = [
+      {
+        id: 'window-1',
+        name: 'alpha',
+        tmuxWindow: 'agentboard:1',
+        projectPath: '/tmp/alpha',
+        status: 'waiting',
+        lastActivity: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        source: 'managed',
+      },
+      {
+        id: 'window-2',
+        name: 'beta',
+        tmuxWindow: 'agentboard:2',
+        projectPath: '/tmp/beta',
+        status: 'waiting',
+        lastActivity: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        source: 'managed',
+      },
+    ]
+
+    setTmuxOutput('agentboard:1', buildPromptScrollback(messagesA))
+    setTmuxOutput('agentboard:2', buildPromptScrollback(messagesB))
+
+    const { matches: results } = matchWindowsToLogsByExactRg(windows, tempDir)
+    expect(results.get(logPathA)?.tmuxWindow).toBe('agentboard:1')
+    expect(results.get(logPathB)?.tmuxWindow).toBe('agentboard:2')
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('matchWindowsToLogsByExactRg never swaps a claude and a codex window sharing a prompt', async () => {
+    // Incident replay: same prompt in a claude window (pane shows the collapsed
+    // paste placeholder, which is in no log) and a codex window (pane shows the
+    // raw paste). Phase 1: only the claude log has flushed. Phase 2: both have.
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-logmatch-'))
+    const claudeDir = path.join(tempDir, '.claude', 'projects', 'proj')
+    const codexDir = path.join(tempDir, '.codex', 'sessions')
+    await fs.mkdir(claudeDir, { recursive: true })
+    await fs.mkdir(codexDir, { recursive: true })
+    const claudeLog = path.join(claudeDir, 'claude-session.jsonl')
+    const codexLog = path.join(codexDir, 'rollout-codex.jsonl')
+    const paste = 'Look at this slack convo and tell me what our product should focus on'
+
+    const base = {
+      projectPath: '/tmp/proj',
+      status: 'waiting' as const,
+      lastActivity: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      source: 'managed' as const,
+    }
+    const windows: Session[] = [
+      { ...base, id: 'w-claude', name: 'claude-win', tmuxWindow: 'agentboard:1', agentType: 'claude' },
+      { ...base, id: 'w-codex', name: 'codex-win', tmuxWindow: 'agentboard:2', agentType: 'codex' },
+    ]
+    setTmuxOutput('agentboard:1', buildPromptScrollback(['[Pasted text #1 +400 lines]']))
+    setTmuxOutput('agentboard:2', buildPromptScrollback([paste]))
+
+    // Phase 1: claude log flushed first
+    await fs.writeFile(claudeLog, buildUserLogEntry(paste))
+    let { matches } = matchWindowsToLogsByExactRg(windows, tempDir)
+    expect(matches.size).toBe(0)
+
+    // Phase 2: codex log catches up
+    await fs.writeFile(codexLog, buildUserLogEntry(paste))
+    ;({ matches } = matchWindowsToLogsByExactRg(windows, tempDir))
+    expect(matches.get(codexLog)?.tmuxWindow).toBe('agentboard:2')
+    expect(matches.has(claudeLog)).toBe(false)
+
+    const asyncResult = await matchWindowsToLogsByExactRgAsync(windows, tempDir)
+    expect(asyncResult.matches.get(codexLog)?.tmuxWindow).toBe('agentboard:2')
+    expect(asyncResult.matches.has(claudeLog)).toBe(false)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('matchWindowsToLogsByExactRg returns noMessageWindows for empty terminals', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-nomsg-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const messages = ['gamma one', 'gamma two']
+
+    await fs.writeFile(
+      logPath,
+      messages.map((message) => buildUserLogEntry(message)).join('\n')
+    )
+
+    const windows: Session[] = [
+      {
+        id: 'window-empty',
+        name: 'booting',
+        tmuxWindow: 'agentboard:3',
+        projectPath: '/tmp/booting',
+        status: 'unknown',
+        lastActivity: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        source: 'managed',
+      },
+      {
+        id: 'window-content',
+        name: 'gamma',
+        tmuxWindow: 'agentboard:4',
+        projectPath: '/tmp/gamma',
+        status: 'waiting',
+        lastActivity: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        source: 'managed',
+      },
+    ]
+
+    // Empty terminal: no user messages and no trace lines
+    setTmuxOutput('agentboard:3', '')
+    // Window with real content that matches the log
+    setTmuxOutput('agentboard:4', buildPromptScrollback(messages))
+
+    const { matches: results, noMessageWindows } = matchWindowsToLogsByExactRg(
+      windows,
+      tempDir
+    )
+
+    // The empty window should be in noMessageWindows
+    expect(noMessageWindows.has('agentboard:3')).toBe(true)
+    // The content window should NOT be in noMessageWindows
+    expect(noMessageWindows.has('agentboard:4')).toBe(false)
+    // The content window should still match its log
+    expect(results.get(logPath)?.tmuxWindow).toBe('agentboard:4')
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('matchWindowsToLogsByExactRgAsync returns noMessageWindows (parity with sync)', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-async-nomsg-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const messages = ['delta one', 'delta two']
+
+    await fs.writeFile(
+      logPath,
+      messages.map((message) => buildUserLogEntry(message)).join('\n')
+    )
+
+    const windows: Session[] = [
+      {
+        id: 'window-empty-async',
+        name: 'booting-async',
+        tmuxWindow: 'agentboard:5',
+        projectPath: '/tmp/booting-async',
+        status: 'unknown',
+        lastActivity: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        source: 'managed',
+      },
+      {
+        id: 'window-content-async',
+        name: 'delta',
+        tmuxWindow: 'agentboard:6',
+        projectPath: '/tmp/delta',
+        status: 'waiting',
+        lastActivity: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        source: 'managed',
+      },
+    ]
+
+    setTmuxOutput('agentboard:5', '')
+    setTmuxOutput('agentboard:6', buildPromptScrollback(messages))
+
+    const { matches: results, noMessageWindows } =
+      await matchWindowsToLogsByExactRgAsync(windows, tempDir)
+
+    expect(noMessageWindows.has('agentboard:5')).toBe(true)
+    expect(noMessageWindows.has('agentboard:6')).toBe(false)
+    expect(results.get(logPath)?.tmuxWindow).toBe('agentboard:6')
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('verifyWindowLogAssociation returns true when content matches', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-verify-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const messages = ['verify test one', 'verify test two']
+
+    await fs.writeFile(
+      logPath,
+      messages.map((m) => buildUserLogEntry(m)).join('\n')
+    )
+    setTmuxOutput('agentboard:1', buildPromptScrollback(messages))
+
+    const result = verifyWindowLogAssociation('agentboard:1', logPath, [tempDir], {})
+    expect(result).toBe(true)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('verifyWindowLogAssociation returns false when content does not match', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-verify-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+
+    // Log has different content than the tmux window
+    await fs.writeFile(
+      logPath,
+      buildUserLogEntry('log content here')
+    )
+    setTmuxOutput('agentboard:1', buildPromptScrollback(['different window content']))
+
+    const result = verifyWindowLogAssociation('agentboard:1', logPath, [tempDir], {})
+    expect(result).toBe(false)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('verifyWindowLogAssociation returns false for empty terminal', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-verify-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+
+    await fs.writeFile(
+      logPath,
+      buildUserLogEntry('some content')
+    )
+    setTmuxOutput('agentboard:1', '') // Empty terminal
+
+    const result = verifyWindowLogAssociation('agentboard:1', logPath, [tempDir], {})
+    expect(result).toBe(false)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('verifyWindowLogAssociationDetailedAsync returns verified when content matches', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-verify-async-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const messages = ['verify async one', 'verify async two']
+
+    await fs.writeFile(
+      logPath,
+      messages.map((m) => buildUserLogEntry(m)).join('\n')
+    )
+    setTmuxOutput('agentboard:1', buildPromptScrollback(messages))
+
+    const result = await verifyWindowLogAssociationDetailedAsync(
+      'agentboard:1',
+      logPath,
+      [tempDir],
+      {}
+    )
+    expect(result.status).toBe('verified')
+    expect(result.bestMatch?.logPath).toBe(logPath)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('verifyWindowLogAssociationDetailedAsync returns mismatch when another log is best match', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-verify-async-'))
+    const expectedLog = path.join(tempDir, 'expected.jsonl')
+    const otherLog = path.join(tempDir, 'other.jsonl')
+    const expectedMessages = ['alpha one', 'alpha two']
+    const otherMessages = ['beta one', 'beta two']
+
+    await fs.writeFile(
+      expectedLog,
+      expectedMessages.map((m) => buildUserLogEntry(m)).join('\n')
+    )
+    await fs.writeFile(
+      otherLog,
+      otherMessages.map((m) => buildUserLogEntry(m)).join('\n')
+    )
+    setTmuxOutput('agentboard:1', buildPromptScrollback(otherMessages))
+
+    const result = await verifyWindowLogAssociationDetailedAsync(
+      'agentboard:1',
+      expectedLog,
+      [tempDir],
+      {}
+    )
+    expect(result.status).toBe('mismatch')
+    expect(result.bestMatch?.logPath).toBe(otherLog)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('verifyWindowsBatch matches per-window verification verdicts', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-verify-batch-'))
+    const logA = path.join(tempDir, 'session-a.jsonl')
+    const logB = path.join(tempDir, 'session-b.jsonl')
+    const logC = path.join(tempDir, 'session-c.jsonl')
+    const msgA1 = 'alpha deploy the staging build please'
+    const msgA2 = 'alpha second instruction here'
+    const msgB1 = 'beta rotate the api keys now'
+
+    await fs.writeFile(
+      logA,
+      [buildUserLogEntry(msgA1), buildUserLogEntry(msgA2)].join('\n')
+    )
+    await fs.writeFile(logB, buildUserLogEntry(msgB1))
+    // msgA1 echoed inside a tool_result — rg -l hits it but it is not a valid
+    // user context, so the batch scan must reject it the same way.
+    await fs.writeFile(logC, buildAskAnswerLogEntry('which env?', msgA1))
+
+    setTmuxOutput('agentboard:1', buildPromptScrollback([msgA1, msgA2]))
+    setTmuxOutput(
+      'agentboard:2',
+      buildPromptScrollback([msgB1], { glyph: '›' })
+    )
+    setTmuxOutput('agentboard:3', 'no prompts here\n')
+
+    const jobs = [
+      // exact expected match
+      { sessionId: 's1', tmuxWindow: 'agentboard:1', expectedLogPath: logA, context: {}, excludeLogPaths: [] },
+      // codex glyph window
+      { sessionId: 's2', tmuxWindow: 'agentboard:2', expectedLogPath: logB, context: {}, excludeLogPaths: [] },
+      // window matches a different log than expected
+      { sessionId: 's3', tmuxWindow: 'agentboard:1', expectedLogPath: logB, context: {}, excludeLogPaths: [] },
+      // no extractable messages
+      { sessionId: 's4', tmuxWindow: 'agentboard:3', expectedLogPath: logA, context: {}, excludeLogPaths: [] },
+      // exclusion is fail-open: filtering out logA leaves nothing, so logA
+      // still wins and the expected logC reads as a mismatch
+      { sessionId: 's5', tmuxWindow: 'agentboard:1', expectedLogPath: logC, context: {}, excludeLogPaths: [logA] },
+    ]
+
+    commandCalls.length = 0
+    const batched = verifyWindowsBatch(jobs, [tempDir])
+    const batchRgListCalls = commandCalls.filter(
+      (call) => call[0] === 'rg' && call.includes('-l')
+    ).length
+
+    for (const job of jobs) {
+      const single = verifyWindowLogAssociationDetailed(
+        job.tmuxWindow,
+        job.expectedLogPath,
+        [tempDir],
+        { context: job.context, excludeLogPaths: job.excludeLogPaths }
+      )
+      const batchResult = batched.get(job.sessionId)
+      expect(batchResult?.status).toBe(single.status)
+      expect(batchResult?.bestMatch?.logPath ?? null).toBe(
+        single.bestMatch?.logPath ?? null
+      )
+    }
+
+    expect(batched.get('s1')?.status).toBe('verified')
+    expect(batched.get('s2')?.status).toBe('verified')
+    expect(batched.get('s3')?.status).toBe('mismatch')
+    expect(batched.get('s3')?.bestMatch?.logPath).toBe(logA)
+    expect(batched.get('s4')?.status).toBe('inconclusive')
+    expect(batched.get('s5')?.status).toBe('mismatch')
+    expect(batched.get('s5')?.bestMatch?.logPath).toBe(logA)
+
+    // One rg -l pass per directory for the whole batch, not one per message.
+    // (The per-window parity calls above each run their own scans.)
+    expect(batchRgListCalls).toBe(1)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('verifyWindowsBatch matches per-window when a jumbo final line swallows the initial tail', async () => {
+    // The valid user entry sits before a >96KB single-line tool_result, so the
+    // progressive 96KB tail read lands entirely inside it and returns empty.
+    // Both paths must agree — the batch reads 2MB once; the per-window path
+    // expands past the empty window.
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-jumbo-tail-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const message = 'prompt before the jumbo trailer here'
+    const jumboToolResult = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', content: 'x'.repeat(150 * 1024) }],
+      },
+    })
+    await fs.writeFile(
+      logPath,
+      [buildUserLogEntry(message), jumboToolResult].join('\n') + '\n'
+    )
+    setTmuxOutput('agentboard:1', buildPromptScrollback([message]))
+
+    const single = verifyWindowLogAssociationDetailed(
+      'agentboard:1',
+      logPath,
+      [tempDir],
+      {}
+    )
+    const batched = verifyWindowsBatch(
+      [
+        {
+          sessionId: 's1',
+          tmuxWindow: 'agentboard:1',
+          expectedLogPath: logPath,
+          context: {},
+          excludeLogPaths: [],
+        },
+      ],
+      [tempDir]
+    )
+    expect(single.status).toBe('verified')
+    expect(batched.get('s1')?.status).toBe(single.status)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog matches messages with JSON-escaped quotes', async () => {
+    // Regression test: terminal shows "working" but log has \"working\" (JSON-escaped)
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-quotes-'))
+    const logPath = path.join(tempDir, 'session.jsonl')
+    const messageWithQuotes = 'why is it appearing as "working" in the UI?'
+
+    // JSON.stringify escapes quotes as \" in the log file
+    await fs.writeFile(
+      logPath,
+      buildUserLogEntry(messageWithQuotes)
+    )
+    // Terminal shows unescaped quotes
+    setTmuxOutput('agentboard:1', buildPromptScrollback([messageWithQuotes]))
+
+    const result = tryExactMatchWindowToLog('agentboard:1', tempDir)
+    expect(result?.logPath).toBe(logPath)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+})
+
+// Regression test fixtures from real tmux sessions
+// Codex session after running /review command - no visible user prompt (swallowed by slash command)
+const CODEX_REVIEW_SCROLLBACK = `• Explored
+  └ Read logPoller.ts
+
+• The update code sets lastUserMessage only if missing or a tool notification.
+
+• Explored
+  └ Read SessionList.tsx
+
+• I'm verifying that lastUserMessage updates correctly.
+
+  Identifying stale lastUserMessage update bug
+
+  I found that logPoller only updates lastUserMessage when the existing message is missing.
+
+<< Code review finished >>
+
+─ Worked for 12m 25s ─────────────────────────────────────────────────────────
+
+• The new last-user-message feature can get stuck showing stale values because log updates are ignored once a message is set.
+
+  Review comment:
+
+  - [P2] Update lastUserMessage when newer log input arrives
+    The log poller only writes lastUserMessage when the stored value is empty.
+
+
+› Find and fix a bug in @filename
+
+  100% context left · ? for shortcuts
+`
+
+// Claude session with submitted prompt and assistant response, plus pending input
+const CLAUDE_PROMPT_SCROLLBACK = `  Right now it's reading every file every poll cycle just to throw away the data.
+
+✻ Brewed for 33s
+
+❯ yes create a test and then fix it
+
+⏺ I'll create a test first to verify the optimization, then fix the code. Let me start by understanding the test structure.
+
+⏺ Read(src/server/__tests__/logPollData.test.ts)
+  ⎿  Read 139 lines
+
+⏺ Read(src/server/__tests__/logPoller.test.ts)
+  ⎿  Read 345 lines
+
+⏺ Now I understand the full flow. Let me write a test and then fix the code.
+
+⏺ Update(src/server/__tests__/logPoller.test.ts)
+  ⎿  Added 57 lines
+
+────────────────────────────────────────────────────────────────────────────────
+❯ commit these changes                                                   ↵ send
+────────────────────────────────────────────────────────────────────────────────
+  Opus 4.5 in agentboard on master [20%]
+  ⏵⏵ accept edits on (shift+tab to cycle)
+`
+
+describe('message extraction regression tests', () => {
+  test('Codex /review: returns empty userMessages when prompt is swallowed', () => {
+    const userMessages = extractRecentUserMessagesFromTmux(CODEX_REVIEW_SCROLLBACK)
+    // The only › line is a UI tip in the input field, not a real user message
+    expect(userMessages).toEqual([])
+  })
+
+  test('Pi TUI: extracts user messages from background color', () => {
+    // Pi uses RGB(52,53,65) background for user messages
+    // Using \x1b for ESC character
+    const ESC = '\x1b'
+    const piScrollback = `
+${ESC}[38;2;129;162;190m─────────────────────────────────────────────────────────────────────────────────
+${ESC}[48;2;52;53;65m
+ hello world
+
+
+${ESC}[49m Hello! How can I help?
+${ESC}[38;2;129;162;190m─────────────────────────────────────────────────────────────────────────────────
+`
+    const messages = extractPiUserMessagesFromAnsi(piScrollback)
+    expect(messages).toContain('hello world')
+  })
+
+  test('Pi TUI: extracts multiple user messages', () => {
+    const ESC = '\x1b'
+    const piScrollback = `
+${ESC}[48;2;52;53;65m first message ${ESC}[49m Response 1
+${ESC}[48;2;52;53;65m second message ${ESC}[49m Response 2
+`
+    const messages = extractPiUserMessagesFromAnsi(piScrollback)
+    expect(messages).toHaveLength(2)
+    // Most recent first
+    expect(messages[0]).toBe('second message')
+    expect(messages[1]).toBe('first message')
+  })
+
+  test('Pi TUI: returns empty array for non-pi content', () => {
+    const claudeScrollback = '❯ hello world'
+    const messages = extractPiUserMessagesFromAnsi(claudeScrollback)
+    expect(messages).toEqual([])
+  })
+
+  test('Codex /review: extracts trace lines for fallback', () => {
+    const traces = extractRecentTraceLinesFromTmux(CODEX_REVIEW_SCROLLBACK)
+    expect(traces).toContain(
+      'The new last-user-message feature can get stuck showing stale values because log updates are ignored once a message is set.'
+    )
+  })
+
+  test('Omp TUI: extracts tool box rows and check rows for fallback', () => {
+    const ESC = '\x1b'
+    const ompScrollback = `
+ Run the bash command: echo hello-omp — then tell me what it printed.
+ ${ESC}[38;2;118;118;118m${ESC}[48;2;232;240;232m┌───${ESC}[39m ${ESC}[38;2;88;132;88m✔${ESC}[39m ${ESC}[38;2;90;128;128mBash${ESC}[39m ──────────────────────────
+ ${ESC}[38;2;118;118;118m${ESC}[48;2;232;240;232m│ $ ${ESC}[38;2;121;94;38mecho hello-omp${ESC}[39m
+ ${ESC}[38;2;118;118;118m${ESC}[48;2;232;240;232m├───${ESC}[39m Output ──────────────────
+ ${ESC}[38;2;118;118;118m${ESC}[48;2;232;240;232m│ ${ESC}[38;2;108;108;108mhello-omp${ESC}[39m
+ ${ESC}[38;2;118;118;118m${ESC}[48;2;232;240;232m│ ⟦Wall: 0.03s | Timeout: 300s⟧${ESC}[39m
+ ${ESC}[38;2;118;118;118m${ESC}[48;2;232;240;232m└──────────────────────────────
+ ${ESC}[38;2;88;132;88m✔${ESC}[39m ${ESC}[1mRead${ESC}[0m ${ESC}[38;2;90;128;128m/tmp/omp-proj${ESC}[39m
+╭── π  > ⬢ Codex Auto Review > 🗑 omp-proj > ◫ 14.7% ⟲ ▶──╮
+╰─                                                        ─╯`
+    const traces = extractRecentTraceLinesFromTmux(ompScrollback)
+    expect(traces).toContain('echo hello-omp')
+    expect(traces).toContain('hello-omp')
+    expect(traces).toContain('/tmp/omp-proj')
+    // Timing metadata and box decorations are not searchable needles
+    expect(traces.some((t) => t.includes('⟦'))).toBe(false)
+    expect(traces.some((t) => t.includes('│'))).toBe(false)
+  })
+
+  test('Omp TUI: bare user message lines are not extracted as traces', () => {
+    const traces = extractRecentTraceLinesFromTmux(
+      ' Run the bash command: echo hello-omp\n ✔ Bash\n'
+    )
+    // The bare prose line has no marker and is skipped; `✔ Bash` has no arg.
+    expect(traces).toEqual([])
+  })
+
+  test('Claude: returns submitted userMessages, not pending', () => {
+    const userMessages = extractRecentUserMessagesFromTmux(CLAUDE_PROMPT_SCROLLBACK)
+    // Should find the submitted message
+    expect(userMessages).toContain('yes create a test and then fix it')
+    // Should NOT include the pending message (has ↵ send indicator)
+    expect(userMessages).not.toContain('commit these changes')
+  })
+
+  test('Claude: skips AskUserQuestion option lines with ❯ selector', () => {
+    const scrollback = `❯ before implementing the feature, let me ask some questions
+
+⏺ Great idea. Let me ask a few questions to narrow this down.
+
+─────────────────────────────────────────────────────────────────────────
+←  ☒ Audience  ☐ Format  ☐ Granularity  ✔ Submit  →
+
+What's the primary audience for this deliverable?
+
+❯ 1. Just us (dev alignment) ✔
+     You and I use it to validate the flow.
+  2. Internal team / stakeholders
+     Something you could share with teammates.
+  3. Demo rehearsal tool
+     A presenter could walk through it.
+  4. Type something.
+─────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    // Should NOT include the AskUserQuestion option
+    expect(userMessages).not.toContainEqual(
+      expect.stringContaining('Just us')
+    )
+    // Should find the real user message
+    expect(userMessages).toContain(
+      'before implementing the feature, let me ask some questions'
+    )
+  })
+
+  test('Codex: skips request_user_input option lines with › selector', () => {
+    // Matches actual Codex TUI rendering from snapshot tests:
+    // - Uses › (not ❯) for selected option
+    // - Footer: "tab to add notes | enter to submit answer | esc to interrupt"
+    // - Options show "N. Label  Description" in two columns
+    const scrollback = `› implement the auth module
+
+⏺ Let me ask about the requirements first.
+
+  Question 1/1 (1 unanswered)
+  Which auth strategy?
+
+  › 1. OAuth 2.0 with PKCE      Recommended for SPAs and mobile apps.
+    2. Session-based JWT          Simpler but less secure for public clients.
+    3. API key auth               For internal services only.
+
+  tab to add notes | enter to submit answer | esc to interrupt`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContainEqual(
+      expect.stringContaining('OAuth')
+    )
+    expect(userMessages).toContain('implement the auth module')
+  })
+
+  test('Grok: strips right-aligned clock suffix from submitted prompt', () => {
+    const scrollback = `❯ say hello and list files in this directory, then stop     3:21 PM
+
+● Ran list_dir`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).toContain('say hello and list files in this directory, then stop')
+  })
+
+  test('does NOT strip a prompt that itself ends in a time', () => {
+    const scrollback = `❯ remind me at 3:30 PM
+
+⏺ Sure.`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).toContain('remind me at 3:30 PM')
+  })
+
+  test('does NOT false-positive on user messages that start with numbers', () => {
+    const scrollback = `❯ 3. fix the validation logic in handleSubmit
+
+⏺ I'll fix the validation logic now. Let me read the file first.
+
+⏺ Read(src/handlers.ts)
+  ⎿  Read 200 lines`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    // Should include the numbered user message — no sibling numbered items nearby
+    expect(userMessages).toContain('3. fix the validation logic in handleSubmit')
+  })
+
+  test('does NOT false-positive when numbered list is far away in assistant output', () => {
+    const scrollback = `❯ 1. rename the field to camelCase
+
+⏺ Done. Here's what I changed:
+
+  1. Updated the schema
+  2. Updated the handler
+  3. Updated the tests
+
+✻ Brewed for 5s
+
+❯ looks good, ship it`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    // "1. rename..." has numbered siblings in the assistant output, but they're
+    // more than 6 lines away. Only "looks good, ship it" should be first.
+    expect(userMessages[0]).toBe('looks good, ship it')
+    // "1. rename..." is also a valid user message (numbered siblings are far away)
+    expect(userMessages).toContain('1. rename the field to camelCase')
+  })
+
+  test('handles AskUserQuestion with only two options', () => {
+    const scrollback = `❯ should we proceed?
+
+⏺ Let me confirm.
+
+Continue with the refactor?
+
+❯ 1. Yes, proceed
+  2. No, cancel
+
+Enter to select · Esc to cancel`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContainEqual(
+      expect.stringContaining('Yes, proceed')
+    )
+    expect(userMessages).toContain('should we proceed?')
+  })
+
+  test('does NOT false-positive when assistant prose contains "Enter to select"', () => {
+    const scrollback = `❯ 1. Do this thing
+
+⏺ Sure — press Enter to select the template you want to use.`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    // The ⏺ boundary should stop the "Enter to select" scan
+    expect(userMessages).toContain('1. Do this thing')
+  })
+
+  test('detects AskUserQuestion when selected option is last (siblings above)', () => {
+    const scrollback = `❯ pick a strategy
+
+⏺ Let me ask.
+
+Which approach?
+
+  1. Fast
+  2. Thorough
+❯ 3. Balanced
+
+Enter to select · Esc to cancel`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContainEqual(
+      expect.stringContaining('Balanced')
+    )
+    expect(userMessages).toContain('pick a strategy')
+  })
+
+  test('detects AskUserQuestion with multi-line option descriptions', () => {
+    const scrollback = `❯ what format?
+
+⏺ Let me ask.
+
+❯ 1. ASCII storyboard
+     Markdown file with dual-panel ASCII art.
+     Lightweight and easy to annotate.
+  2. HTML clickthrough
+     Single HTML file with screens.
+
+Enter to select · Esc to cancel`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContainEqual(
+      expect.stringContaining('ASCII storyboard')
+    )
+    expect(userMessages).toContain('what format?')
+  })
+
+  test('does NOT drop a real multiline numbered user message (pasted)', () => {
+    const scrollback = `❯ 1. Audit auth flow
+  2. Fix validation
+  3. Add regression tests
+
+⏺ Sounds good. I'll start with the auth audit.`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    // The ⏺ after the block proves this was a submitted message, not AskUserQuestion
+    expect(userMessages).toContain('1. Audit auth flow')
+  })
+
+  test('Codex: skips suggested message in idle input field with "N% left" status', () => {
+    // Codex shows a suggested next message in the input field when idle.
+    // The status line below uses "N% left" without the word "context".
+    const scrollback = `› is there any benefit for Effect on client side
+
+⏺ Yes, but mostly for client workflows, not for rendering itself.
+
+› Explain this codebase
+
+  gpt-5.4 xhigh fast · 68% left · ~/Documents/GitHub/usonia`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    // Should NOT include the suggested message in the input field
+    expect(userMessages).not.toContain('Explain this codebase')
+    // Should find the real submitted message
+    expect(userMessages).toContain(
+      'is there any benefit for Effect on client side'
+    )
+  })
+
+  test('Codex: skips suggested message in idle input field without "N% left"', () => {
+    // Codex may omit the "N% left" portion from the status line,
+    // showing only "model config · ~/path".
+    const scrollback = `› should we restart windowserver to see if that helps
+
+⏺ I would not restart WindowServer first.
+
+› Run /review on my current changes
+
+  gpt-5.4 xhigh fast · ~/Documents/GitHub`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContain('Run /review on my current changes')
+    expect(userMessages).toContain(
+      'should we restart windowserver to see if that helps'
+    )
+  })
+
+  test('Codex: skips suggested message with model-only status line (no path)', () => {
+    // Custom /statusline config: model + git branch, no CurrentDir
+    const scrollback = `› fix the flaky test
+
+⏺ Done — the race condition is resolved.
+
+› Refactor the auth module
+
+  gpt-5.4 xhigh fast · main`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContain('Refactor the auth module')
+    expect(userMessages).toContain('fix the flaky test')
+  })
+
+  test('Codex: skips suggested message with path-first status line', () => {
+    // Custom /statusline config: current-dir comes before other items
+    const scrollback = `› deploy to staging
+
+⏺ Deployed.
+
+› Check the CI pipeline
+
+  ~/projects/myapp · main`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContain('Check the CI pipeline')
+    expect(userMessages).toContain('deploy to staging')
+  })
+
+  test('does not false-positive when assistant output resembles a status line', () => {
+    // If the assistant response contains text that looks like a Codex status
+    // line (e.g., "~/repo · main"), the submitted user message above must NOT
+    // be filtered out. The ⏺ marker between prompt and status-like text proves
+    // the prompt was submitted.
+    const scrollback = `› explain the status line
+
+⏺ Example:
+  ~/projects/myapp · main
+
+› another real question
+
+⏺ Sure, here's the answer.`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).toContain('explain the status line')
+    expect(userMessages).toContain('another real question')
+  })
+
+  test('does not false-positive when assistant mentions a model name with middle dot', () => {
+    const scrollback = `› what model are you using
+
+⏺ I'm running:
+  gpt-5.4 xhigh fast · with streaming enabled`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).toContain('what model are you using')
+  })
+
+  test('assistant output with ⏺ on same line as status-like text is not idle', () => {
+    // The ⏺ marker must take precedence over status-line heuristics
+    // even when both appear on the same scanned line.
+    const scrollback = `› show me the config
+
+⏺ gpt-5.4 xhigh fast · main`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).toContain('show me the config')
+  })
+
+  test('Codex: skips suggested message with unhyphenated model name (o3)', () => {
+    // Model names like "o3" have no hyphen after the prefix
+    const scrollback = `› fix the tests
+
+⏺ All tests pass now.
+
+› Add error handling for edge cases
+
+  o3 · main`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContain('Add error handling for edge cases')
+    expect(userMessages).toContain('fix the tests')
+  })
+
+  test('Claude: skips idle input above box-drawing separator', () => {
+    // Claude Code draws ─────── as the input field border. Any prompt
+    // at the bottom of the scrollback above this separator is the idle
+    // input field, not a submitted user message.
+    const scrollback = `❯ yea do it
+
+⏺ Pushed. Two commits landed:
+
+❯
+───────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).toContain('yea do it')
+    // The empty idle prompt should not produce a message
+    expect(userMessages).toHaveLength(1)
+  })
+
+  test('Claude: skips any text in idle input above box separator', () => {
+    // Claude Code may display arbitrary hints (e.g. "Press up to edit
+    // queued messages") in the input field. The box separator below
+    // detects it structurally — no need to match specific hint text.
+    const scrollback = `❯ implement the plan
+
+⏺ Done. All tests pass.
+
+❯ Press up to edit queued messages
+───────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).not.toContain('Press up to edit queued messages')
+    expect(userMessages).toContain('implement the plan')
+  })
+
+  test('does not false-positive on ─── in chat history higher up', () => {
+    // A user might paste markdown tables or separators that contain ───.
+    // These should NOT cause the prompt above them to be filtered out.
+    const scrollback = `❯ here is my markdown table
+
+⏺ Got it, here's the formatted version:
+───────────────────────────────────────────────
+| col1 | col2 |
+───────────────────────────────────────────────
+
+❯ looks good, ship it
+
+⏺ Done.
+
+❯
+  claude-opus-4-6 · 42% context left · ~/project`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    // Both real user messages should be preserved
+    expect(userMessages).toContain('here is my markdown table')
+    expect(userMessages).toContain('looks good, ship it')
+  })
+
+  test('does not false-positive when submitted prompt + short response + separator near bottom', () => {
+    // A submitted message near the bottom with ─── below should NOT be
+    // treated as the idle input field when assistant output (⏺) intervenes.
+    const scrollback = `❯ summarize this
+
+⏺ Done.
+───────────────────────────────────────────────`
+
+    const userMessages = extractRecentUserMessagesFromTmux(scrollback)
+    expect(userMessages).toContain('summarize this')
+  })
+})
+
+describe('extractActionFromUserAction', () => {
+  test('extracts action from valid user_action XML', () => {
+    const xml = `<user_action>
+  <context>User initiated a review task.</context>
+  <action>review</action>
+  <results>Some review results here</results>
+</user_action>`
+    expect(extractActionFromUserAction(xml)).toBe('review')
+  })
+
+  test('extracts action with whitespace', () => {
+    const xml = '<user_action><action>  commit  </action></user_action>'
+    expect(extractActionFromUserAction(xml)).toBe('commit')
+  })
+
+  test('returns null for non-user_action text', () => {
+    expect(extractActionFromUserAction('hello world')).toBeNull()
+    expect(extractActionFromUserAction('<other_tag>content</other_tag>')).toBeNull()
+    expect(extractActionFromUserAction('')).toBeNull()
+  })
+
+  test('returns null when no action tag present', () => {
+    const xml = '<user_action><context>No action here</context></user_action>'
+    expect(extractActionFromUserAction(xml)).toBeNull()
+  })
+
+  test('handles case-insensitive matching', () => {
+    const xml = '<USER_ACTION><action>test</action></USER_ACTION>'
+    expect(extractActionFromUserAction(xml)).toBe('test')
+  })
+})
+
+describe('hasMessageInValidUserContext', () => {
+  describe('positive cases - should match', () => {
+    test('matches Claude format with "text" field', () => {
+      const claudeLog = '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"scaffold the xcode project"}]}}'
+      expect(hasMessageInValidUserContext(claudeLog, 'scaffold the xcode project')).toBe(true)
+    })
+
+    test('matches Claude format with direct "content" string (no tool_result)', () => {
+      const claudeLog = '{"type":"user","message":{"role":"user","content":"scaffold the xcode project"}}'
+      expect(hasMessageInValidUserContext(claudeLog, 'scaffold the xcode project')).toBe(true)
+    })
+
+    test('matches user message containing tool_result substring', () => {
+      const claudeLog =
+        '{"type":"user","message":{"role":"user","content":"please explain tool_result semantics"}}'
+      expect(hasMessageInValidUserContext(claudeLog, 'explain tool_result')).toBe(true)
+    })
+
+    test('matches Codex response_item format with "text" field', () => {
+      const codexLog = '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"help me debug this"}]}}'
+      expect(hasMessageInValidUserContext(codexLog, 'help me debug this')).toBe(true)
+    })
+
+    test('matches Codex event_msg format with "message" field', () => {
+      const codexLog = '{"type":"event_msg","payload":{"type":"user_message","message":"can you fix the bug"}}'
+      expect(hasMessageInValidUserContext(codexLog, 'can you fix the bug')).toBe(true)
+    })
+
+    test('matches Codex event_msg format with structured user message payload', () => {
+      const codexLog = JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: {
+            role: 'user',
+            content: [{ type: 'input_text', text: 'structured user payload text' }],
+          },
+        },
+      })
+      expect(hasMessageInValidUserContext(codexLog, 'structured user payload text')).toBe(true)
+    })
+
+    test('matches message with flexible whitespace', () => {
+      // Log has multiple spaces, pattern should still match
+      const logLine = '{"text":"hello    world"}'
+      expect(hasMessageInValidUserContext(logLine, 'hello world')).toBe(true)
+    })
+
+    test('matches message with escaped quotes in JSON', () => {
+      // JSON escapes quotes as \"
+      const logLine = '{"text":"why is it \\"working\\""}'
+      expect(hasMessageInValidUserContext(logLine, 'why is it "working"')).toBe(true)
+    })
+
+    test('matches message preceded by other content in same JSON string', () => {
+      const logLine = '{"text":"prefix content and the actual message here"}'
+      expect(hasMessageInValidUserContext(logLine, 'the actual message')).toBe(true)
+    })
+
+    test('matches when message contains special regex characters', () => {
+      const logLine = '{"text":"what does (foo|bar) mean?"}'
+      expect(hasMessageInValidUserContext(logLine, 'what does (foo|bar) mean?')).toBe(true)
+    })
+  })
+
+  describe('negative cases - should NOT match', () => {
+    test('does not match tool_result content field (terminal capture)', () => {
+      // This is a tool_result that captured terminal output
+      const toolResult = '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"123","type":"tool_result","content":"=== TERMINAL ===\\n❯ scaffold the xcode project"}]}}'
+      expect(hasMessageInValidUserContext(toolResult, 'scaffold the xcode project')).toBe(false)
+    })
+
+    test('does not match top-level toolUseResult content', () => {
+      const toolUseResult = JSON.stringify({
+        type: 'user',
+        toolUseResult: {
+          type: 'text',
+          file: {
+            content: '=== TERMINAL ===\n❯ scaffold the xcode project',
+            filePath: '/tmp/output.txt',
+            startLine: 1,
+            numLines: 2,
+            totalLines: 2,
+          },
+        },
+      })
+      expect(hasMessageInValidUserContext(toolUseResult, 'scaffold the xcode project')).toBe(false)
+    })
+
+    test('does not match Codex custom_tool_call_output content', () => {
+      const toolOutput = JSON.stringify({
+        type: 'event',
+        payload: {
+          type: 'custom_tool_call_output',
+          call_id: 'call_123',
+          output: '❯ implement the feature',
+        },
+      })
+      expect(hasMessageInValidUserContext(toolOutput, 'implement the feature')).toBe(false)
+    })
+
+    test('does not match message appearing outside JSON structure', () => {
+      const plainText = 'just some random text in a file'
+      expect(hasMessageInValidUserContext(plainText, 'random text')).toBe(false)
+    })
+
+    test('does not match message in wrong field name', () => {
+      const logLine = '{"data":"important data"}'
+      expect(hasMessageInValidUserContext(logLine, 'important data')).toBe(false)
+    })
+
+    test('does not match message in "description" field', () => {
+      const logLine = '{"description":"fix the bug please"}'
+      expect(hasMessageInValidUserContext(logLine, 'fix the bug')).toBe(false)
+    })
+  })
+
+  describe('edge cases', () => {
+    test('handles empty message', () => {
+      const logLine = '{"text":""}'
+      // Should not throw
+      expect(() => hasMessageInValidUserContext(logLine, '')).not.toThrow()
+    })
+
+    test('handles message with newlines (JSON-escaped)', () => {
+      // JSON newlines are \n in the string
+      const logLine = '{"text":"line one\\nline two"}'
+      expect(hasMessageInValidUserContext(logLine, 'line one')).toBe(true)
+    })
+
+    test('handles message that looks like JSON', () => {
+      // User actually typed something that looks like JSON
+      const logLine = '{"text":"set \\"text\\": \\"value\\""}'
+      expect(hasMessageInValidUserContext(logLine, 'set "text": "value"')).toBe(true)
+    })
+
+    test('handles unicode in message', () => {
+      const logLine = '{"text":"hello 世界 🌍"}'
+      expect(hasMessageInValidUserContext(logLine, 'hello 世界 🌍')).toBe(true)
+    })
+
+    test('works with multiline log content', () => {
+      const multilineLog = `{"type":"assistant","text":"some response"}
+{"type":"user","text":"user request"}
+{"type":"assistant","text":"another response"}`
+      expect(hasMessageInValidUserContext(multilineLog, 'user request')).toBe(true)
+    })
+  })
+
+  describe('userOnly option', () => {
+    test('matches user-role events with userOnly enabled', () => {
+      const claudeLog = '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"scaffold the project"}]}}'
+      expect(hasMessageInValidUserContext(claudeLog, 'scaffold the project', { userOnly: true })).toBe(true)
+    })
+
+    test('skips assistant-role events in normalized path with userOnly enabled', () => {
+      const assistantLog = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"scaffold the project"}]}}'
+      // With userOnly, the normalized path rejects assistant events.
+      // The hasMessageInParsedJson fallback still matches text/content fields,
+      // so the overall function still returns true (fallback is role-blind).
+      expect(hasMessageInValidUserContext(assistantLog, 'scaffold the project', { userOnly: true })).toBe(true)
+    })
+
+    test('matches any role without userOnly', () => {
+      const assistantLog = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"scaffold the project"}]}}'
+      expect(hasMessageInValidUserContext(assistantLog, 'scaffold the project')).toBe(true)
+    })
+
+    test('Codex user_message matches with userOnly', () => {
+      const codexLog = JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'fix the tests' },
+      })
+      expect(hasMessageInValidUserContext(codexLog, 'fix the tests', { userOnly: true })).toBe(true)
+    })
+  })
+})
+
+describe('integration: JSON field pattern filters terminal captures', () => {
+  test('tryExactMatchWindowToLog excludes logs with message only in tool_result', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-toolresult-'))
+
+    // Log A: has message as actual user message
+    const logPathA = path.join(tempDir, 'session-a.jsonl')
+    // Log B: has same message but only inside a tool_result (terminal capture)
+    const logPathB = path.join(tempDir, 'session-b.jsonl')
+
+    const userMessage = 'implement the feature'
+
+    // Log A: proper user message
+    await fs.writeFile(
+      logPathA,
+      JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: userMessage }] }
+      })
+    )
+
+    // Log B: message appears only in tool_result (terminal capture from another window)
+    await fs.writeFile(
+      logPathB,
+      JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{
+            tool_use_id: 'tool_123',
+            type: 'tool_result',
+            content: `=== TERMINAL CAPTURE ===\n❯ ${userMessage}\n⏺ Working on it...`
+          }]
+        }
+      })
+    )
+
+    setTmuxOutput('agentboard:1', buildPromptScrollback([userMessage]))
+
+    const result = tryExactMatchWindowToLog('agentboard:1', tempDir)
+    // Should match Log A (actual user message), not Log B (terminal capture)
+    expect(result?.logPath).toBe(logPathA)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('tryExactMatchWindowToLog matches correct log when both have message in different contexts', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-context-'))
+
+    const logPathCorrect = path.join(tempDir, 'correct.jsonl')
+    const logPathWrong = path.join(tempDir, 'wrong.jsonl')
+
+    const messages = ['first message', 'second message', 'third message']
+
+    // Correct log: has all messages as actual user messages
+    const correctLines = messages.map(msg =>
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: msg }] } })
+    )
+    await fs.writeFile(logPathCorrect, correctLines.join('\n'))
+
+    // Wrong log: has messages inside tool_result (captured terminal)
+    const wrongLine = JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          content: messages.map(m => `❯ ${m}`).join('\n')
+        }]
+      }
+    })
+    await fs.writeFile(logPathWrong, wrongLine)
+
+    setTmuxOutput('agentboard:1', buildPromptScrollback(messages))
+
+    const result = tryExactMatchWindowToLog('agentboard:1', tempDir)
+    expect(result?.logPath).toBe(logPathCorrect)
+
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+})
+
+describe('isToolNotificationText', () => {
+  describe('should filter (return true)', () => {
+    test('filters Codex CLI apply_patch warning', () => {
+      const warning = 'Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.'
+      expect(isToolNotificationText(warning)).toBe(true)
+    })
+
+    test('filters other tool warnings via exec_command', () => {
+      expect(isToolNotificationText('Warning: some_tool was requested via exec_command. Use the proper tool.')).toBe(true)
+    })
+
+    test('filters task notifications', () => {
+      expect(isToolNotificationText('<task-notification>Task completed</task-notification>')).toBe(true)
+    })
+
+    test('filters messages with task-id', () => {
+      expect(isToolNotificationText('Task <task-id>abc123</task-id> is running')).toBe(true)
+    })
+
+    test('filters messages with instructions tag', () => {
+      expect(isToolNotificationText('<instructions>Follow these steps</instructions>')).toBe(true)
+    })
+  })
+
+  describe('should NOT filter (return false)', () => {
+    test('allows normal user messages', () => {
+      expect(isToolNotificationText('Please fix the bug in the login form')).toBe(false)
+    })
+
+    test('allows messages mentioning warnings in conversation', () => {
+      expect(isToolNotificationText('I saw a warning in the console, can you help?')).toBe(false)
+    })
+
+    test('allows messages discussing exec_command', () => {
+      expect(isToolNotificationText('How do I use exec_command properly?')).toBe(false)
+    })
+
+    test('allows messages with Warning not at start', () => {
+      expect(isToolNotificationText('The compiler showed: Warning: unused variable')).toBe(false)
+    })
+
+    test('allows messages that mention apply_patch normally', () => {
+      expect(isToolNotificationText('Can you apply_patch to fix the issue?')).toBe(false)
+    })
+
+    test('allows empty string', () => {
+      expect(isToolNotificationText('')).toBe(false)
+    })
+
+    test('allows whitespace only', () => {
+      expect(isToolNotificationText('   ')).toBe(false)
+    })
+
+    test('filters Claude Code <local-command-stdout> auto-compact output', () => {
+      const text = '<local-command-stdout>[2mCompacted (ctrl+o to see full summary)[22m</local-command-stdout>'
+      expect(isToolNotificationText(text)).toBe(true)
+    })
+
+    test('filters <local-command-stderr> output', () => {
+      expect(isToolNotificationText('<local-command-stderr>error</local-command-stderr>')).toBe(true)
+    })
+  })
+})
+
+describe('extractLastResponseTimestamp', () => {
+  test('skips newer Codex progress and tool events', async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-response-'))
+    try {
+      const rollout = path.join(directory, 'rollout.jsonl')
+      const responseAt = '2026-11-23T10:00:00.000Z'
+      const assistant = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'reply' }] }
+      await fs.writeFile(rollout, [
+        { timestamp: responseAt, type: 'response_item', payload: { ...assistant, phase: 'final_answer' } },
+        { timestamp: '2026-11-24T10:00:00Z', type: 'response_item', payload: { ...assistant, phase: 'commentary' } },
+        { timestamp: '2026-11-25T10:00:00Z', type: 'response_item', payload: { type: 'function_call_output' } },
+      ].map(entry => JSON.stringify(entry)).join('\n'))
+      expect(extractLastResponseTimestamp(rollout, 'codex')).toBe(responseAt)
+      expect(extractLastResponseTimestamp(rollout, 'grok')).toBeUndefined()
+    } finally {
+      await fs.rm(directory, { force: true, recursive: true })
+    }
+  })
+})
+
+describe('extractLastEntryTimestamp', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'extract-timestamp-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  test('extracts timestamp from last entry', async () => {
+    const logPath = path.join(tmpDir, 'test.jsonl')
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({ timestamp: '2025-01-01T00:00:00Z', type: 'message' }),
+        JSON.stringify({ timestamp: '2025-01-02T00:00:00Z', type: 'message' }),
+        JSON.stringify({ timestamp: '2025-01-03T00:00:00Z', type: 'message' }),
+      ].join('\n')
+    )
+    expect(extractLastEntryTimestamp(logPath)).toBe('2025-01-03T00:00:00Z')
+  })
+
+  test('returns null for empty file', async () => {
+    const logPath = path.join(tmpDir, 'empty.jsonl')
+    await fs.writeFile(logPath, '')
+    expect(extractLastEntryTimestamp(logPath)).toBe(null)
+  })
+
+  test('returns null for non-existent file', () => {
+    const logPath = path.join(tmpDir, 'nonexistent.jsonl')
+    expect(extractLastEntryTimestamp(logPath)).toBe(null)
+  })
+
+  test('skips malformed JSON lines', async () => {
+    const logPath = path.join(tmpDir, 'malformed.jsonl')
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({ timestamp: '2025-01-01T00:00:00Z', type: 'message' }),
+        'this is not valid json',
+        '{ broken json',
+      ].join('\n')
+    )
+    // Should find the first (only valid) entry
+    expect(extractLastEntryTimestamp(logPath)).toBe('2025-01-01T00:00:00Z')
+  })
+
+  test('returns null when no entries have timestamp field', async () => {
+    const logPath = path.join(tmpDir, 'no-timestamp.jsonl')
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({ type: 'message', content: 'hello' }),
+        JSON.stringify({ type: 'message', content: 'world' }),
+      ].join('\n')
+    )
+    expect(extractLastEntryTimestamp(logPath)).toBe(null)
+  })
+
+  test('finds timestamp even if last line has none', async () => {
+    const logPath = path.join(tmpDir, 'mixed.jsonl')
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({ timestamp: '2025-01-01T00:00:00Z', type: 'message' }),
+        JSON.stringify({ timestamp: '2025-01-02T00:00:00Z', type: 'message' }),
+        JSON.stringify({ type: 'status', content: 'no timestamp here' }),
+      ].join('\n')
+    )
+    // Should iterate backwards and find the second entry's timestamp
+    expect(extractLastEntryTimestamp(logPath)).toBe('2025-01-02T00:00:00Z')
+  })
+
+  test('handles trailing newline', async () => {
+    const logPath = path.join(tmpDir, 'trailing.jsonl')
+    await fs.writeFile(
+      logPath,
+      JSON.stringify({ timestamp: '2025-01-01T00:00:00Z', type: 'message' }) + '\n'
+    )
+    expect(extractLastEntryTimestamp(logPath)).toBe('2025-01-01T00:00:00Z')
+  })
+})
+
+describe('iterateLogLinesBackward', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-backward-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  test('yields complete lines newest-first across chunk boundaries', async () => {
+    const logPath = path.join(tmpDir, 'lines.jsonl')
+    const lines = ['first', 'second 你好🚀 multibyte', 'x'.repeat(300), 'last']
+    await fs.writeFile(logPath, lines.join('\n') + '\n')
+
+    const seen = [...iterateLogLinesBackward(logPath, { chunkBytes: 7 })]
+    expect(seen).toEqual([...lines].reverse())
+  })
+
+  test('completes a jumbo line that straddles the scan budget', async () => {
+    const logPath = path.join(tmpDir, 'jumbo.jsonl')
+    const jumbo = 'j'.repeat(50 * 1024)
+    await fs.writeFile(logPath, ['early', jumbo, 'tail'].join('\n'))
+
+    const seen = [
+      ...iterateLogLinesBackward(logPath, { chunkBytes: 1024, maxScanBytes: 4 * 1024 }),
+    ]
+    // 'tail' fits the budget; the jumbo line straddles it and is still
+    // completed; 'early' lies past the budget and is not scanned.
+    expect(seen).toEqual(['tail', jumbo])
+  })
+
+  test('stops at a clean line boundary once the budget is spent', async () => {
+    const logPath = path.join(tmpDir, 'budget.jsonl')
+    const lines = Array.from({ length: 64 }, (_, i) => `line-${i}-${'p'.repeat(100)}`)
+    await fs.writeFile(logPath, lines.join('\n') + '\n')
+
+    const seen = [
+      ...iterateLogLinesBackward(logPath, { chunkBytes: 512, maxScanBytes: 1024 }),
+    ]
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen.length).toBeLessThan(lines.length)
+    expect(seen[0]).toBe(lines[lines.length - 1] ?? '')
+  })
+
+  test('aborts on a line larger than maxLineBytes', async () => {
+    const logPath = path.join(tmpDir, 'oversized.jsonl')
+    await fs.writeFile(logPath, ['early', 'g'.repeat(8 * 1024), 'tail'].join('\n'))
+
+    const seen = [
+      ...iterateLogLinesBackward(logPath, { chunkBytes: 1024, maxLineBytes: 2 * 1024 }),
+    ]
+    expect(seen).toEqual(['tail'])
+  })
+
+  test('enforces maxLineBytes on a line contained entirely within one chunk', async () => {
+    const logPath = path.join(tmpDir, 'in-chunk-oversized.jsonl')
+    await fs.writeFile(logPath, ['early', 'h'.repeat(4 * 1024), 'tail'].join('\n'))
+
+    const seen = [
+      ...iterateLogLinesBackward(logPath, { chunkBytes: 16 * 1024, maxLineBytes: 1024 }),
+    ]
+    expect(seen).toEqual(['tail'])
+  })
+
+  test('handles CRLF line endings', async () => {
+    const logPath = path.join(tmpDir, 'crlf.jsonl')
+    await fs.writeFile(logPath, 'first\r\nsecond\r\nthird\r\n')
+
+    expect([...iterateLogLinesBackward(logPath, { chunkBytes: 4 })]).toEqual([
+      'third',
+      'second',
+      'first',
+    ])
+  })
+
+  test('handles a file with no trailing newline and a single line', async () => {
+    const logPath = path.join(tmpDir, 'single.jsonl')
+    await fs.writeFile(logPath, 'only-line')
+    expect([...iterateLogLinesBackward(logPath)]).toEqual(['only-line'])
+  })
+})
+
+describe('jumbo last-message extraction', () => {
+  let tmpDir: string
+  const workerReadOptions = {
+    lineLimit: 0,
+    byteLimit: 32 * 1024,
+    maxByteLimit: 2 * 1024 * 1024,
+  }
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentboard-jumbo-'))
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  test('recovers a Claude user message far larger than the initial tail read', async () => {
+    // Shape of the fresh-silo incident: meta lines, one 121KB+ user line,
+    // then attachments and a last-prompt entry.
+    const logPath = path.join(tmpDir, 'claude.jsonl')
+    const jumboText = 'grill me on this concept: ' + 'detail '.repeat(20_000)
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({ type: 'mode', mode: 'default' }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: jumboText },
+        }),
+        JSON.stringify({ type: 'attachment', attachment: { pad: 'a'.repeat(30_000) } }),
+        JSON.stringify({
+          type: 'last-prompt',
+          lastPrompt: jumboText.slice(0, 200) + '…',
+        }),
+      ].join('\n') + '\n'
+    )
+
+    // Full untruncated text wins over the last-prompt mirror.
+    expect(extractLastUserMessageFromLog(logPath, workerReadOptions)).toBe(
+      jumboText.trim()
+    )
+  })
+
+  test('recovers a jumbo Codex response_item user message', async () => {
+    const logPath = path.join(tmpDir, 'codex.jsonl')
+    const jumboText = 'review this dump: ' + 'lorem '.repeat(60_000)
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({ type: 'session_meta', payload: { id: 'x' } }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: jumboText }],
+          },
+        }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }),
+      ].join('\n') + '\n'
+    )
+
+    expect(extractLastUserMessageFromLog(logPath, workerReadOptions)).toBe(
+      jumboText.trim()
+    )
+  })
+
+  test('falls back to the last-prompt mirror when the user entry is past the scan budget', async () => {
+    const logPath = path.join(tmpDir, 'fallback.jsonl')
+    const truncated = 'huge prompt preview…'
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'huge prompt ' + 'x'.repeat(1000) },
+        }),
+        // Enough post-user filler to exhaust a small scan budget at a line boundary.
+        ...Array.from({ length: 40 }, (_, i) =>
+          JSON.stringify({ type: 'attachment', attachment: { i, pad: 'f'.repeat(400) } })
+        ),
+        JSON.stringify({ type: 'last-prompt', lastPrompt: truncated }),
+      ].join('\n') + '\n'
+    )
+
+    expect(
+      extractLastUserMessageFromLog(logPath, {
+        lineLimit: 0,
+        byteLimit: 1024,
+        maxByteLimit: 8 * 1024,
+      })
+    ).toBe(truncated)
+  })
+
+  test('prefers the real user entry over a last-prompt mirror', async () => {
+    const logPath = path.join(tmpDir, 'prefer-real.jsonl')
+    await fs.writeFile(
+      logPath,
+      [
+        JSON.stringify({ type: 'last-prompt', lastPrompt: 'older mirror' }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'the real latest message' },
+        }),
+      ].join('\n') + '\n'
+    )
+
+    expect(extractLastUserMessageFromLog(logPath, workerReadOptions)).toBe(
+      'the real latest message'
+    )
+  })
+})
+
+describe('stripPastePlaceholders', () => {
+  test('returns the same string when no placeholder is present', () => {
+    const input = 'fix the login bug'
+    expect(stripPastePlaceholders(input)).toBe(input)
+  })
+
+  test('strips a Claude paste placeholder and collapses whitespace', () => {
+    expect(
+      stripPastePlaceholders('check this out [Pasted text #1 +263 lines] please')
+    ).toBe('check this out please')
+  })
+
+  test('strips bracketed pasted variants case-insensitively', () => {
+    expect(stripPastePlaceholders('[ pasted 4123 characters ]')).toBe('')
+    expect(stripPastePlaceholders('[Pasted text #2 +9 lines]')).toBe('')
+  })
+
+  test('leaves unrelated bracketed text alone', () => {
+    const input = 'see [Image #1] and [link](https://example.com)'
+    expect(stripPastePlaceholders(input)).toBe(input)
+  })
+
+  test('leaves bracketed prose starting with "pasted" alone when no counter token follows', () => {
+    const inputs = [
+      'Compare [pasted from docs] with the generated output.',
+      'The UI displays [pasted content unavailable] here.',
+      'Preserve the literal token [PastedExample].',
+    ]
+    for (const input of inputs) {
+      expect(stripPastePlaceholders(input)).toBe(input)
+    }
+  })
+})

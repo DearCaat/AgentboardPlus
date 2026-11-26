@@ -1,0 +1,205 @@
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, unlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { reapPrivateTmuxServer, socketPath } from '../../../tests/e2e/tmuxReap'
+import type { ClientMessage, ServerMessage, Session } from '../../shared/types'
+
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+// A lease with no client progress for this long is reclaimed. Attach time
+// counts against it, so the window leaves room for a slow attach.
+const PROGRESS_MS = 5000
+type Frame = ServerMessage
+class Peer {
+  readonly ws: WebSocket
+  frames: Frame[] = []
+  token = ''
+  closed = false
+  constructor(url: string) {
+    this.ws = new WebSocket(url)
+    this.ws.onmessage = event => { const frame = JSON.parse(String(event.data)); this.frames.push(frame); if (frame.type === 'terminal-lease') this.token = frame.token }
+    this.ws.onclose = () => { this.closed = true }
+  }
+  async receive<T extends Frame['type']>(type: T, timeout = 5000): Promise<Extract<Frame, { type: T }>> {
+    const end = performance.now() + timeout
+    while (performance.now() < end) {
+      const index = this.frames.findIndex(frame => frame.type === type)
+      if (index >= 0) return this.frames.splice(index, 1)[0] as Extract<Frame, { type: T }>
+      if (this.closed) break
+      await wait(5)
+    }
+    throw new Error(`Timed out waiting for ${type}; closed=${this.closed}; frames=${JSON.stringify(this.frames)}`)
+  }
+  send(message: ClientMessage) { this.ws.send(JSON.stringify(message)) }
+  async attach(session: Session, attachId: number) {
+    this.send({ type: 'terminal-attach', sessionId: session.id, tmuxTarget: session.tmuxWindow, cols: 80, rows: 24, attachId })
+    const frame = await this.receive('terminal-ready')
+    expect(frame.attachId).toBe(attachId)
+  }
+  async echo(session: Session, attachId: number) {
+    const marker = `relay_${crypto.randomUUID()}`
+    const start = performance.now()
+    this.send({ type: 'terminal-input', sessionId: session.id, attachId, data: `${marker}\r` })
+    let output = ''
+    while (!output.includes(marker)) {
+      const frame = await this.receive('terminal-output')
+      output += frame.data
+      if (frame.outputSeq) this.send({ type: 'terminal-ack', outputSeq: frame.outputSeq })
+    }
+    return performance.now() - start
+  }
+}
+
+describe('isolated terminal relay with real tmux', () => {
+  let dir: string, url: string, child: ReturnType<typeof Bun.spawn>, sessions: Session[], env: Record<string, string>
+  const peers: Peer[] = []
+  function tmux(...args: string[]) {
+    const result = Bun.spawnSync(['tmux', ...args], { env, stdout: 'pipe', stderr: 'pipe' })
+    if (result.exitCode) throw new Error(result.stderr.toString())
+    return result.stdout.toString().trim()
+  }
+  // Grouped-session disposal after a lease ends is asynchronous. Poll for it
+  // instead of checking after a fixed wait; a real leak still fails.
+  async function expectOnlyAgentSession() {
+    const deadline = Date.now() + 3000
+    while (tmux('list-sessions', '-F', '#{session_name}') !== 'relay-test' && Date.now() < deadline) await wait(20)
+    expect(tmux('list-sessions', '-F', '#{session_name}')).toBe('relay-test')
+  }
+  async function entered(file: string) {
+    const deadline = Date.now() + 5000
+    while (!existsSync(file)) {
+      if (Date.now() > deadline) throw new Error(`Stall did not enter: ${file}`)
+      await wait(10)
+    }
+  }
+  async function connect(token?: string, claim = 1) {
+    const peer = new Peer(url); peers.push(peer)
+    await peer.receive('sessions')
+    peer.send({ type: 'terminal-resume', token, claim })
+    await peer.receive('terminal-lease')
+    return peer
+  }
+  beforeAll(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'ab-relay-'))
+    env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
+    delete env.TMUX; delete env.TMUX_PANE
+    Object.assign(env, { TMUX_TMPDIR: dir, TMUX_SESSION: 'relay-test', AGENTBOARD_DATA_DIR: dir, LOG_FILE: path.join(dir, 'relay.log'), LOG_LEVEL: 'error', NODE_ENV: 'production', AGENTBOARD_TMUX_SET_CLIPBOARD: '0', AGENTBOARD_RELAY_GRACE_MS: '500', AGENTBOARD_RELAY_PROGRESS_MS: String(PROGRESS_MS) })
+    const a = tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'relay-test', '-P', '-F', '#{window_id}', 'stty -echo; exec /bin/cat')
+    const b = tmux('new-window', '-t', 'relay-test', '-P', '-F', '#{window_id}', 'stty -echo; exec /bin/cat')
+    sessions = [a, b].map((window, i) => ({ id: `relay-test:${window}`, tmuxWindow: `relay-test:${window}`, name: `Target ${i}`, projectPath: dir, status: 'unknown', lastActivity: new Date().toISOString(), createdAt: new Date().toISOString(), source: 'managed' }))
+    const bin = path.join(dir, 'bin'); mkdirSync(bin)
+    const realTmux = Bun.spawnSync(['which', 'tmux'], { env, stdout: 'pipe' }).stdout.toString().trim()
+    writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh\ncase "$*" in *new-session*) if [ -f "$RELAY_TEST_SLOW_START" ]; then touch "$RELAY_TEST_SLOW_START.entered"; while [ -f "$RELAY_TEST_SLOW_START" ]; do sleep 0.01; done; fi;; esac\nexec '${realTmux.replaceAll("'", "'\\''")}' "$@"\n`, { mode: 0o755 })
+    const childEnv = { ...env, PATH: `${bin}:${env.PATH}`, RELAY_TEST_SLOW_START: path.join(dir, 'slow'), RELAY_TEST_BLOCK: path.join(dir, 'dashboard-block'), RELAY_TEST_SESSIONS: JSON.stringify(sessions) }
+    child = Bun.spawn([process.execPath, 'src/server/__tests__/fixtures/relayHost.ts'], { env: childEnv, stdout: 'pipe', stderr: Bun.file(path.join(dir, 'child.err')) })
+    const reader = (child.stdout as ReadableStream<Uint8Array>).getReader(); let text = ''
+    while (!url) {
+      const part = await reader.read()
+      if (part.done) throw new Error('Relay fixture exited')
+      text += new TextDecoder().decode(part.value)
+      const line = text.split('\n').find(line => line.startsWith('{"port":'))
+      if (line) url = `ws://127.0.0.1:${JSON.parse(line).port}/ws?catalog=2`
+    }
+  }, 15000)
+  afterAll(async () => {
+    try {
+      for (const peer of peers) peer.ws.close()
+      if (child) { child.kill(); expect(await child.exited).toBe(0); expect(child.signalCode).toBeNull() }
+    } finally {
+      if (dir) {
+        // Capture the private server's children before it exits. Closing its
+        // last session alone can leave discarded login shells adopted by PID 1.
+        reapPrivateTmuxServer(socketPath(dir))
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  })
+
+
+  test('old catalog clients receive reload guidance and pongs without allocating a terminal', async () => {
+    const peer = new Peer(url.replace('?catalog=2', '')); peers.push(peer)
+    const notice = await peer.receive('error')
+    expect(notice.message).toContain('Reload this tab')
+    peer.send({ type: 'terminal-resume', claim: 1 })
+    peer.send({ type: 'terminal-attach', sessionId: sessions[0].id, cols: 80, rows: 24 })
+    peer.send({ type: 'ping', seq: 87 })
+    expect((await peer.receive('pong')).seq).toBe(87)
+    await wait(50)
+    expect(peer.closed).toBe(false)
+    expect(peer.frames.some(frame => ['sessions', 'terminal-lease', 'terminal-ready', 'terminal-output'].includes(frame.type))).toBe(false)
+    peer.ws.close()
+  })
+
+  test('dashboard stall does not block ping or PTY echo', async () => {
+    const peer = await connect(); await peer.attach(sessions[0], 1)
+    const gate = path.join(dir, 'dashboard-block')
+    writeFileSync(gate, '')
+    try {
+      await fetch(url.replace('ws:', 'http:').replace('/ws', '/block'))
+      await entered(`${gate}.entered`)
+      peer.send({ type: 'ping', seq: 7 })
+      expect((await peer.receive('pong')).seq).toBe(7)
+      await peer.echo(sessions[0], 1)
+      expect(existsSync(gate)).toBe(true)
+    } finally { unlinkSync(gate); peer.ws.close() }
+  })
+
+  test('slow new tmux observer cannot stall a different terminal', async () => {
+    const first = await connect(); await first.attach(sessions[0], 1)
+    const second = await connect()
+    writeFileSync(path.join(dir, 'slow'), '')
+    try {
+      second.send({ type: 'terminal-attach', sessionId: sessions[1].id, attachId: 1, cols: 80, rows: 24 })
+      await entered(path.join(dir, 'slow.entered'))
+      await first.echo(sessions[0], 1)
+      expect(second.frames.some(frame => frame.type === 'terminal-ready')).toBe(false)
+      unlinkSync(path.join(dir, 'slow'))
+      await second.receive('terminal-ready')
+    } finally { rmSync(path.join(dir, 'slow'), { force: true }); first.ws.close(); second.ws.close() }
+  })
+
+  test('resume retains observer, revalidates target, and fences old attach IDs', async () => {
+    // Prior tests close their sockets, but retained leases expire asynchronously.
+    // Drain those observers before comparing this lease's tty across resume.
+    const deadline = Date.now() + 2000
+    while (tmux('list-clients', '-F', '#{client_tty}') && Date.now() < deadline) await wait(20)
+    expect(tmux('list-clients', '-F', '#{client_tty}')).toBe('')
+    const first = await connect(); await first.attach(sessions[0], 1)
+    const before = tmux('list-clients', '-F', '#{client_tty}').split('\n').sort()
+    const second = await connect(first.token, 2); await second.attach(sessions[1], 2)
+    expect(second.token).toBe(first.token)
+    expect(tmux('list-clients', '-F', '#{client_tty}').split('\n').sort()).toEqual(before)
+    second.send({ type: 'terminal-input', sessionId: sessions[1].id, attachId: 1, data: 'FORBIDDEN_STALE\r' })
+    await second.echo(sessions[1], 2)
+    expect(tmux('capture-pane', '-p', '-t', sessions[1].tmuxWindow)).not.toContain('FORBIDDEN_STALE')
+    second.ws.close()
+  })
+
+  test('non-retained terminal clients and repeated disposal reuse preserve live agent panes', async () => {
+    await wait(1100)
+    for (let cycle = 0; cycle < 8; cycle++) {
+      const peer = new Peer(url); peers.push(peer)
+      await peer.receive('sessions')
+      peer.send({ type: 'terminal-attach', sessionId: sessions[0].id, cols: 80, rows: 24 })
+      const ready = await peer.receive('terminal-ready')
+      expect(ready.attachId).toBeUndefined()
+      peer.send({ type: 'terminal-input', sessionId: sessions[0].id, data: `legacy_${cycle}\r` })
+      await wait(50)
+      expect(tmux('capture-pane', '-p', '-t', sessions[0].tmuxWindow)).toContain(`legacy_${cycle}`)
+      peer.ws.close()
+      await wait(100)
+    }
+    await expectOnlyAgentSession()
+  }, 15000)
+
+  test('server reclaims silent OPEN and disconnected leases without killing agents', async () => {
+    const first = await connect(); await first.attach(sessions[0], 1)
+    await wait(PROGRESS_MS + 600)
+    expect(first.closed).toBe(true)
+    expect(tmux('list-windows', '-t', 'relay-test')).toContain('cat')
+    const second = await connect(first.token, 2); await second.attach(sessions[0], 2)
+    expect(second.token).not.toBe(first.token)
+    second.ws.close(); await wait(1100)
+    await expectOnlyAgentSession()
+  }, PROGRESS_MS + 10_000)
+})

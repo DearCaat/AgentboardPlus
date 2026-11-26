@@ -1,0 +1,628 @@
+import { afterEach, describe, expect, test } from 'bun:test'
+import TestRenderer, { act } from 'react-test-renderer'
+import NumPad from '../components/NumPad'
+
+const globalAny = globalThis as typeof globalThis & {
+  navigator?: Navigator
+  fetch?: typeof fetch
+}
+
+const originalNavigator = globalAny.navigator
+const originalFetch = globalAny.fetch
+
+const { default: TerminalControls } = await import('../components/TerminalControls')
+
+afterEach(() => {
+  globalAny.navigator = originalNavigator
+  globalAny.fetch = originalFetch
+})
+
+function clipboardWithImage() {
+  return {
+    read: () =>
+      Promise.resolve([
+        {
+          types: ['image/png'],
+          getType: () =>
+            Promise.resolve(
+              new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' })
+            ),
+        },
+      ]),
+    readText: () => Promise.reject(new Error('no text')),
+  }
+}
+
+function findPasteButton(renderer: TestRenderer.ReactTestRenderer) {
+  return renderer.root
+    .findAllByType('button')
+    .find((button) => button.props['aria-label'] === 'Paste')
+}
+
+describe('TerminalControls', () => {
+  test('renders the mobile key deck as one scrollable row of 44px targets', () => {
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={() => {}}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        onSelectSession={() => {}}
+      />
+    )
+
+    const keyDeck = renderer.root.findAllByType('div').find((element) =>
+      String(element.props.className ?? '').includes('grid-flow-col')
+    )
+    expect(keyDeck).toBeDefined()
+    expect(String(keyDeck?.props.className)).toContain('auto-cols-[44px]')
+    expect(String(keyDeck?.props.className)).toContain('overflow-x-auto')
+
+    const keyButtons = renderer.root.findAllByType('button').filter((button) =>
+      String(button.props.className ?? '').includes('terminal-key')
+    )
+    expect(keyButtons).toHaveLength(9)
+    expect(renderer.root.findAllByProps({ 'aria-label': 'Show keyboard' })).toHaveLength(0)
+    expect(renderer.root.findAllByProps({ 'aria-label': 'Dismiss keyboard' })).toHaveLength(0)
+    expect(keyButtons.some(button => button.props['aria-label'] === 'Shift+Tab')).toBe(false)
+    expect(keyButtons.every((button) =>
+      String(button.props.className).includes('size-[44px]')
+    )).toBe(true)
+  })
+
+  test('the Enter key uses the same neutral colors as the other command keys', () => {
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={() => {}}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        onSelectSession={() => {}}
+      />
+    )
+    const classesOf = (label: string) => {
+      const button = renderer.root
+        .findAllByType('button')
+        .find((b) => b.props['aria-label'] === label)
+      return String(button?.props.className).split(/\s+/).filter(Boolean)
+    }
+    const enter = classesOf('Enter')
+    expect(enter).toEqual(expect.arrayContaining(['bg-surface', 'border-border', 'text-secondary']))
+    expect(enter).not.toContain('bg-accent/20')
+    expect(enter).not.toContain('border-accent/40')
+    expect(enter).not.toContain('text-accent')
+    expect(classesOf('Delete word')).toEqual(
+      expect.arrayContaining(['bg-surface', 'border-border', 'text-secondary', 'border'])
+    )
+    act(() => renderer.unmount())
+  })
+
+  test('ctrl toggle modifies keys and resets', () => {
+    globalAny.navigator = { vibrate: () => true } as unknown as Navigator
+
+    const sent: string[] = []
+
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={(key) => sent.push(key)}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        onSelectSession={() => {}}
+      />
+    )
+
+    const ctrlButton = renderer.root.findAllByType('button').find(
+      (button) => button.props.children === 'ctrl'
+    )
+    if (!ctrlButton) {
+      throw new Error('Expected ctrl button')
+    }
+
+    act(() => {
+      ctrlButton.props.onClick()
+    })
+
+    const numpad = renderer.root.findByType(NumPad)
+
+    act(() => {
+      numpad.props.onSendKey('a')
+    })
+
+    expect(sent[0]).toBe(String.fromCharCode(1))
+
+    act(() => {
+      numpad.props.onSendKey('a')
+    })
+
+    expect(sent[1]).toBe('a')
+  })
+
+  test('session switcher selects sessions when multiple are present', () => {
+    globalAny.navigator = { vibrate: () => true } as unknown as Navigator
+
+    const selections: string[] = []
+
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={() => {}}
+        sessions={[
+          { id: 'session-1', name: 'alpha', status: 'working' },
+          { id: 'session-2', name: 'beta', status: 'waiting' },
+        ]}
+        currentSessionId="session-1"
+        onSelectSession={(id) => selections.push(id)}
+      />
+    )
+
+    const sessionButtons = renderer.root
+      .findAllByType('button')
+      .filter((button) =>
+        String(button.props.className ?? '').includes('snap-start')
+      )
+
+    expect(sessionButtons).toHaveLength(2)
+    expect(sessionButtons.every((button) =>
+      String(button.props.className).includes('h-[44px]')
+    )).toBe(true)
+
+    act(() => {
+      sessionButtons[1]?.props.onClick()
+    })
+
+    expect(selections).toEqual(['session-2'])
+  })
+
+  test('Paste opens a dialog even with clipboard access, then submitted text inserts and refocuses', async () => {
+    let refocused = false
+    const sent: string[] = []
+    const pasted: string[] = []
+
+    globalAny.navigator = {
+      vibrate: () => true,
+      clipboard: {
+        read: () => Promise.reject(new Error('no clipboard')),
+        readText: () => Promise.resolve('pasted text'),
+      },
+    } as unknown as Navigator
+
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={(key) => sent.push(key)}
+        onPasteText={(text) => pasted.push(text)}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        onSelectSession={() => {}}
+        onRefocus={() => {
+          refocused = true
+        }}
+        isKeyboardVisible={() => true}
+      />
+    )
+
+    const pasteButton = findPasteButton(renderer)
+    if (!pasteButton) {
+      throw new Error('Expected paste button')
+    }
+
+    await act(async () => {
+      await pasteButton.props.onClick()
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('textarea').props.onChange({ target: { value: 'pasted text' } })
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('form').props.onSubmit({ preventDefault() {} })
+    })
+
+    // Pasted text goes through the explicit paste path (bracketed server-side),
+    // never the raw keystroke path — so multi-line pastes aren't auto-submitted.
+    expect(pasted).toEqual(['pasted text'])
+    expect(sent).toEqual([])
+    expect(refocused).toBe(true)
+  })
+
+  test('paste button falls back to onSendKey when onPasteText is not provided', async () => {
+    const sent: string[] = []
+
+    globalAny.navigator = {
+      vibrate: () => true,
+      clipboard: {
+        read: () => Promise.reject(new Error('no clipboard')),
+        readText: () => Promise.resolve('pasted text'),
+      },
+    } as unknown as Navigator
+
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={(key) => sent.push(key)}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        onSelectSession={() => {}}
+      />
+    )
+
+    const pasteButton = findPasteButton(renderer)
+    if (!pasteButton) {
+      throw new Error('Expected paste button')
+    }
+
+    await act(async () => {
+      await pasteButton.props.onClick()
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('textarea').props.onChange({ target: { value: 'pasted text' } })
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('form').props.onSubmit({ preventDefault() {} })
+    })
+
+    expect(sent).toEqual(['pasted text'])
+  })
+
+  test('manual paste textarea preserves multiline text', async () => {
+    const sent: string[] = []
+    const pasted: string[] = []
+
+    globalAny.navigator = {
+      vibrate: () => true,
+      clipboard: {
+        read: () => Promise.reject(new Error('no clipboard')),
+        readText: () => Promise.reject(new Error('no text')),
+      },
+    } as unknown as Navigator
+
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={(key) => sent.push(key)}
+        onPasteText={(text) => pasted.push(text)}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        onSelectSession={() => {}}
+      />
+    )
+
+    const pasteButton = findPasteButton(renderer)
+    if (!pasteButton) {
+      throw new Error('Expected paste button')
+    }
+
+    await act(async () => {
+      await pasteButton.props.onClick()
+    })
+
+    const textarea = renderer.root.findByType('textarea')
+
+    await act(async () => {
+      textarea.props.onChange({ target: { value: 'line 1\nline 2\n' } })
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('form').props.onSubmit({ preventDefault() {} })
+    })
+
+    expect(pasted).toEqual(['line 1\nline 2\n'])
+    expect(sent).toEqual([])
+  })
+
+  test('paste button uploads clipboard image and sends a bracketed path for Claude', async () => {
+    const sent: string[] = []
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+
+    globalAny.navigator = {
+      vibrate: () => true,
+      clipboard: clipboardWithImage(),
+    } as unknown as Navigator
+
+    globalAny.fetch = (async (url: string, init?: RequestInit) => {
+      requests.push({ url, init })
+      return new Response(JSON.stringify({ path: '/tmp/paste-test.png' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={(key) => sent.push(key)}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        agentType="claude"
+        onSelectSession={() => {}}
+      />
+    )
+
+    const pasteButton = findPasteButton(renderer)
+    if (!pasteButton) {
+      throw new Error('Expected paste button')
+    }
+
+    await act(async () => {
+      await pasteButton.props.onClick()
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('textarea').props.onPaste({ preventDefault() {}, clipboardData: { getData: () => '', files: [new File(['png bytes'], 'image.png', { type: 'image/png' })] } })
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('form').props.onSubmit({ preventDefault() {} })
+    })
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.url).toBe('/api/paste-image')
+    // Path wrapped in bracketed-paste markers so Claude attaches it ([Image #N]).
+    expect(sent).toEqual(['\x1b[200~/tmp/paste-test.png\x1b[201~ '])
+  })
+
+  test('paste button sends the raw path for Codex (unchanged native behavior)', async () => {
+    const sent: string[] = []
+
+    globalAny.navigator = {
+      vibrate: () => true,
+      clipboard: clipboardWithImage(),
+    } as unknown as Navigator
+
+    globalAny.fetch = (async () =>
+      new Response(JSON.stringify({ path: '/tmp/paste-test.png' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch
+
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={(key) => sent.push(key)}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        agentType="codex"
+        onSelectSession={() => {}}
+      />
+    )
+
+    const pasteButton = findPasteButton(renderer)
+    if (!pasteButton) {
+      throw new Error('Expected paste button')
+    }
+
+    await act(async () => {
+      await pasteButton.props.onClick()
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('textarea').props.onPaste({ preventDefault() {}, clipboardData: { getData: () => '', files: [new File(['png bytes'], 'image.png', { type: 'image/png' })] } })
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('form').props.onSubmit({ preventDefault() {} })
+    })
+
+    // Codex attaches via its own clipboard path, so the raw path is sent as-is.
+    expect(sent).toEqual(['/tmp/paste-test.png '])
+  })
+
+  test('shows the server error when an image upload is rejected', async () => {
+    const sent: string[] = []
+
+    globalAny.navigator = {
+      vibrate: () => true,
+      clipboard: clipboardWithImage(),
+    } as unknown as Navigator
+
+    globalAny.fetch = (async () =>
+      new Response(JSON.stringify({ error: 'Image too large' }), {
+        status: 413,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch
+
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={(key) => sent.push(key)}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        onSelectSession={() => {}}
+      />
+    )
+
+    const pasteButton = findPasteButton(renderer)
+    if (!pasteButton) {
+      throw new Error('Expected paste button')
+    }
+
+    await act(async () => {
+      await pasteButton.props.onClick()
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('textarea').props.onPaste({ preventDefault() {}, clipboardData: { getData: () => '', files: [new File(['png bytes'], 'image.png', { type: 'image/png' })] } })
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('form').props.onSubmit({ preventDefault() {} })
+    })
+
+    // Nothing was pasted, and the inline status shows the failure
+    expect(sent).toEqual([])
+    const alert = renderer.root
+      .findAllByType('span')
+      .find((p) => p.props.role === 'alert')
+    if (!alert) {
+      throw new Error('Expected upload error message')
+    }
+    expect(alert.props.children).toBe('Image too large')
+  })
+
+  test('clears the upload error when dismissed', async () => {
+    globalAny.navigator = {
+      vibrate: () => true,
+      clipboard: clipboardWithImage(),
+    } as unknown as Navigator
+
+    globalAny.fetch = (async () =>
+      new Response(JSON.stringify({ error: 'Unsupported image type' }), {
+        status: 415,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch
+
+    const renderer = TestRenderer.create(
+      <TerminalControls
+        onSendKey={() => {}}
+        sessions={[{ id: 'session-1', name: 'alpha', status: 'working' }]}
+        currentSessionId="session-1"
+        onSelectSession={() => {}}
+      />
+    )
+
+    const pasteButton = findPasteButton(renderer)
+    if (!pasteButton) {
+      throw new Error('Expected paste button')
+    }
+
+    await act(async () => {
+      await pasteButton.props.onClick()
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('textarea').props.onPaste({ preventDefault() {}, clipboardData: { getData: () => '', files: [new File(['png bytes'], 'image.png', { type: 'image/png' })] } })
+    })
+    expect(renderer.root.findByType('dialog')).toBeDefined()
+    await act(async () => {
+      renderer.root.findByType('form').props.onSubmit({ preventDefault() {} })
+    })
+
+    const cancelButton = renderer.root
+      .findAllByType('button')
+      .find((button) => button.props.children === 'Dismiss')
+    if (!cancelButton) {
+      throw new Error('Expected cancel button')
+    }
+
+    act(() => {
+      cancelButton.props.onClick()
+    })
+
+    expect(
+      renderer.root.findAllByType('span').some((p) => p.props.role === 'alert')
+    ).toBe(false)
+  })
+})
+
+test('a horizontal swipe does not press a key; a stationary tap presses it once', () => {
+  globalAny.navigator = {} as Navigator
+  const sent: string[] = []
+  const renderer = TestRenderer.create(<TerminalControls onSendKey={(key) => sent.push(key)}
+    sessions={[]} currentSessionId="test" onSelectSession={() => {}} isKeyboardVisible={() => true} />)
+  const row = renderer.root.findAllByType('div').find((div) => div.props.onTouchStartCapture)!
+  const esc = renderer.root.findAllByType('button').find((button) => button.props.children === 'esc')!
+  let prevented = false
+  const event = (x: number) => ({ touches: [{ clientX: x, clientY: 0 }], changedTouches: [{ clientX: x, clientY: 0 }],
+    preventDefault: () => { prevented = true }, stopPropagation() {} })
+  act(() => {
+    row.props.onTouchStartCapture(event(100))
+    row.props.onTouchMoveCapture(event(40))
+    esc.props.onTouchEnd(event(40))
+  })
+  expect(prevented).toBe(false)
+  expect(sent).toEqual([])
+  act(() => {
+    row.props.onTouchStartCapture(event(100))
+    esc.props.onTouchEnd(event(100))
+    esc.props.onClick()
+  })
+  expect(prevented).toBe(true)
+  expect(sent).toEqual(['\x1b'])
+  renderer.unmount()
+})
+
+test('selected files survive resetting the native picker and wait with the draft for Submit', async () => {
+  const sent: string[] = []
+  globalAny.navigator = {} as Navigator
+  globalAny.fetch = (async () => Response.json({ path: '/tmp/notes.txt' })) as unknown as typeof fetch
+  const renderer = TestRenderer.create(<TerminalControls onSendKey={text => sent.push(text)}
+    sessions={[]} currentSessionId="test" onSelectSession={() => {}} />)
+  await act(async () => { findPasteButton(renderer)!.props.onClick() })
+  let selected: File[] = [new File(['notes'], 'notes.txt')]
+  const target = {
+    get files() { return selected },
+    set value(_value: string) { selected = [] },
+  }
+  act(() => {
+    renderer.root.findByType('textarea').props.onChange({ target: { value: 'Read this\nplease' } })
+    renderer.root.findByType('input').props.onChange({ target })
+  })
+  expect(selected).toEqual([])
+  expect(renderer.root.findAllByType('li')).toHaveLength(1)
+  expect(sent).toEqual([])
+  await act(async () => { renderer.root.findByType('form').props.onSubmit({ preventDefault() {} }) })
+  expect(sent).toEqual(["Read this\nplease\n'/tmp/notes.txt' "])
+  renderer.unmount()
+})
+
+
+test('recovery disables command and paste buttons without adding a keyboard control', () => {
+  const renderer = TestRenderer.create(<TerminalControls disabled onSendKey={() => {}}
+    sessions={[]} currentSessionId="recovery" onSelectSession={() => {}} />)
+  expect(renderer.root.findAllByProps({ 'aria-label': 'Show keyboard' })).toHaveLength(0)
+  expect(renderer.root.findByProps({ 'aria-label': 'Paste' }).props.disabled).toBe(true)
+  expect(renderer.root.findByProps({ 'aria-label': 'Enter' }).props.disabled).toBe(true)
+  act(() => renderer.unmount())
+})
+
+test('Select text renders only with a handler and fires it on tap', () => {
+  let opened = 0
+  const renderer = TestRenderer.create(
+    <TerminalControls onSendKey={() => {}} sessions={[]} currentSessionId="s" onSelectSession={() => {}}
+      onSelectText={() => { opened += 1 }} />
+  )
+  const button = renderer.root.findAllByType('button').find((b) => b.props['aria-label'] === 'Select text')
+  act(() => button?.props.onClick())
+  expect(opened).toBe(1)
+  const without = TestRenderer.create(
+    <TerminalControls onSendKey={() => {}} sessions={[]} currentSessionId="s" onSelectSession={() => {}} />
+  )
+  expect(without.root.findAllByType('button').some((b) => String(b.props['aria-label']).includes('text'))).toBe(false)
+})
+
+test('while the snapshot is open the key row is replaced by Done then Refresh', () => {
+  const calls: string[] = []
+  const actions = { onDone: () => { calls.push('done') }, onRefresh: () => { calls.push('refresh') }, busy: false }
+  const renderer = TestRenderer.create(
+    <TerminalControls onSendKey={() => { calls.push('key') }} sessions={[]} currentSessionId="s" onSelectSession={() => {}}
+      onSelectText={() => { calls.push('select') }} snapshotActions={actions} />
+  )
+  const buttons = renderer.root.findAllByType('button')
+  expect(buttons.map((b) => b.props['aria-label'])).toEqual(['Done selecting text', 'Refresh text'])
+  for (const button of buttons) expect(String(button.props.className)).toContain('h-[44px]')
+  act(() => buttons[0].props.onClick())
+  act(() => buttons[1].props.onClick())
+  expect(calls).toEqual(['done', 'refresh'])
+
+  act(() => renderer.update(
+    <TerminalControls onSendKey={() => {}} sessions={[]} currentSessionId="s" onSelectSession={() => {}}
+      onSelectText={() => {}} snapshotActions={{ ...actions, busy: true }} />
+  ))
+  const refresh = renderer.root.findAllByType('button').find((b) => b.props['aria-label'] === 'Refresh text')
+  expect(refresh?.props.disabled).toBe(true)
+  expect(refresh?.props['aria-busy']).toBe(true)
+  const done = renderer.root.findAllByType('button').find((b) => b.props['aria-label'] === 'Done selecting text')
+  expect(done?.props.disabled).toBeFalsy()
+})
+
+
+test('touch Shift clears when the session changes or controls become disabled', () => {
+  globalAny.navigator = {} as Navigator
+  const props = { onSendKey() {}, sessions: [], currentSessionId: 'one', onSelectSession() {} }
+  let renderer!: TestRenderer.ReactTestRenderer
+  act(() => { renderer = TestRenderer.create(<TerminalControls {...props} />) })
+  const shift = () => renderer.root.findByProps({ 'aria-label': 'Shift' })
+  act(() => { shift().props.onClick() })
+  expect(shift().props['aria-pressed']).toBe(true)
+  act(() => { renderer.update(<TerminalControls {...props} currentSessionId="two" />) })
+  expect(shift().props['aria-pressed']).toBe(false)
+  act(() => { shift().props.onClick() })
+  expect(shift().props['aria-pressed']).toBe(true)
+  act(() => { renderer.update(<TerminalControls {...props} currentSessionId="two" disabled />) })
+  expect(shift().props['aria-pressed']).toBe(false)
+  expect(shift().props.disabled).toBe(true)
+  act(() => { renderer.unmount() })
+})
