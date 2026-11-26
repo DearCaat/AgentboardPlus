@@ -9,7 +9,7 @@ import type { AgentSession } from '@shared/types'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation, type Locale } from '../locale'
 
 const PREVIEW_FETCH_TIMEOUT_MS = 10_000
 const PREVIEW_LINE_LIMIT = 200
@@ -76,7 +76,7 @@ function extractLogTimestampFromRecord(record: Record<string, unknown>): string 
   return timestamp && !Number.isNaN(Date.parse(timestamp)) ? timestamp : null
 }
 
-function formatLogTimestamp(timestamp?: string): string | null {
+function formatLogTimestamp(timestamp?: string, locale?: Locale): string | null {
   if (!timestamp) return null
   const date = new Date(timestamp)
   if (Number.isNaN(date.getTime())) return null
@@ -91,7 +91,7 @@ function formatLogTimestamp(timestamp?: string): string | null {
       ? { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }
       : { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }
 
-  return new Intl.DateTimeFormat(undefined, options).format(date)
+  return new Intl.DateTimeFormat(locale, options).format(date)
 }
 
 function compactJson(value: unknown) {
@@ -413,23 +413,36 @@ function lineKey(entry: ParsedEntry) {
   return `${entry.sourceKey}:${entry.seq}`
 }
 
-function lineTitle(lineNumber: number, timestamp: string | undefined, exactLineNumber: boolean) {
+type TranslateFn = ReturnType<typeof useTranslation>
+
+function lineTitle(
+  lineNumber: number,
+  timestamp: string | undefined,
+  exactLineNumber: boolean,
+  t: TranslateFn,
+) {
   if (!exactLineNumber) return timestamp
-  return timestamp ? `Line ${lineNumber + 1} · ${timestamp}` : undefined
+  return timestamp ? t('Line {n} · {timestamp}', { n: lineNumber + 1, timestamp }) : undefined
 }
 
-function lineMarker(lineNumber: number, timestamp: string | undefined, exactLineNumber: boolean) {
-  const formatted = formatLogTimestamp(timestamp)
+function lineMarker(
+  lineNumber: number,
+  timestamp: string | undefined,
+  exactLineNumber: boolean,
+  t: TranslateFn,
+  locale: Locale,
+) {
+  const formatted = formatLogTimestamp(timestamp, locale)
   if (formatted) return formatted
-  return exactLineNumber ? `Line ${lineNumber + 1}` : 'Entry'
+  return exactLineNumber ? t('Line {n}', { n: lineNumber + 1 }) : t('Entry')
 }
 
-function entryLabel(entry: ParsedEntry) {
-  if (entry.type === 'user') return 'User'
-  if (entry.type === 'assistant') return 'Assistant'
-  if (entry.type === 'system') return 'System'
-  if (entry.type === 'tool') return 'Tool'
-  return 'Log'
+function entryLabel(entry: ParsedEntry, t: TranslateFn) {
+  if (entry.type === 'user') return t('User')
+  if (entry.type === 'assistant') return t('Assistant')
+  if (entry.type === 'system') return t('System')
+  if (entry.type === 'tool') return t('Tool')
+  return t('Log')
 }
 
 function entryToneClass(entry: ParsedEntry) {
@@ -441,9 +454,10 @@ function entryToneClass(entry: ParsedEntry) {
 
 function ToolEntry({ entry }: { entry: ParsedEntry }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [expanded, setExpanded] = useState(false)
-  const marker = lineMarker(entry.lineNumber, entry.timestamp, entry.exactLineNumber)
-  const label = entry.kind === 'tool_call' ? entry.content : 'Result'
+  const marker = lineMarker(entry.lineNumber, entry.timestamp, entry.exactLineNumber, t, locale)
+  const label = entry.kind === 'tool_call' ? entry.content : t('Result')
 
   return (
     <div className="rounded-md border border-border bg-surface/40">
@@ -456,7 +470,7 @@ function ToolEntry({ entry }: { entry: ParsedEntry }) {
         <span className="min-w-0 truncate">
           <span
             className="mr-2 text-[10px] uppercase tracking-wide text-muted"
-            title={lineTitle(entry.lineNumber, entry.timestamp, entry.exactLineNumber)}
+            title={lineTitle(entry.lineNumber, entry.timestamp, entry.exactLineNumber, t)}
           >
             {marker}
           </span>
@@ -535,12 +549,14 @@ function MarkdownMessage({ content }: { content: string }) {
 }
 
 function TranscriptEntry({ entry, showRole = true }: { entry: ParsedEntry; showRole?: boolean }) {
+  const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   // tool_result events normalize to empty text and are dropped by parseLogEntry,
   // so only tool_call and result entries reach the collapsible ToolEntry.
   if (isToolEntry(entry)) {
     return <ToolEntry entry={entry} />
   }
-  const marker = lineMarker(entry.lineNumber, entry.timestamp, entry.exactLineNumber)
+  const marker = lineMarker(entry.lineNumber, entry.timestamp, entry.exactLineNumber, t, locale)
 
   // showRole marks the start of a same-role run: it gets the role label and a
   // top divider; continued entries in the run are flush below with no label, so
@@ -554,12 +570,12 @@ function TranscriptEntry({ entry, showRole = true }: { entry: ParsedEntry; showR
       <div className="select-none pt-0.5 text-right">
         {showRole && (
           <div className={`text-[11px] font-semibold uppercase tracking-wide ${entryToneClass(entry)}`}>
-            {entryLabel(entry)}
+            {entryLabel(entry, t)}
           </div>
         )}
         <div
           className={`text-[10px] tabular-nums text-muted ${showRole ? 'mt-1' : ''}`}
-          title={lineTitle(entry.lineNumber, entry.timestamp, entry.exactLineNumber)}
+          title={lineTitle(entry.lineNumber, entry.timestamp, entry.exactLineNumber, t)}
         >
           {marker}
         </div>
@@ -571,10 +587,11 @@ function TranscriptEntry({ entry, showRole = true }: { entry: ParsedEntry; showR
 
 function StructuredLogEntry({ entry }: { entry: StructuredLogLine }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [bodyExpanded, setBodyExpanded] = useState(false)
   const isLowProminence = entry.prominence === 'system' || entry.prominence === 'plain'
   const collapseBody = entry.prominence === 'tool' && Boolean(entry.body && entry.body.length > 160)
-  const timestamp = formatLogTimestamp(entry.timestamp)
+  const timestamp = formatLogTimestamp(entry.timestamp, locale)
   const rowClass = isLowProminence
     ? 'border-border/70 bg-surface/20 opacity-80'
     : entry.prominence === 'tool'
@@ -589,9 +606,9 @@ function StructuredLogEntry({ entry }: { entry: StructuredLogLine }) {
       <div className="grid grid-cols-[5.75rem_minmax(0,1fr)] gap-3 px-3 py-2 sm:grid-cols-[6.75rem_minmax(0,1fr)]">
         <div
           className="select-none text-right text-[11px] tabular-nums text-muted"
-          title={lineTitle(entry.lineNumber, entry.timestamp, entry.exactLineNumber)}
+          title={lineTitle(entry.lineNumber, entry.timestamp, entry.exactLineNumber, t)}
         >
-          {timestamp ?? (entry.exactLineNumber ? `Line ${entry.lineNumber + 1}` : t('Entry'))}
+          {timestamp ?? (entry.exactLineNumber ? t('Line {n}', { n: entry.lineNumber + 1 }) : t('Entry'))}
         </div>
         <div className="min-w-0 space-y-2">
           <div className="flex flex-wrap items-center gap-2">
@@ -599,7 +616,7 @@ function StructuredLogEntry({ entry }: { entry: StructuredLogLine }) {
               {entry.source}
             </span>
             <span className="min-w-0 break-words text-xs font-semibold text-primary">
-              {entry.source === 'text' ? t(entry.title) : entry.title}
+              {entry.source === 'text' || entry.source === 'json' ? t(entry.title) : entry.title}
             </span>
           </div>
           {entry.body && !collapseBody && (
@@ -678,6 +695,7 @@ export default function SessionPreviewContent({
   onStateChange,
 }: SessionPreviewContentProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [loading, setLoading] = useState(true)
   const [loadingEarlier, setLoadingEarlier] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -841,11 +859,11 @@ export default function SessionPreviewContent({
   const eventEntries = useMemo(() => structuredLines.slice().reverse(), [structuredLines])
   const lineRangeLabel = previewData
     ? previewData.totalLines === 0
-      ? 'No transcript entries'
+      ? t('No transcript entries')
       : previewData.totalLines === null
-        ? `Showing ${previewData.lines.length} recent log entries`
-        : `Showing ${previewData.lines.length} of ${previewData.totalLines} log entries`
-    : 'Derived from the saved session log.'
+        ? t('Showing {count} recent log entries', { count: previewData.lines.length })
+        : t('Showing {shown} of {total} log entries', { shown: previewData.lines.length, total: previewData.totalLines })
+    : t('Derived from the saved session log.')
 
   return (
     <div className={`flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-border bg-elevated ${className}`.trim()}>
@@ -895,7 +913,7 @@ export default function SessionPreviewContent({
         )}
         {error && (
           <div className="flex items-center justify-center py-8 text-danger">
-            {error}
+            {translateServerError(locale, error)}
           </div>
         )}
         {previewData && viewMode === 'messages' && (

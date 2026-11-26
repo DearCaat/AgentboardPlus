@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Session } from '@shared/types'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 interface CloseTarget {
   name: string
@@ -11,6 +11,7 @@ interface CloseTarget {
 
 export default function CloseTmuxDialog({ session, onClose }: { session: Session; onClose: () => void }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const dialog = useRef<HTMLDialogElement>(null)
   const [target, setTarget] = useState<CloseTarget>()
   const [error, setError] = useState('')
@@ -75,7 +76,7 @@ export default function CloseTmuxDialog({ session, onClose }: { session: Session
           </>
         )}
         {!target && !error && <p role="status" className="text-sm text-secondary">{t('Inspecting tmux session…')}</p>}
-        {error && <p role="alert" className="text-sm text-secondary">{error}</p>}
+        {error && <p role="alert" className="text-sm text-secondary">{translateServerError(locale, error)}</p>}
         <div className="flex justify-end gap-2">
           <button type="button" className="btn" onClick={onClose} disabled={closing}>{t('Cancel')}</button>
           <button type="button" className="btn btn-danger" onClick={() => void confirm()} disabled={!target || closing}>

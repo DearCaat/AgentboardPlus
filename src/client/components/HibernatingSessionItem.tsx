@@ -9,7 +9,7 @@ import { formatRelativeTime } from '../utils/time'
 import { useMenuViewportFit } from '../hooks/useMenuViewportFit'
 import AgentIcon from './AgentIcon'
 import ProjectBadge from './ProjectBadge'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 interface HibernatingSessionItemProps {
   session: AgentSession
@@ -35,7 +35,8 @@ export default function HibernatingSessionItem({
   onMoveToHistory,
 }: HibernatingSessionItemProps) {
   const t = useTranslation()
-  const lastActivity = formatRelativeTime(session.lastActivityAt)
+  const locale = useLocale((s) => s.locale)
+  const lastActivity = formatRelativeTime(session.lastActivityAt, locale)
   const directoryLeaf = getPathLeaf(session.projectPath)
   const displayName =
     session.displayName || directoryLeaf || session.sessionId.slice(0, 8)
@@ -161,7 +162,7 @@ export default function HibernatingSessionItem({
               width={ICON_SIZE.pill} height={ICON_SIZE.pill}
               className="shrink-0 text-amber-500"
               aria-label={t('Wake failed')}
-              title={`Last wake failed: ${session.lastResumeError}`}
+              title={t('Last wake failed: {error}', { error: translateServerError(locale, session.lastResumeError) })}
             />
           )}
           {sessionIdPrefix && (

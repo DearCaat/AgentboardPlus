@@ -9,7 +9,7 @@ import { ChevronRightIcon, Image01Icon, XCloseIcon } from './icons'
 import { ICON_SIZE } from './controlStyles'
 import { useFocusTrap, useSuspendTerminalInput } from './settings/useDialogFocus'
 import { getFocusable, nextTrapTarget } from './settings/focusTrap'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 export interface MediaLightboxProps {
   media: SessionMedia
@@ -30,6 +30,7 @@ const isLocal = (media: SessionMedia) => media.url.startsWith('/api/session-medi
 
 export default function MediaLightbox(props: MediaLightboxProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const { media, enabled, onClose, canPrevious, canNext, navigating, navigationError, onRetryNavigation, label } = props
   const panel = useRef<HTMLDivElement>(null)
   const close = useRef<HTMLButtonElement>(null)
@@ -103,7 +104,7 @@ export default function MediaLightbox(props: MediaLightboxProps) {
       <ImageView key={media.url} media={media} previewSrc={props.previewSrc} enabled={enabled} />
       {!enabled && <p role="status" className="px-4 py-2 text-center text-sm text-white/70">{t('Waiting for terminal recovery…')}</p>}
       {navigationError && <div role="alert" className="px-4 py-2 text-center text-sm text-white/70">
-        {navigationError}{' '}{onRetryNavigation && <button type="button" className="min-h-[44px] text-accent underline"
+        {translateServerError(locale, navigationError)}{' '}{onRetryNavigation && <button type="button" className="min-h-[44px] text-accent underline"
           disabled={!enabled || navigating} onClick={onRetryNavigation}>{t('Retry navigation')}</button>}
       </div>}
       <nav aria-label={t('Image navigation')} className="flex shrink-0 items-center justify-between gap-2 border-t border-white/10 p-2">
@@ -164,7 +165,7 @@ function ImageView({ media, previewSrc, enabled }: Pick<MediaLightboxProps, 'med
     <div data-testid="media-lightbox-stage" className="media-lightbox-stage">
       <div className="media-lightbox-canvas">
         {preview.status === 'ready' && full !== 'ready' && <img data-testid="media-lightbox-preview" src={preview.src}
-          alt={`${media.label || 'Image'} preview`} className="media-lightbox-image"
+          alt={t('{label} preview', { label: media.label || t('Image') })} className="media-lightbox-image"
           onError={() => { source.current = undefined; setPreview({ status: 'error' }) }} />}
         {loadingOriginal && <img key={token} data-testid="media-lightbox-original" src={mediaPayloadUrl(media.url)} alt={media.label || t('Image')}
           className={`media-lightbox-image ${full === 'ready' ? '' : 'invisible'}`}

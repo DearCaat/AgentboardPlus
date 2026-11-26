@@ -16,7 +16,7 @@ export function CopyLinkButton({ url, label }: { url: string; label: string }) {
   }, [url])
   const Icon = status === 'copied' ? CheckIcon : Copy01Icon
   return <span className="relative shrink-0">
-    <button type="button" aria-label={`Copy link for ${label}`} title={status === 'copied' ? t('Copied') : t('Copy link')}
+    <button type="button" aria-label={t('Copy link for {label}', { label })} title={status === 'copied' ? t('Copied') : t('Copy link')}
       aria-busy={status === 'copying'} data-copy-state={status}
       onKeyDown={event => event.stopPropagation()} onKeyUp={event => event.stopPropagation()}
       onClick={event => {

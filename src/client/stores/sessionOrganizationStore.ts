@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { Session } from '@shared/types'
+import { translate, useLocale } from '../locale'
 
 export const SESSION_GROUP_COLORS = [
   { id: 'blue', label: 'Blue', value: '#3b82f6' },
@@ -255,7 +256,7 @@ export const useSessionOrganizationStore = create<SessionOrganizationState>((set
         SESSION_GROUP_COLORS[state.organization.groups.length % SESSION_GROUP_COLORS.length]
       commit({
         ...state.organization,
-        groups: [...state.organization.groups, { id, name: 'New group', color: color.id }],
+        groups: [...state.organization.groups, { id, name: translate(useLocale.getState().locale, 'New group'), color: color.id }],
       })
       return id
     },

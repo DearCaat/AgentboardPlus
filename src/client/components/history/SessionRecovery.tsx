@@ -4,21 +4,14 @@ import type { Session, ServerMessage } from '@shared/types'
 import type { HistoryPage, SavedSession } from '@shared/persistence'
 import { libraryRequest, historyButton } from './api'
 import { createOperationId } from '../../utils/operationId'
-import { useTranslation } from '../../locale'
+import { formatRelativeAge } from '../../utils/time'
+import { translateServerError, useLocale, useTranslation } from '../../locale'
 
 interface SessionRecoveryProps {
   open: boolean
   subscribe: (listener: (message: ServerMessage) => void) => () => void
   onClose: () => void
   onOpenSession: (session: Session) => void
-}
-
-function age(iso: string) {
-  const minutes = Math.floor((Date.now() - Date.parse(iso)) / 60000)
-  if (minutes < 60) return `${Math.max(1, minutes)}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 48) return `${hours}h ago`
-  return `${Math.floor(hours / 24)}d ago`
 }
 
 export default function SessionRecovery({
@@ -28,6 +21,7 @@ export default function SessionRecovery({
   onOpenSession,
 }: SessionRecoveryProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [sessions, setSessions] = useState<SavedSession[]>([])
   const [error, setError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
@@ -40,7 +34,7 @@ export default function SessionRecovery({
           setError(null)
         })
         .catch((e) => {
-          if (!signal?.aborted) setError(String(e))
+          if (!signal?.aborted) setError(e instanceof Error ? e.message : String(e))
         })
     },
     []
@@ -82,7 +76,7 @@ export default function SessionRecovery({
       onOpenSession(live)
       onClose()
     } catch (e) {
-      setError(String(e))
+      setError(e instanceof Error ? e.message : String(e))
       refresh()
     } finally {
       setBusyId(null)
@@ -111,7 +105,7 @@ export default function SessionRecovery({
         <div className="max-h-[60vh] overflow-y-auto p-2">
           {error && (
             <div className="m-2 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-[12px] text-danger">
-              {error}
+              {translateServerError(locale, error)}
             </div>
           )}
           {!sessions.length && !error && (
@@ -129,8 +123,8 @@ export default function SessionRecovery({
                   {saved.name}
                 </div>
                 <div className="truncate text-[11px] text-secondary">
-                  {saved.projectPath} · {age(saved.lastActivityAt)}
-                  {saved.error ? ` · ${saved.error}` : ''}
+                  {saved.projectPath} · {formatRelativeAge(saved.lastActivityAt, locale)}
+                  {saved.error ? ` · ${translateServerError(locale, saved.error)}` : ''}
                 </div>
               </div>
               <button

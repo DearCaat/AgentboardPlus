@@ -4,7 +4,8 @@ import { ICON_SIZE } from '../controlStyles'
 import type { SessionMedia } from '@shared/types'
 import { LinkExternal01Icon, XCloseIcon } from '../icons'
 import { useSuspendTerminalInput } from '../settings/useDialogFocus'
-import { useTranslation } from '../../locale'
+import { translateServerError, useLocale, useTranslation } from '../../locale'
+import { getStatusText } from '../../utils/sessionStatus'
 
 const control = 'flex min-h-[44px] items-center justify-center rounded px-3 text-[12px] text-secondary hover:bg-hover hover:text-primary'
 
@@ -22,6 +23,7 @@ export function OutputPreview({ item, mobile, open, onClose, onChoose, status }:
   status?: string
 }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [load, setLoad] = useState<{ url: string } | { error: string; candidates?: string[]; attemptedPath?: string } | null>(null)
   const [width, setWidth] = useState(48)
   const [revision, setRevision] = useState(0)
@@ -131,7 +133,7 @@ export function OutputPreview({ item, mobile, open, onClose, onChoose, status }:
       {item.kind === 'link' && <p className="shrink-0 border-b border-border px-3 py-2 text-[12px] text-muted">{t('If this page stays blank or refuses to connect, use Open original.')}</p>}
       {load && 'error' in load ? (
         <div role="alert" className="min-h-0 overflow-y-auto p-5 text-[13px] text-secondary">
-          <p>{load.error}</p>
+          <p>{translateServerError(locale, load.error)}</p>
           {load.attemptedPath && <p className="mt-3 break-all">{t('Looked for:')}{' '}<code>{load.attemptedPath}</code></p>}
           {load.candidates && <ul aria-label={t('Matching session files')} className="mt-3 space-y-2">
             {load.candidates.map(candidate => <li key={candidate}><button type="button"
@@ -154,7 +156,7 @@ export function OutputPreview({ item, mobile, open, onClose, onChoose, status }:
           />}
         </>
       )}
-      {mobile && <div className="shrink-0 border-t border-border px-3 py-2 text-[12px] text-muted">{t('Agent')}{' '}{status === 'working' ? 'is still working' : status === 'permission' ? 'needs permission' : 'status: ' + (status || 'unknown')}</div>}
+      {mobile && <div className="shrink-0 border-t border-border px-3 py-2 text-[12px] text-muted">{status === 'working' ? t('Agent is still working') : status === 'permission' ? t('Agent needs permission') : t('Agent status: {status}', { status: status === 'waiting' || status === 'unknown' ? getStatusText(status, t) : (status || t('Unknown')) })}</div>}
     </section>
   )
 }

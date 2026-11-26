@@ -7,6 +7,7 @@ import { cn } from '../../../utils/cn'
 import { ICON_SIZE } from '../../controlStyles'
 import { MinusIcon, PlusIcon } from '../../icons'
 import { CONTROL_HEIGHT, CONTROL_ICON_BUTTON } from '../styles'
+import { useTranslation } from '../../../locale'
 
 interface StepperProps {
   value: number
@@ -20,12 +21,13 @@ interface StepperProps {
 }
 
 export function Stepper({ value, min, max, onChange, noun, labelledBy, describedBy }: StepperProps) {
+  const t = useTranslation()
   return (
     <div role="group" aria-labelledby={labelledBy} aria-describedby={describedBy} className="flex items-center">
       <button
         type="button"
         className={CONTROL_ICON_BUTTON}
-        aria-label={`Decrease ${noun}`}
+        aria-label={t('Decrease {noun}', { noun })}
         disabled={value <= min}
         onClick={() => onChange(Math.max(min, value - 1))}
       >
@@ -40,7 +42,7 @@ export function Stepper({ value, min, max, onChange, noun, labelledBy, described
       <button
         type="button"
         className={CONTROL_ICON_BUTTON}
-        aria-label={`Increase ${noun}`}
+        aria-label={t('Increase {noun}', { noun })}
         disabled={value >= max}
         onClick={() => onChange(Math.min(max, value + 1))}
       >

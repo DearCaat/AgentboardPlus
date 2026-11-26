@@ -93,7 +93,9 @@ export function RecoveryNotice({
     >
       <button onClick={onOpen} className="flex-1 px-3 py-2 text-left">
         {pending.length
-          ? `${pending.length} interrupted session${pending.length === 1 ? '' : 's'} saved. Review and reopen →`
+          ? (pending.length === 1
+              ? t('1 interrupted session saved. Review and reopen →')
+              : t('{count} interrupted sessions saved. Review and reopen →', { count: pending.length }))
           : t('Session recovery needs attention →')}
       </button>
       <button

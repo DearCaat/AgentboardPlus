@@ -55,7 +55,7 @@ import SessionSortButton from './SessionSortButton'
 import SessionPreviewModal from './SessionPreviewModal'
 import WorkspacePresets from './WorkspacePresets'
 import { HibernatingSection, HistorySection } from './DormantSessionSections'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 const groupDragId = (id: string) => 'group/' + id
 
@@ -157,6 +157,7 @@ export default function SessionList({
   notice,
 }: SessionListProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const isBottom = anchor === 'bottom'
   const [openListMenu, setOpenListMenu] = useState<'filter' | 'sort' | null>(null)
   useTimestampRefresh()
@@ -729,7 +730,7 @@ export default function SessionList({
     const id = createOrganizationGroup()
     if (!id) return
     setEditingGroupId(id)
-    setEditingGroupName('New group')
+    setEditingGroupName(t('New group'))
   }
 
   const handleStartGroupRename = (group: SessionGroup) => {
@@ -899,7 +900,7 @@ export default function SessionList({
                 useSessionOrganizationStore.setState({ error: error.message })
               ).finally(() => setSwitchingWorkspace(false))
             }}>
-            {workspaces.map(workspace => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
+            {workspaces.map(workspace => <option key={workspace.id} value={workspace.id}>{workspace.id === 'default' && workspace.name === 'Default' ? t('Default') : workspace.name}</option>)}
           </select>
         ) : <span>{t('Active')}</span>}
         <div className="flex items-center gap-2">
@@ -924,7 +925,7 @@ export default function SessionList({
           {organizationProfileId && organizationError && (
             <span
               role="status"
-              title={organizationError}
+              title={translateServerError(locale, organizationError)}
               className="max-w-28 truncate text-[10px] normal-case tracking-normal text-danger"
             >
               {t('Workspace error')}
@@ -937,7 +938,7 @@ export default function SessionList({
               aria-pressed={showHidden}
               className="rounded px-1.5 py-0.5 text-[11px] normal-case tracking-normal hover:bg-hover"
             >
-              {showHidden ? t('Hide hidden') : 'Show hidden (' + hiddenCount + ')'}
+              {showHidden ? t('Hide hidden') : t('Show hidden ({count})', { count: hiddenCount })}
             </button>
           )}
           {filteredSessions.length === 0 && onNewSession && (
@@ -1046,7 +1047,7 @@ export default function SessionList({
     <aside className="session-sidebar flex min-h-0 flex-1 flex-col border-r border-border bg-elevated">
       {error && (
         <div className="shrink-0 border-b border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
-          {error}
+          {translateServerError(locale, error)}
         </div>
       )}
 
@@ -1174,7 +1175,7 @@ function SessionGroupHeader({
     'divider',
     ...SESSION_GROUP_COLORS.map((candidate) => ({
       key: `color-${candidate.id}`,
-      label: candidate.id === group.color ? `${candidate.label} (current)` : candidate.label,
+      label: candidate.id === group.color ? t('{color} (current)', { color: t(candidate.label) }) : t(candidate.label),
       icon: (
         <span
           aria-hidden="true"
@@ -1182,7 +1183,7 @@ function SessionGroupHeader({
           style={{ backgroundColor: candidate.value }}
         />
       ),
-      title: `Set group color to ${candidate.label.toLowerCase()}`,
+      title: t('Set group color to {color}', { color: t(candidate.label).toLowerCase() }),
       onSelect: () => onSetColor(candidate.id),
     })),
     'divider',
@@ -1206,7 +1207,7 @@ function SessionGroupHeader({
         type="button"
         {...attributes}
         {...listeners}
-        aria-label={`Drag group ${group.name}`}
+        aria-label={t('Drag group {name}', { name: group.name })}
         title={t('Drag to reorder group')}
         className="touch-none cursor-grab px-1 text-muted hover:text-primary active:cursor-grabbing"
       >
@@ -1215,7 +1216,7 @@ function SessionGroupHeader({
       <button
         type="button"
         onClick={onToggle}
-        aria-label={`${group.collapsed ? 'Expand' : 'Collapse'} ${group.name}`}
+        aria-label={group.collapsed ? t('Expand {name}', { name: group.name }) : t('Collapse {name}', { name: group.name })}
         aria-expanded={!group.collapsed}
         className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-muted hover:bg-hover hover:text-primary"
       >
@@ -1269,10 +1270,10 @@ function SessionGroupHeader({
         ref={menuButtonRef}
         type="button"
         onClick={openMenu}
-        aria-label={`Options for ${group.name}`}
+        aria-label={t('Options for {name}', { name: group.name })}
         aria-haspopup="menu"
         aria-expanded={menu !== null}
-        title={`Options for ${group.name}`}
+        title={t('Options for {name}', { name: group.name })}
         className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-muted hover:bg-hover hover:text-primary"
       >
         <DotsHorizontalIcon width={ICON_SIZE.default} height={ICON_SIZE.default} />
@@ -1572,12 +1573,13 @@ function SessionRow({
   onToggleHidden,
 }: SessionRowProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const shortcutModifier = useSettingsStore((state) => state.shortcutModifier)
   const modDisplay = getModifierDisplay(getEffectiveModifier(shortcutModifier))
   const responseAt = session.lastResponseAt
-  const responseTime = responseAt ? formatRelativeTime(responseAt) : ''
+  const responseTime = responseAt ? formatRelativeTime(responseAt, locale) : ''
   const responseLabel = responseAt && responseTime
-    ? <span title={t('Last response · {time}', { time: new Date(responseAt).toLocaleString() })}>{responseTime}</span>
+    ? <span title={t('Last response · {time}', { time: new Date(responseAt).toLocaleString(locale) })}>{responseTime}</span>
     : <span title={session.remote && session.agentType === 'codex' && !session.agentSessionId
       ? t('Run /status in Codex, then right-click and choose Read ID from /status.')
       : t('Last response time unavailable')}>—</span>
@@ -1887,7 +1889,7 @@ function SessionRow({
                 {conversationId.pending ? t('Reading session ID…') : t('Read ID from /status')}
               </button>
               {conversationId.error && (
-                <p role="alert" className="max-w-64 px-3 py-2 text-xs text-danger">{conversationId.error}</p>
+                <p role="alert" className="max-w-64 px-3 py-2 text-xs text-danger">{translateServerError(locale, conversationId.error)}</p>
               )}
             </>
           )}

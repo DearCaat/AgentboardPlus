@@ -6,7 +6,7 @@ import { useMediaThumbnail } from '../../hooks/useMediaThumbnail'
 import { BrowserIcon } from '../icons'
 import { ICON_SIZE } from '../controlStyles'
 import MediaDiscoveryStatus from '../MediaDiscoveryStatus'
-import { useTranslation } from '../../locale'
+import { translateServerError, useLocale, useTranslation } from '../../locale'
 
 function PreviewRow({ item, ready, root, onSelect }: {
   item: SessionMedia; ready: boolean; root: RefObject<HTMLDivElement>; onSelect: (item: SessionMedia) => void
@@ -25,6 +25,7 @@ function PreviewRow({ item, ready, root, onSelect }: {
 
 export function PreviewList({ session, ready, onSelect }: { session: Session; ready: boolean; onSelect: (item: SessionMedia) => void }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const root = useRef<HTMLDivElement>(null)
   const pages = useMediaPages(session.agentSessionId, session.mediaSummary, true, ready, { kind: 'previews' })
   return <div ref={root} className="min-h-0 overflow-y-auto px-3 py-2" data-testid="preview-list">
@@ -35,7 +36,7 @@ export function PreviewList({ session, ready, onSelect }: { session: Session; re
     {!pages.error && <MediaDiscoveryStatus discovery={pages.discovery} kind="previews" hasItems={pages.items.length > 0} />}
     {pages.status === 'loading' && pages.discovery.status === 'ready' && <p role="status" className="text-[12px] text-muted">{t('Loading previews…')}</p>}
     {pages.pages.length > 0 && !pages.items.length && pages.discovery.status === 'ready' && <p className="py-2 text-[12px] text-secondary">{t('No previews in this session yet.')}</p>}
-    {pages.error && <div role="alert" className="text-[12px] text-muted">{pages.error} <button onClick={() => void pages.refresh()} className="min-h-[44px] text-accent">{t('Retry')}</button></div>}
+    {pages.error && <div role="alert" className="text-[12px] text-muted">{translateServerError(locale, pages.error)} <button onClick={() => void pages.refresh()} className="min-h-[44px] text-accent">{t('Retry')}</button></div>}
     {pages.hasNext && <button type="button" disabled={!ready || pages.status === 'loading'} onClick={() => void pages.loadNext()} className="min-h-[44px] text-[12px] text-accent">{t('Load older previews')}</button>}
   </div>
 }

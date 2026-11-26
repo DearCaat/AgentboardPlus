@@ -1,7 +1,7 @@
 /** Mobile status overview and drawer opener. Never covers terminal text. */
 import { useId } from 'react'
 import type { Session } from '@shared/types'
-import { statusText } from '../utils/sessionStatus'
+import { getStatusText } from '../utils/sessionStatus'
 import { getSessionDisplayName, useSessionOrganizationStore } from '../stores/sessionOrganizationStore'
 import { useTranslation } from '../locale'
 
@@ -34,7 +34,7 @@ export default function MobileSessionPeek({ sessions, selectedId, isOpen, onOpen
       onClick={onOpen}
     >
       <span id={descriptionId} className="sr-only">
-        {sessions.map((s) => `${getSessionDisplayName(s, organizationSessions[s.id])}: ${statusText[s.status]}${s.id === selectedId ? ', current session' : ''}`).join('; ')}
+        {sessions.map((s) => `${getSessionDisplayName(s, organizationSessions[s.id])}: ${getStatusText(s.status, t)}${s.id === selectedId ? t(', current session') : ''}`).join('; ')}
       </span>
       {sessions.map((s) => (
         <span

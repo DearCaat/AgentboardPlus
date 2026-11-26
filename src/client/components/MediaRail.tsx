@@ -31,7 +31,7 @@ import {
   SearchSmIcon,
 } from './icons'
 import { ICON_SIZE, TOUCH_TARGET_CLASS } from './controlStyles'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 // Full originals load only after an explicit user gesture.
 
@@ -99,7 +99,7 @@ function MediaChip({
           onOpen(media)
         } else window.open(mediaPayloadUrl(media.url), '_blank', 'noopener')
       }}
-      title={caption || media.kind}
+      title={caption || (isImage ? t('Image') : t('Document'))}
       aria-label={caption || (isImage ? t('Image') : t('Document'))}
       className={MEDIA_FILE_TILE_CLASS}
     >
@@ -120,7 +120,7 @@ function ImageThumbnail({ media, caption, enabled, root, onOpen }: {
 }) {
   const t = useTranslation()
   const { target, preview, fail } = useMediaThumbnail(media.url, enabled, root)
-  const label = preview.status === 'error' ? 'No preview' : preview.status === 'loading' ? 'Loading…' : 'Open image'
+  const label = preview.status === 'error' ? t('No preview') : preview.status === 'loading' ? t('Loading…') : t('Open image')
   return (
     <button ref={target} type="button" data-testid="media-thumb" data-preview-state={preview.status}
       onClick={(event) => {
@@ -128,10 +128,10 @@ function ImageThumbnail({ media, caption, enabled, root, onOpen }: {
         event.currentTarget.focus({ preventScroll: true })
         onOpen(media, preview.status === 'ready' ? preview.src : undefined)
       }} title={caption || t('Image')}
-      aria-label={`${caption || 'Image'} · ${preview.status === 'error' ? 'Preview unavailable. ' : ''}Open image`}
+      aria-label={preview.status === 'error' ? t('{label} · Preview unavailable. Open image', { label: caption || t('Image') }) : t('{label} · Open image', { label: caption || t('Image') })}
       aria-busy={preview.status === 'loading'} className={preview.status === 'ready' ? MEDIA_TILE_CLASS : MEDIA_FILE_TILE_CLASS}>
       {preview.status === 'ready' ? (
-        <img data-testid="media-thumbnail" src={preview.src} alt={caption || 'session image'} onError={fail} className="h-full w-full object-cover" />
+        <img data-testid="media-thumbnail" src={preview.src} alt={caption || t('session image')} onError={fail} className="h-full w-full object-cover" />
       ) : <>
         <Image01Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} className="shrink-0" />
         <span className={MEDIA_TILE_LABEL_CLASS}>{label}</span>
@@ -151,6 +151,7 @@ export default function MediaRail({ session, ready = false, onPreview, choosePre
 
 function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0, chooseTab = 'previews' }: RailProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [expanded, setExpanded] = useState(false)
   const [attention, setAttention] = useState<'idle' | 'pulsing' | 'unread'>('idle')
   const summary = session.mediaSummary
@@ -245,7 +246,7 @@ function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0
               const Icon = value === 'media' ? Image01Icon : value === 'links' ? Link01Icon : BrowserIcon
               return <button key={value} type="button" aria-pressed={tab === value} onClick={() => { setTab(value); lightbox.close() }}
                 className={`flex h-[44px] shrink-0 items-center gap-[6px] whitespace-nowrap px-2 text-[12px] ${tab === value ? 'text-primary shadow-[inset_0_-2px_var(--accent)]' : 'text-secondary hover:text-primary'} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent`}>
-                <Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />{value === 'media' ? `Media${mediaCount === undefined ? '' : ` ${mediaCount}`}` : value === 'links' ? `Links${counts ? ` ${counts.links}` : ''}` : `Previews${counts ? ` ${counts.previews ?? 0}` : ''}`}
+                <Icon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />{value === 'media' ? (mediaCount === undefined ? t('Media') : `${t('Media')} ${mediaCount}`) : value === 'links' ? (counts ? `${t('Links')} ${counts.links}` : t('Links')) : (counts ? `${t('Previews')} ${counts.previews ?? 0}` : t('Previews'))}
               </button>
             })}
             </div>
@@ -265,11 +266,13 @@ function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0
           </div>}
           {!!counts?.omittedRecords && (
             <p data-testid="media-incomplete" className="px-3 py-2 text-xs text-muted">
-              Some media may be unavailable: {counts?.omittedRecords} oversized transcript {counts?.omittedRecords === 1 ? 'entry was' : 'entries were'} skipped.
+              {counts?.omittedRecords === 1
+                ? t('Some media may be unavailable: 1 oversized transcript entry was skipped.')
+                : t('Some media may be unavailable: {count} oversized transcript entries were skipped.', { count: counts?.omittedRecords ?? 0 })}
             </p>
           )}
           {Boolean(counts?.omittedItems || pages.pages[0]?.page.omittedItems) && <p data-testid="media-omitted-items" className="px-3 py-2 text-xs text-muted">
-            Some items could not be listed because their details are too large ({Math.max(counts?.omittedItems ?? 0, pages.pages[0]?.page.omittedItems ?? 0)}).
+            {t('Some items could not be listed because their details are too large ({count}).', { count: Math.max(counts?.omittedItems ?? 0, pages.pages[0]?.page.omittedItems ?? 0) })}
           </p>}
           {tab === 'previews' ? <PreviewList session={session} ready={ready} onSelect={item => { onPreview?.(item); setExpanded(false) }} /> : tab === 'links' ? <SessionLinks onPreview={onPreview ? item => { setExpanded(false); onPreview(item) } : undefined} key={query} session={session} ready={ready} search={query} onRefresh={() => setAttention('idle')} /> : <>
           {pages.changed && (
@@ -300,7 +303,7 @@ function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0
           {pages.status === 'loading' && pages.discovery.status === 'ready' && <p role="status" className="px-3 pb-2 text-xs text-muted">{t('Loading media…')}</p>}
           {pages.pages.length > 0 && !pages.items.length && pages.discovery.status === 'ready' && <p className="px-3 py-2 text-xs text-secondary">{t('No media in this session yet.')}</p>}
           {pages.error && <div role="alert" className="px-3 pb-2 text-xs text-muted">
-            {pages.error} <button type="button" onClick={refresh} disabled={!ready} className="text-accent" aria-label={t('Refresh media')}>{t('Refresh')}</button>
+            {translateServerError(locale, pages.error)} <button type="button" onClick={refresh} disabled={!ready} className="text-accent" aria-label={t('Refresh media')}>{t('Refresh')}</button>
           </div>}
           {pages.hasNext && !pages.error && (
             <button type="button" onClick={() => void pages.loadNext()} disabled={!ready || pages.status === 'loading'}
@@ -318,7 +321,7 @@ function SessionMediaRail({ session, ready = false, onPreview, choosePreview = 0
             setAttention('idle')
             setExpanded(true)
           }}
-          aria-label={`Open media, links and previews${counts && !pendingEmpty ? `: ${counts.total} ${counts.total === 1 ? 'item' : 'items'}` : ''}${attention !== 'idle' ? ', new media' : ''}`}
+          aria-label={`${t('Open media, links and previews')}${counts && !pendingEmpty ? (counts.total === 1 ? t(': 1 item') : t(': {count} items', { count: counts.total })) : ''}${attention !== 'idle' ? t(', new media') : ''}`}
           className={`absolute top-2 right-2 z-40 flex items-center gap-[12px] whitespace-nowrap rounded-full border border-border bg-elevated/90 px-3 py-1.5 text-xs text-secondary shadow-lg backdrop-blur transition-colors hover:text-primary md:min-h-[30px] md:gap-[16px] md:px-[12px] md:py-[5px] md:text-[12px] md:leading-[18px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${attention === 'pulsing' ? 'media-attention' : ''} ${TOUCH_TARGET_CLASS}`}
         >
           <span className="inline-flex items-center gap-[6px]">

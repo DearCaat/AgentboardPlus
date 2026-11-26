@@ -22,7 +22,7 @@ import { keepA11yRowsStable } from '../utils/a11yRowStability'
 import { MEASURE_PROBE_ATTR, watchSelectedRows } from '../utils/iosSelection'
 import { formatRelativeTime } from '../utils/time'
 import { getPathLeaf } from '../utils/sessionLabel'
-import { statusClass, statusText } from '../utils/sessionStatus'
+import { getConnectionStatusText, getStatusText, statusClass } from '../utils/sessionStatus'
 import SessionRail from './SessionRail'
 import TerminalControls from './TerminalControls'
 import TerminalSnapshotLayer from './TerminalSnapshotLayer'
@@ -52,7 +52,7 @@ import {
 } from './icons'
 import '../styles/compactMobileControls.css'
 import { ICON_SIZE, TOUCH_TARGET_CLASS, mobileButtonClass } from './controlStyles'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 interface TerminalProps {
   session: Session | null
@@ -121,6 +121,7 @@ export default function Terminal({
   error = null,
 }: TerminalProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const resetNativeInputRef = useRef<((afterPaste?: boolean) => void) | undefined>(undefined)
   const [pasteStatus, setPasteStatus] = useState<'idle' | 'sending' | 'unconfirmed'>('idle')
   const nextPasteId = useRef(0)
@@ -215,7 +216,7 @@ export default function Terminal({
     : ''
   const hibernatingProjectName = hibernatingSession ? getPathLeaf(hibernatingSession.projectPath) : ''
   const hibernatingLastActivity = hibernatingSession
-    ? formatRelativeTime(hibernatingSession.lastActivityAt)
+    ? formatRelativeTime(hibernatingSession.lastActivityAt, locale)
     : ''
   const canHibernate =
     !!session &&
@@ -1349,7 +1350,7 @@ export default function Terminal({
                 </span>
               )}
               <span className={`shrink-0 text-[10px] ${connectionStatus !== 'connected' ? 'text-approval' : statusClass[session.status]}`}>
-                {connectionStatus !== 'connected' ? connectionStatus : statusText[session.status]}
+                {connectionStatus !== 'connected' ? getConnectionStatusText(connectionStatus, t) : getStatusText(session.status, t)}
               </span>
             </div>
           ) : hibernatingSession ? (
@@ -1386,7 +1387,7 @@ export default function Terminal({
               disabled={isSwitching}
               onClick={() => setShowEndConfirm(true)}
               className={mobileButtonClass('danger')}
-              title={`Kill session (${modDisplay}X)`}
+              title={t('Kill session ({shortcut})', { shortcut: `${modDisplay}X` })}
               aria-label={t('Kill session')}
             >
               <XCloseIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} />
@@ -1567,7 +1568,7 @@ export default function Terminal({
                     {hibernatingSession.lastResumeError && (
                       <div
                         className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-2 py-1 text-xs text-amber-400"
-                        title={`Last wake failed: ${hibernatingSession.lastResumeError}`}
+                        title={t('Last wake failed: {error}', { error: translateServerError(locale, hibernatingSession.lastResumeError) })}
                       >
                         <AlertTriangleIcon width={ICON_SIZE.pill} height={ICON_SIZE.pill} />
                         {t('Last wake failed')}
@@ -1750,7 +1751,7 @@ export default function Terminal({
               {t('Kill Session')}
             </h3>
             <p className="text-sm text-secondary mb-4 text-pretty">
-              Kill "{sessionDisplayName}"? The process will be terminated. Conversation history is preserved in logs.
+              {t('Kill "{name}"? The process will be terminated. Conversation history is preserved in logs.', { name: sessionDisplayName })}
             </p>
             <div className="flex justify-end gap-2">
               <button

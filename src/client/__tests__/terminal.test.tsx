@@ -864,7 +864,7 @@ describe('Terminal', () => {
     })
 
     const html = JSON.stringify(renderer.toJSON())
-    expect(html).toContain('reconnecting')
+    expect(html).toContain('Reconnecting…')
 
     const newSessionButton = renderer.root.findByProps({ 'aria-label': 'New session' })
     act(() => {

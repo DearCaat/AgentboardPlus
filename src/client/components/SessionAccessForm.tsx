@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { useSessionStore } from '../stores/sessionStore'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 interface SessionAccess {
   grantId: string | null
@@ -11,6 +11,7 @@ const endpoint = '/api/workspace/session-owner'
 
 export default function SessionAccessForm() {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const sessions = useSessionStore(state => state.sessions)
   const [sessionId, setSessionId] = useState('')
   const [access, setAccess] = useState<SessionAccess>()
@@ -98,7 +99,7 @@ export default function SessionAccessForm() {
         </label>
       )}
       {access && <button type="submit" className="btn" disabled={saving || (grantId || null) === access.grantId}>{t('Save session access')}</button>}
-      {feedback && <p className="text-sm text-secondary" role="status">{feedback}</p>}
+      {feedback && <p className="text-sm text-secondary" role="status">{translateServerError(locale, feedback)}</p>}
     </form>
   )
 }

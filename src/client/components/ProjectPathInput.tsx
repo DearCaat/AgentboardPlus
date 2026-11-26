@@ -4,7 +4,7 @@ import { forwardRef, useEffect, useId, useRef, useState } from 'react'
 import { useSettingsStore } from '../stores/settingsStore'
 import { readDirectory, useDirectoryListing } from '../hooks/useDirectoryListing'
 import { FolderIcon } from './icons'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 export const ProjectPathInput = forwardRef<HTMLInputElement, {
   value: string
@@ -14,6 +14,7 @@ export const ProjectPathInput = forwardRef<HTMLInputElement, {
   onBrowse: () => void
 }>(function ProjectPathInput({ value, onChange, placeholder, remote, onBrowse }, ref) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const recentPaths = useSettingsStore(s => s.recentPaths)
   const [open, setOpen] = useState(false)
   const [edited, setEdited] = useState(false)
@@ -111,7 +112,7 @@ export const ProjectPathInput = forwardRef<HTMLInputElement, {
           </div>)}
         </div>
         <div role="status" className="px-3 pb-2 text-xs text-secondary">
-          {error || listingError ? <span className="text-danger">{error || listingError}</span>
+          {error || listingError ? <span className="text-danger">{translateServerError(locale, error || listingError || '')}</span>
             : choosing ? t('Checking folder…') : loading ? t('Loading folders…')
               : !suggestions.length ? (completing ? t('No matching folders. Enter a full path or browse.') : t('No recent matches. Enter a path or browse.'))
                 : completing ? t('Enter to choose · Tab to browse into a match') : t('Choose a project or enter a path')}

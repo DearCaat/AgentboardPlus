@@ -12,7 +12,7 @@ import {
   yoloConflict,
   yoloFlagFor,
 } from '@shared/yolo'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 interface NewSessionModalProps {
   isOpen: boolean
@@ -49,6 +49,7 @@ export default function NewSessionModal({
   initialCommand,
 }: NewSessionModalProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [projectPath, setProjectPath] = useState('')
   const [name, setName] = useState('')
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null)
@@ -281,10 +282,12 @@ export default function NewSessionModal({
     commandAgentType && !yoloChecked ? yoloConflict(command, commandAgentType) : null
   const yoloDisabled = !yoloSupported || yoloConflictReason !== null
   const yoloTooltip = !commandAgentType
-    ? 'Enter a supported agent command (claude, codex, pi, grok, devin, omp, agy)'
+    ? t('Enter a supported agent command (claude, codex, pi, grok, devin, omp, agy)')
     : commandAgentType === 'pi'
-      ? 'Pi has no permission prompts — nothing to enable'
-      : yoloConflictReason ?? `Append ${yoloFlagFor(commandAgentType)}`
+      ? t('Pi has no permission prompts — nothing to enable')
+      : yoloConflictReason
+        ? translateServerError(locale, yoloConflictReason)
+        : t('Append {flag}', { flag: yoloFlagFor(commandAgentType) ?? '' })
 
   const handleYoloToggle = (checked: boolean) => {
     setYoloMode(checked)
@@ -373,7 +376,7 @@ export default function NewSessionModal({
                       role="radio"
                       aria-checked={isActive}
                       aria-label={option.label}
-                      title={!option.ok ? (option.error || t('Unreachable')) : undefined}
+                      title={!option.ok ? (option.error ? translateServerError(locale, option.error) : t('Unreachable')) : undefined}
                       tabIndex={isActive ? 0 : -1}
                       onClick={() => setSelectedHost(option.id)}
                       onKeyDown={(e) => {

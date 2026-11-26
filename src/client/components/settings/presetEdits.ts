@@ -5,6 +5,7 @@
  */
 import type { AgentType } from '@shared/types'
 import { normalizePreset, type CommandPreset } from '../../stores/settingsStore'
+import { translate, useLocale } from '../../locale'
 
 export const PRESET_LABEL_MAX = 64
 export const PRESET_COMMAND_MAX = 1024
@@ -24,14 +25,19 @@ export const PRESET_ICON_OPTIONS: ReadonlyArray<{ value: AgentType | ''; label: 
 ]
 
 export function validatePresetField(field: PresetField, value: string): string | null {
+  const locale = useLocale.getState().locale
   const trimmed = value.trim()
   if (field === 'label') {
-    if (!trimmed) return 'Name is required'
-    if (trimmed.length > PRESET_LABEL_MAX) return `Name is at most ${PRESET_LABEL_MAX} characters`
+    if (!trimmed) return translate(locale, 'Name is required')
+    if (trimmed.length > PRESET_LABEL_MAX) {
+      return translate(locale, 'Name is at most {max} characters', { max: PRESET_LABEL_MAX })
+    }
     return null
   }
-  if (!trimmed) return 'Command is required'
-  if (trimmed.length > PRESET_COMMAND_MAX) return `Command is at most ${PRESET_COMMAND_MAX} characters`
+  if (!trimmed) return translate(locale, 'Command is required')
+  if (trimmed.length > PRESET_COMMAND_MAX) {
+    return translate(locale, 'Command is at most {max} characters', { max: PRESET_COMMAND_MAX })
+  }
   return null
 }
 

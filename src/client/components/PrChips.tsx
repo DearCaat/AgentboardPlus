@@ -15,8 +15,8 @@ import { ICON_SIZE, PR_STATE_MARK_SIZE } from './controlStyles'
 import type { SessionPullRequest } from '../../shared/types'
 import type { PrInfo } from '../../shared/prStatus'
 import { cachedChecks, fetchChecks, getPrInfo, subscribePrInfo, watchPrInfo } from '../lib/prStatus'
-import { formatRelativeTime } from '../utils/time'
-import { useTranslation } from '../locale'
+import { formatRelativeAge } from '../utils/time'
+import { useLocale, useTranslation } from '../locale'
 
 // Pill geometry shared by PrChip anchors and the offscreen measurer spans
 // below — keep these in sync or the single-row fit math drifts.
@@ -321,18 +321,19 @@ const FlyoutRetainContext = createContext<(() => () => void) | null>(null)
 
 function PrStatusAge({ at, stale }: { at: number; stale?: boolean }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const iso = new Date(at).toJSON() ?? ''
-  const [age, setAge] = useState(() => formatRelativeTime(iso))
+  const [age, setAge] = useState(() => formatRelativeAge(iso, locale))
   useEffect(() => {
-    const tick = () => setAge(formatRelativeTime(iso))
+    const tick = () => setAge(formatRelativeAge(iso, locale))
     tick()
     const timer = setInterval(tick, 30_000)
     return () => clearInterval(timer)
-  }, [iso])
+  }, [iso, locale])
   if (!age) return null
   return (
     <div className="mt-0.5 shrink-0 text-[11px] text-muted">
-      {stale ? t('Last confirmed') : t('Checked')} {age === 'now' ? t('just now') : `${age} ago`}
+      {stale ? t('Last confirmed {age}', { age }) : t('Checked {age}', { age })}
     </div>
   )
 }
@@ -376,9 +377,11 @@ function PrChip({
 
   const chipInfo = info ?? checks
   const chipState = stateLabel(chipInfo)
+  const translatedChipState = chipState ? t(chipState) : ''
   const detail = checks?.state && (checks.lastConfirmedAt ?? 0) > (info?.lastConfirmedAt ?? 0)
     ? checks
     : chipInfo
+  const detailState = stateLabel(detail)
   return (
     <span
       ref={anchorRef}
@@ -392,7 +395,7 @@ function PrChip({
         rel="noreferrer"
         onClick={(e) => e.stopPropagation()}
         className={`${pillClass} bg-elevated text-muted hover:text-accent`}
-        aria-label={`${pr.repo}#${pr.number}${chipState ? ` ${chipState}` : ''}`}
+        aria-label={`${pr.repo}#${pr.number}${translatedChipState ? ` ${translatedChipState}` : ''}`}
       >
         <PrGlyph info={chipInfo} />
         {pr.number}
@@ -418,7 +421,7 @@ function PrChip({
           >
           <div className="flex shrink-0 items-center gap-1.5 text-[11px]">
             <PrGlyph info={detail} />
-            <span className="text-muted">{stateLabel(detail) || 'PR'}</span>
+            <span className="text-muted">{detailState ? t(detailState) : 'PR'}</span>
             <span className="text-muted">·</span>
             <a
               href={pr.url}
@@ -440,7 +443,7 @@ function PrChip({
                 {detail.title ?? t('(title unavailable)')}
               </a>
               <div className="mt-0.5 shrink-0 text-[11px] text-muted">
-                {detail.author ? `by ${detail.author}` : ''}
+                {detail.author ? t('by {author}', { author: detail.author }) : ''}
               </div>
               {detail.lastConfirmedAt !== undefined && (
                 <PrStatusAge at={detail.lastConfirmedAt} stale={detail.stale} />
@@ -513,6 +516,7 @@ function OverflowChip({
   prs: SessionPullRequest[]
   pillClass?: string
 }) {
+  const t = useTranslation()
   const anchorRef = useRef<HTMLSpanElement>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
   // Enter/ArrowDown on "+N" opens the strip and moves focus to its first
@@ -568,7 +572,7 @@ function OverflowChip({
         ref={buttonRef}
         type="button"
         className={`${pillClass} cursor-pointer text-muted hover:text-accent`}
-        aria-label={`${prs.length} more PR${prs.length === 1 ? '' : 's'}`}
+        aria-label={prs.length === 1 ? t('1 more PR') : t('{count} more PRs', { count: prs.length })}
         aria-haspopup="true"
         aria-expanded={open}
         onKeyDown={(e) => {

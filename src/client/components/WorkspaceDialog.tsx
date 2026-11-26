@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { Session } from '@shared/types'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 type WorkspaceInfo = { hosts: string[]; canAddRemoteHosts: boolean; localAllowed?: boolean }
 type ImageUploadCheck = 'passed' | 'failed' | 'skipped'
@@ -23,6 +23,7 @@ export default function WorkspaceDialog({
   initialHost = '', onClose, onAgentSession, onManageTokens, onCreated,
 }: WorkspaceDialogProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const dialog = useRef<HTMLDialogElement>(null)
   const [mode, setMode] = useState<'terminal' | 'server'>('terminal')
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null)
@@ -139,7 +140,7 @@ export default function WorkspaceDialog({
             {t(serverCheck === 'existing' ? 'Server already added.' : serverCheckMessages[serverCheck])}
           </p>
         )}
-        {error && <p role="alert" className="break-words text-sm text-secondary">{t(error)}</p>}
+        {error && <p role="alert" className="break-words text-sm text-secondary">{translateServerError(locale, error)}</p>}
         <div className="flex justify-end gap-2">
           <button type="button" className="btn" onClick={onClose} disabled={pending}>{t('Cancel')}</button>
           <button type="submit" className="btn btn-primary" disabled={pending || !workspace || (workspace.localAllowed === false && !host)}>

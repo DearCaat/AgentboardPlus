@@ -22,7 +22,7 @@ import {
 } from '../stores/sessionOrganizationStore'
 import { getPathLeaf } from '../utils/sessionLabel'
 import { copyText } from '../utils/copyText'
-import { statusClass, statusText } from '../utils/sessionStatus'
+import { getConnectionStatusText, getStatusText, statusClass } from '../utils/sessionStatus'
 import ProjectBadge from './ProjectBadge'
 import HostBadge from './HostBadge'
 import { PrChips } from './PrChips'
@@ -39,7 +39,7 @@ import {
   XCloseIcon,
 } from './icons'
 import { ICON_SIZE, ROW_ICON_BUTTON_CLASS, iconButtonClass } from './controlStyles'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 const harnessLabels: Record<string, string> = {
   codex: 'Codex', claude: 'Claude Code', 'claude-rp': 'Claude RP', pi: 'Pi',
@@ -141,6 +141,7 @@ export default function SessionRail({
   onDismissSelection,
 }: SessionRailProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const showProjectName = useSettingsStore((state) => state.showProjectName)
 
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
@@ -216,7 +217,7 @@ export default function SessionRail({
   }, [shownSessionId])
 
   function setRemoteSessionId() {
-    const value = window.prompt('Enter the full ' + (harnessLabel ?? 'harness') + ' session ID', agentSessionId ?? '')?.trim()
+    const value = window.prompt(t('Enter the full {harness} session ID', { harness: harnessLabel ?? t('harness') }), agentSessionId ?? '')?.trim()
     if (value && value !== agentSessionId) void conversationId.save({ conversationId: value })
   }
 
@@ -289,7 +290,7 @@ export default function SessionRail({
       ...(canReadCodexStatus
         ? [{
             key: 'codex-status',
-            label: conversationId.pending ? 'Reading session ID…' : 'Read ID from /status',
+            label: conversationId.pending ? t('Reading session ID…') : t('Read ID from /status'),
             icon: <Hash01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
             onSelect: () => void conversationId.save({ source: 'codex-status' }),
           }]
@@ -297,7 +298,7 @@ export default function SessionRail({
       ...(session.remote && session.agentType
         ? [{
             key: 'set-id',
-            label: agentSessionId ? 'Edit session ID…' : 'Set session ID…',
+            label: agentSessionId ? t('Edit session ID…') : t('Set session ID…'),
             icon: <Hash01Icon width={ICON_SIZE.default} height={ICON_SIZE.default} />,
             onSelect: () => void setRemoteSessionId(),
           }]
@@ -395,7 +396,7 @@ export default function SessionRail({
         }}
         className="shrink-0 cursor-pointer"
         title={fullPath}
-        aria-label={`Copy project path ${fullPath}`}
+        aria-label={t('Copy project path {path}', { path: fullPath })}
       >
         <ProjectBadge name={leaf} fullPath={fullPath} className={railPill} />
       </button>
@@ -406,7 +407,7 @@ export default function SessionRail({
       {harnessLabel && <span className="shrink-0 text-xs font-medium text-secondary">{harnessLabel}</span>}
       {agentSessionId ? (
         <button type="button" className="min-w-0 break-all text-left font-mono text-xs text-muted hover:text-primary"
-          title={`${agentSessionId} — click to copy`} aria-label={t('Copy session ID')}
+          title={t('{id} — click to copy', { id: agentSessionId })} aria-label={t('Copy session ID')}
           onClick={() => { copyText(agentSessionId); markIdCopied() }}>
           {idCopied ? t('Copied!') : agentSessionId}
         </button>
@@ -420,7 +421,7 @@ export default function SessionRail({
           {t('Set session ID…')}
         </button>
       )}
-      {conversationId.error && <span role="alert" className="text-xs text-danger">{conversationId.error}</span>}
+      {conversationId.error && <span role="alert" className="text-xs text-danger">{translateServerError(locale, conversationId.error)}</span>}
     </>
   )
 
@@ -445,7 +446,7 @@ export default function SessionRail({
               )}
               <Divider />
               <span className={`${STATUS_SLOT} ${statusClass[session.status]}`}>
-                {statusText[session.status]}
+                {getStatusText(session.status, t)}
               </span>
               {liveContext && (
                 <>
@@ -508,7 +509,7 @@ export default function SessionRail({
           </>
         ) : (
           <span className="text-xs text-muted">
-            {sessionCount} {sessionCount === 1 ? 'session' : t('sessions')}
+            {sessionCount === 1 ? t('1 session') : t('{count} sessions', { count: sessionCount })}
           </span>
         )}
       </div>
@@ -567,7 +568,7 @@ export default function SessionRail({
         {hasTransients && <Divider />}
 
         {connectionStatus !== 'connected' && (
-          <span className="text-xs text-approval">{connectionStatus}</span>
+          <span className="text-xs text-approval">{getConnectionStatusText(connectionStatus, t)}</span>
         )}
 
         {hibernatingSession && (
@@ -598,7 +599,7 @@ export default function SessionRail({
               setMenu(menu ? null : { x: bounds.left, y: bounds.top })
             }}
             className={iconButtonClass('neutral')}
-            title={`Session actions (Kill: ${modDisplay}X)`}
+            title={t('Session actions (Kill: {shortcut})', { shortcut: `${modDisplay}X` })}
             aria-label={t('Session actions')}
             aria-haspopup="menu"
             aria-expanded={menu !== null}

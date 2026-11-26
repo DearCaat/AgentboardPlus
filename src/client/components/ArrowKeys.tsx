@@ -69,6 +69,13 @@ const ARROW_LABELS: Record<ArrowDirection, string> = {
   right: '→',
 }
 
+const ARROW_ARIA_LABELS: Record<ArrowDirection, string> = {
+  up: 'Arrow up',
+  down: 'Arrow down',
+  left: 'Arrow left',
+  right: 'Arrow right',
+}
+
 // Inverted-T layout, like a keyboard: ↑ on top, ← ↓ → below.
 // Grid areas: row 1 = [empty, up, empty], row 2 = [left, down, right]
 const GRID_AREA: Record<ArrowDirection, string> = {
@@ -379,7 +386,7 @@ export default function ArrowKeys({
                 <button
                   key={direction}
                   type="button"
-                  aria-label={`Arrow ${direction}`}
+                  aria-label={t(ARROW_ARIA_LABELS[direction])}
                   className={`
                     flex items-center justify-center
                     rounded-lg text-xl font-bold

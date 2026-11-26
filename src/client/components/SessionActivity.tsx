@@ -7,7 +7,7 @@ import type { AgentActivity } from '@shared/activity'
 import { formatRelativeTime } from '../utils/time'
 import { XCloseIcon } from './icons'
 import { ICON_SIZE } from './controlStyles'
-import { useTranslation } from '../locale'
+import { translateActivityLabel, useLocale, useTranslation } from '../locale'
 
 const activityDot: Record<AgentActivity['phase'], string> = {
   model: 'bg-working',
@@ -19,15 +19,16 @@ const activityDot: Record<AgentActivity['phase'], string> = {
 
 function ActivityLine({ name, activity }: { name: string; activity: AgentActivity }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   return (
     <li className="flex gap-3 py-3">
       <span aria-hidden className={`mt-[5px] size-[6px] shrink-0 rounded-full ${activityDot[activity.phase]}`} />
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
           <span className="min-w-0 break-words text-[13px] font-medium text-primary [overflow-wrap:anywhere]">{name}</span>
-          {activity.updatedAt && <span title={t('Last activity signal')} className="shrink-0 text-[11px] tabular-nums text-secondary"><span className="sr-only">{t('Last signal')}{' '}</span>{formatRelativeTime(activity.updatedAt)}</span>}
+          {activity.updatedAt && <span title={t('Last activity signal')} className="shrink-0 text-[11px] tabular-nums text-secondary"><span className="sr-only">{t('Last signal')}{' '}</span>{formatRelativeTime(activity.updatedAt, locale)}</span>}
         </div>
-        <span className="mt-1 block break-words text-[12px] leading-relaxed text-secondary [overflow-wrap:anywhere]">{activity.label}</span>
+        <span className="mt-1 block break-words text-[12px] leading-relaxed text-secondary [overflow-wrap:anywhere]">{translateActivityLabel(activity.label, locale)}</span>
       </div>
     </li>
   )
@@ -43,6 +44,7 @@ interface Props {
 
 export default function SessionActivity({ session, statusClassName, statusContent, onAnimationEnd, children }: Props) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [open, setOpen] = useState(false)
   const counterRef = useRef<HTMLButtonElement>(null)
   const statusRef = useRef<HTMLButtonElement>(null)
@@ -52,11 +54,11 @@ export default function SessionActivity({ session, statusClassName, statusConten
   useEffect(() => { if (!hasActivity) setOpen(false) }, [hasActivity])
   const data = session.activity
   if (!data) return children(null, <span className={`activity-status relative ${statusClassName}`} onAnimationEnd={onAnimationEnd}>{statusContent}</span>)
-  const summary = session.status === 'permission' ? 'Needs input (terminal signal)' : data.main.label
+  const summary = session.status === 'permission' ? t('Needs input (terminal signal)') : translateActivityLabel(data.main.label, locale)
   const counts = [
-    `${data.running} running`,
-    data.blocked > 0 ? `${data.blocked} awaiting input` : '',
-    data.unknown > 0 ? `${data.unknown} unknown` : '',
+    t('{count} running', { count: data.running }),
+    data.blocked > 0 ? t('{count} awaiting input', { count: data.blocked }) : '',
+    data.unknown > 0 ? t('{count} unknown', { count: data.unknown }) : '',
   ].filter(Boolean).join(', ')
   const counterVisible = data.running + data.blocked + data.unknown > 0
   const stop = (event: { stopPropagation(): void }) => event.stopPropagation()
@@ -71,7 +73,7 @@ export default function SessionActivity({ session, statusClassName, statusConten
           <Tooltip.Trigger delay={350} render={<Popover.Trigger
             ref={counterRef}
             data-testid="session-activity-counter"
-            aria-label={`Show subagents: ${counts}`}
+            aria-label={t('Show subagents: {counts}', { counts })}
             className="activity-counter relative inline-flex shrink-0 cursor-pointer items-center min-h-[24px] min-w-[28px] justify-center rounded-md border border-secondary/25 bg-elevated/70 text-[11px] leading-none tabular-nums text-secondary hover:border-secondary/50 hover:bg-hover hover:text-primary focus-visible:bg-hover focus-visible:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent data-[popup-open]:bg-hover"
             onPointerDown={stop} onTouchStart={stop} onTouchEnd={stop} onClick={event => { event.stopPropagation(); lastTrigger.current = event.currentTarget }}
           />}>
@@ -84,7 +86,7 @@ export default function SessionActivity({ session, statusClassName, statusConten
                 role="tooltip"
                 className="max-w-[min(280px,calc(100vw-16px))] rounded-lg bg-primary px-2.5 py-1.5 text-[11px] leading-relaxed text-base shadow-md"
                 onPointerDown={stop} onClick={stop}
-              >Show subagents · {counts}</Tooltip.Popup>
+              >{t('Show subagents · {counts}', { counts })}</Tooltip.Popup>
             </Tooltip.Positioner>
           </Tooltip.Portal>
         </Tooltip.Root>
@@ -92,7 +94,7 @@ export default function SessionActivity({ session, statusClassName, statusConten
       <Popover.Trigger
         ref={statusRef}
         data-testid="session-activity-status"
-        aria-label={`Activity: ${summary}`}
+        aria-label={t('Activity: {summary}', { summary })}
         title={summary}
         className={`activity-status relative focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent ${statusClassName}`}
         onAnimationEnd={onAnimationEnd}
@@ -117,23 +119,23 @@ export default function SessionActivity({ session, statusClassName, statusConten
             </div>
             <Popover.Description className="sr-only">{t('Activity for the main session and its subagents.')}</Popover.Description>
             <ul aria-label={t('Main session')} className="mt-1">
-              <ActivityLine name="Main session" activity={{ ...data.main, phase: session.status === 'permission' ? 'blocked' : data.main.phase, label: summary }} />
+              <ActivityLine name={t('Main session')} activity={{ ...data.main, phase: session.status === 'permission' ? 'blocked' : data.main.phase, label: summary }} />
             </ul>
             {data.total > 0 && (
               <section aria-label={t('Subagents')} className="mt-1 border-t border-border pt-3">
                 <div className="flex items-baseline justify-between gap-3">
                   <h3 className="text-[12px] font-medium">{t('Subagents')}{' '}<span className="ml-1 tabular-nums text-secondary">{data.total}</span></h3>
-                  <span className="text-[11px] tabular-nums text-secondary">{data.running}{' '}{t('running')}</span>
+                  <span className="text-[11px] tabular-nums text-secondary">{t('{count} running', { count: data.running })}</span>
                 </div>
                 {(data.blocked > 0 || data.unknown > 0) && (
                   <p className="mt-1 text-[11px] text-secondary">
-                    {[data.blocked > 0 ? `${data.blocked} awaiting input` : '', data.unknown > 0 ? `${data.unknown} unknown` : ''].filter(Boolean).join(' · ')}
+                    {[data.blocked > 0 ? t('{count} awaiting input', { count: data.blocked }) : '', data.unknown > 0 ? t('{count} unknown', { count: data.unknown }) : ''].filter(Boolean).join(' · ')}
                   </p>
                 )}
                 <ul aria-label={t('Subagent activity')} className="mt-1">
                   {data.subagents.map(child => <ActivityLine key={child.id} name={child.name} activity={child.activity} />)}
                 </ul>
-                {data.truncated && <p className="pb-3 text-[12px] leading-relaxed text-secondary">Showing {data.subagents.length} of {data.total} subagents. Uninspected activity is unknown.</p>}
+                {data.truncated && <p className="pb-3 text-[12px] leading-relaxed text-secondary">{t('Showing {shown} of {total} subagents. Uninspected activity is unknown.', { shown: data.subagents.length, total: data.total })}</p>}
               </section>
             )}
             <details className="mt-1 border-t border-border pt-3 text-[11px] leading-relaxed text-secondary">

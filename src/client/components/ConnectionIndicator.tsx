@@ -97,11 +97,11 @@ export default function ConnectionIndicator({
     <div ref={containerRef} className="flex shrink-0">
       <button
         type="button"
-        aria-label={`${label}. Tailscale remote access`}
+        aria-label={t('{label}. Tailscale remote access', { label })}
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls={open ? popoverId : undefined}
-        title={`${t(statusLabel[connectionStatus])} - Tailscale ${tailscaleIp}`}
+        title={t('{status} - Tailscale {ip}', { status: t(statusLabel[connectionStatus]), ip: tailscaleIp })}
         onClick={() => setOpen((value) => !value)}
         className={ICON_BUTTON_CLASS}
       >

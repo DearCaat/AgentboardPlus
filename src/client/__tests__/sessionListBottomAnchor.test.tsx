@@ -133,7 +133,7 @@ function outline(node: Json | Json[], out: string[] = []): string[] {
   }
   if (typeof node === 'string') {
     if (['Active', 'Hibernating', 'History'].includes(node)) out.push(`label:${node}`)
-    else if (node === 'Show more (') out.push('show-more')
+    else if (node.startsWith('Show more (')) out.push('show-more')
     else if (/^hist-\d+$/.test(node)) out.push(node)
     return out
   }
@@ -273,7 +273,7 @@ describe('SessionList anchor: dormant sections', () => {
     const renderer = renderList({ anchor: 'bottom' })
     const showMore = () =>
       renderer.root.find(
-        (n) => n.type === 'button' && Array.isArray(n.props.children) && n.props.children[0] === 'Show more ('
+        (n) => n.type === 'button' && ((typeof n.props.children === 'string' && n.props.children.startsWith('Show more (')) || (Array.isArray(n.props.children) && n.props.children[0] === 'Show more ('))
       )
     act(() => showMore().props.onClick())
     const tokens = outline(renderer.toJSON())

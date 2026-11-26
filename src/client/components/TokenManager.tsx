@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import SessionAccessForm from './SessionAccessForm'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 interface Grant {
   id: string
@@ -13,6 +13,7 @@ interface GrantList { hosts: string[]; grants: Grant[] }
 
 export default function TokenManager({ onClose }: { onClose: () => void }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const dialog = useRef<HTMLDialogElement>(null)
   const [data, setData] = useState<GrantList>()
   const [label, setLabel] = useState('')
@@ -132,7 +133,7 @@ export default function TokenManager({ onClose }: { onClose: () => void }) {
             }}>{t('Cancel edit')}</button>}
           </div>
         </form>
-        {feedback && <p role="status" className="text-sm text-secondary">{feedback}</p>}
+        {feedback && <p role="status" className="text-sm text-secondary">{translateServerError(locale, feedback)}</p>}
         {data?.grants.length ? (
           <ul className="divide-y divide-border border-t border-border">
             {data.grants.map((grant) => (

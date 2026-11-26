@@ -21,6 +21,7 @@ import { installMobileAutocorrect } from '../utils/mobileAutocorrect'
 import { clipboardFiles } from '../utils/browserFiles'
 import { setAppOwnsMouse } from '../utils/iosSelection'
 import { terminalMouseCell } from '../utils/terminalMouseCell'
+import { translate, useLocale } from '../locale'
 
 // Module-level snapshot cache: sessionId → serialized terminal content.
 // Survives component remounts and avoids stale-closure issues in effects.
@@ -918,7 +919,7 @@ export function useTerminal({
       // Truncate long URLs
       const displayUrl = sanitized.length > 60 ? sanitized.slice(0, 57) + '...' : sanitized
       tooltipUrl.textContent = displayUrl
-      tooltipHint.textContent = `${getIsMac() ? '⌘' : 'Ctrl'}+click to open`
+      tooltipHint.textContent = translate(useLocale.getState().locale, '{mod}+click to open', { mod: getIsMac() ? '⌘' : 'Ctrl' })
       tooltip.style.left = `${event.clientX - rect.left + 10}px`
       tooltip.style.top = `${event.clientY - rect.top + 10}px`
       tooltip.style.display = 'block'

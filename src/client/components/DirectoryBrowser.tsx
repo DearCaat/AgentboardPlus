@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import { FolderIcon, ChevronRightIcon } from './icons'
 import { useDirectoryListing } from '../hooks/useDirectoryListing'
 import { useFocusTrap } from './settings/useDialogFocus'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 interface DirectoryBrowserProps {
   onSelect: (path: string) => void
@@ -14,6 +14,7 @@ interface DirectoryBrowserProps {
 
 export function DirectoryBrowser({ onSelect, onCancel, initialPath }: DirectoryBrowserProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [path, setPath] = useState(initialPath || '~')
   const [draft, setDraft] = useState(initialPath || '~')
   const [query, setQuery] = useState('')
@@ -94,7 +95,7 @@ export function DirectoryBrowser({ onSelect, onCancel, initialPath }: DirectoryB
           }}>
           {loading ? <p role="status" className="p-3 text-sm text-secondary" data-testid="directory-loading">{t('Loading folders…')}</p>
             : error ? <div role="alert" className="p-3 text-sm" data-testid="directory-error">
-              <p className="text-danger">{error}</p>
+              <p className="text-danger">{translateServerError(locale, error)}</p>
               <button type="button" className="btn mt-3" onClick={() => setRetry(n => n + 1)}>{t('Retry')}</button>
             </div>
             : !listing?.directories.length ? <p className="p-3 text-sm text-secondary" data-testid="directory-empty">
@@ -116,8 +117,8 @@ export function DirectoryBrowser({ onSelect, onCancel, initialPath }: DirectoryB
           <div className="flex justify-end gap-2">
             <button type="button" onClick={onCancel} className="btn min-h-[44px] sm:min-h-0">{t('Cancel')}</button>
             <button type="button" disabled={!canChoose} onClick={() => { if (canChoose) onSelect(listing.path) }}
-              className="btn btn-primary min-h-[44px] sm:min-h-0 max-w-[75%] truncate" title={`Use ${displayPath}`} data-testid="directory-choose">
-              {listing ? `Use “${name}”` : t('Use folder')}
+              className="btn btn-primary min-h-[44px] sm:min-h-0 max-w-[75%] truncate" title={t('Use {path}', { path: displayPath })} data-testid="directory-choose">
+              {listing ? t('Use “{name}”', { name }) : t('Use folder')}
             </button>
           </div>
         </div>

@@ -250,7 +250,7 @@ export default function TerminalControls({
     <button
       key={control.key}
       type="button"
-      aria-label={control.ariaLabel}
+      aria-label={control.ariaLabel ? t(control.ariaLabel) : undefined}
       className={`
         terminal-key
         flex items-center justify-center
@@ -382,7 +382,7 @@ export default function TerminalControls({
         {renderControlKey(KEY_TAB)}
         <button
           type="button"
-          aria-label="Shift"
+          aria-label={t('Shift')}
           aria-pressed={shiftActive}
           className={`terminal-key flex items-center justify-center size-[44px] p-0 text-sm font-medium rounded-md active:scale-95 transition-transform duration-75 select-none touch-manipulation
             ${shiftActive ? 'bg-accent/20 text-accent border border-accent/40' : 'bg-surface border border-border text-secondary'}

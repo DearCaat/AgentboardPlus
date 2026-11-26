@@ -22,7 +22,7 @@ function soundControl(key: SoundKey, setter: SoundSetter, play: () => Promise<vo
         <button
           type="button"
           className={CONTROL_BUTTON}
-          aria-label={`Test ${noun}`}
+          aria-label={t('Test {noun}', { noun: t(noun) })}
           onClick={() => void play()}
         >
           {t('Test')}

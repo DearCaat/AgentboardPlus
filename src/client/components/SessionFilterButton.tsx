@@ -34,7 +34,7 @@ import { getDisambiguatedProjectNames, getPathLeaf } from '../utils/sessionLabel
 import { ICON_SIZE, TOUCH_TARGET_CLASS, iconButtonClass } from './controlStyles'
 import { FilterFunnel02Icon } from './icons'
 import FilterChecklist from './FilterChecklist'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 /** The search field shows when hosts + projects exceed this many options. */
 export const FILTER_SEARCH_THRESHOLD = 8
@@ -86,6 +86,7 @@ export default function SessionFilterButton({
   onOpenChange,
 }: SessionFilterButtonProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const [localOpen, setOpenState] = useState(false)
   const open = controlledOpen ?? localOpen
   const [query, setQuery] = useState('')
@@ -112,18 +113,18 @@ export default function SessionFilterButton({
   const isActive = activeCount > 0
   const showDot = hasHiddenPermissions && selectedProjects.length > 0
 
-  let title = 'Filter'
+  let title = t('Filter')
   if (isActive) {
     const parts: string[] = []
     if (selectedProjects.length > 0) {
-      parts.push(`Projects: ${selectedProjects.map(projectLabel).join(', ')}`)
+      parts.push(t('Projects: {projects}', { projects: selectedProjects.map(projectLabel).join(', ') }))
     }
-    if (selectedHosts.length > 0) parts.push(`Hosts: ${selectedHosts.join(', ')}`)
-    title = `Filtered by ${parts.join('; ')}`
+    if (selectedHosts.length > 0) parts.push(t('Hosts: {hosts}', { hosts: selectedHosts.join(', ') }))
+    title = t('Filtered by {parts}', { parts: parts.join('; ') })
   }
   const ariaLabel = isActive
-    ? `Filter, ${activeCount} active filter${activeCount === 1 ? '' : 's'}`
-    : 'Filter'
+    ? (activeCount === 1 ? t('Filter, 1 active filter') : t('Filter, {count} active filters', { count: activeCount }))
+    : t('Filter')
 
   const optionCount = projects.length + (showHosts ? hosts.length : 0)
   const showSearch = optionCount > FILTER_SEARCH_THRESHOLD
@@ -276,7 +277,7 @@ export default function SessionFilterButton({
             {renderHosts && (
               <FilterChecklist
                 heading={t('Hosts')}
-                emptyLabel="No hosts"
+                emptyLabel={t('No hosts')}
                 options={hosts}
                 visibleOptions={visibleHosts}
                 selected={selectedHosts}
@@ -284,18 +285,18 @@ export default function SessionFilterButton({
                 labelFor={(host) => host}
                 titleFor={(host) => {
                   const status = statusMap.get(host)
-                  return status?.error ? `${host}: ${status.error}` : host
+                  return status?.error ? `${host}: ${translateServerError(locale, status.error)}` : host
                 }}
                 noteFor={(host) => {
                   const status = statusMap.get(host)
-                  return status && !status.ok ? 'offline' : null
+                  return status && !status.ok ? t('offline') : null
                 }}
               />
             )}
             {renderProjects && (
               <FilterChecklist
                 heading={t('Projects')}
-                emptyLabel="No projects"
+                emptyLabel={t('No projects')}
                 options={projects}
                 visibleOptions={visibleProjects}
                 selected={selectedProjects}

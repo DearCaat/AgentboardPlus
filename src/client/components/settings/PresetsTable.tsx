@@ -146,7 +146,7 @@ export function PresetsTable({ ids }: RowControlProps) {
           {t('Add preset')}
         </button>
         {presets.length >= MAX_PRESETS && (
-          <span className={HELP_TEXT}>{t('Maximum of')}{' '}{MAX_PRESETS}{' '}{t('presets.')}</span>
+          <span className={HELP_TEXT}>{t('Maximum of {count} presets.', { count: MAX_PRESETS })}</span>
         )}
       </div>
     </div>

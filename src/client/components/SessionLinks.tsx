@@ -7,7 +7,7 @@ import { ICON_SIZE } from './controlStyles'
 import { ChevronRightIcon } from './icons'
 import { CopyLinkButton } from './CopyLinkButton'
 import { linkPresentation } from '../lib/linkPresentation'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 function LinkRow({ item, onPreview }: { item: SessionMedia; onPreview?: (item: SessionMedia) => void }) {
   const t = useTranslation()
@@ -22,10 +22,10 @@ function LinkRow({ item, onPreview }: { item: SessionMedia; onPreview?: (item: S
         {subtitle && <span className="mt-0.5 line-clamp-2 break-words text-[11px] leading-[16px] text-secondary [overflow-wrap:anywhere]">{subtitle}</span>}
         {detail && <span className="mt-0.5 line-clamp-2 break-all text-[11px] leading-[16px] text-secondary">{detail}</span>}
       </a>
-      {onPreview && <button type="button" aria-label={`Preview ${title}`} onClick={() => onPreview(item)}
+      {onPreview && <button type="button" aria-label={t('Preview {title}', { title })} onClick={() => onPreview(item)}
         className="min-h-[44px] shrink-0 rounded px-2 text-[12px] text-secondary hover:bg-hover hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">{t('Preview')}</button>}
       {item.externalUrl && <CopyLinkButton url={item.externalUrl} label={title} />}
-      {item.sourceText && <button type="button" aria-label={`Source for ${title}`} aria-expanded={showSource}
+      {item.sourceText && <button type="button" aria-label={t('Source for {title}', { title })} aria-expanded={showSource}
         onClick={() => setShowSource(value => !value)}
         className="flex h-[44px] w-[36px] shrink-0 items-center justify-center rounded text-secondary hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">
         <ChevronRightIcon width={ICON_SIZE.primary} height={ICON_SIZE.primary} className={showSource ? 'rotate-90' : ''} />
@@ -39,6 +39,7 @@ function LinkRow({ item, onPreview }: { item: SessionMedia; onPreview?: (item: S
 
 export default function SessionLinks({ session, ready, search, onRefresh, onPreview }: { session: Session; ready: boolean; search: string; onRefresh: () => void; onPreview?: (item: SessionMedia) => void }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const pages = useMediaPages(session.agentSessionId, session.mediaSummary, true, ready, { kind: 'links', search })
   const scroll = useRef<HTMLDivElement>(null)
   // Paging replaces a bounded group of rows. Explicit navigation avoids scroll
@@ -53,13 +54,13 @@ export default function SessionLinks({ session, ready, search, onRefresh, onPrev
     <div ref={scroll} data-testid="links-scroll" role="region" aria-label={t('Session links, newest first')}
       className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
       {!!current?.page.omittedItems && !session.mediaSummary?.omittedItems && <p className="px-3 py-2 text-xs text-secondary">
-        Some items could not be listed because their details are too large ({current.page.omittedItems}).
+        {t('Some items could not be listed because their details are too large ({count}).', { count: current.page.omittedItems })}
       </p>}
       {current?.page.items.map(item => <LinkRow key={item.url} item={item} onPreview={onPreview} />)}
       {current && !current.page.items.length && pages.discovery.status === 'ready' && <p className="px-3 py-4 text-xs text-secondary">
         {search ? t('No matching links.') : t('No web links in this session yet.')}
       </p>}
-      {pages.error && <p role="alert" className="px-3 py-2 text-xs text-secondary">{pages.error} <button type="button"
+      {pages.error && <p role="alert" className="px-3 py-2 text-xs text-secondary">{translateServerError(locale, pages.error)} <button type="button"
         onClick={() => { setPageNumber(0); onRefresh(); void pages.refresh() }} className="text-accent">{t('Retry')}</button></p>}
       {!pages.error && <MediaDiscoveryStatus discovery={pages.discovery} kind="links" hasItems={Boolean(current?.page.items.length)} />}
       {pages.status === 'loading' && pages.discovery.status === 'ready' && <p role="status" className="px-3 py-2 text-xs text-secondary">{t('Loading links…')}</p>}

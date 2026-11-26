@@ -55,7 +55,7 @@ export function PresetRow({
   const [confirming, setConfirming] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
   const base = `settings-preset-${preset.id}`
-  const name = preset.label.trim() || `preset ${index + 1}`
+  const name = preset.label.trim() || t('preset {n}', { n: index + 1 })
 
   useEffect(() => {
     if (autoFocusName) nameRef.current?.focus()
@@ -84,7 +84,7 @@ export function PresetRow({
           checked={isDefault}
           disabled={pending}
           onChange={onSetDefault}
-          aria-label={`Default preset: ${name}`}
+          aria-label={t('Default preset: {name}', { name })}
           className="size-4 cursor-pointer accent-accent disabled:cursor-not-allowed"
         />
         <span aria-hidden="true" className="text-[12px] text-secondary md:hidden">{t('Default')}</span>
@@ -99,13 +99,13 @@ export function PresetRow({
         <select
           id={`${base}-icon`}
           value={preset.agentType ?? ''}
-          aria-label={`Icon for ${name}`}
+          aria-label={t('Icon for {name}', { name })}
           onChange={(event) => onIconChange((event.target.value || undefined) as AgentType | undefined)}
           className={cn(CONTROL_INPUT, 'w-full px-1')}
         >
           {PRESET_ICON_OPTIONS.map((option) => (
             <option key={option.value} value={option.value}>
-              {option.label}
+              {option.value === '' ? t(option.label) : option.label}
             </option>
           ))}
         </select>
@@ -116,7 +116,7 @@ export function PresetRow({
         id={`${base}-label`}
         value={preset.label}
         placeholder={t('Name')}
-        aria-label={`Name of preset ${index + 1}`}
+        aria-label={t('Name of preset {n}', { n: index + 1 })}
         maxLength={PRESET_LABEL_MAX}
         onCommit={(draft) => onCommitField('label', draft)}
         wrapperClassName="max-md:order-4 max-md:col-span-3"
@@ -125,7 +125,7 @@ export function PresetRow({
         id={`${base}-command`}
         value={preset.command}
         placeholder="command --flags"
-        aria-label={`Command for ${name}`}
+        aria-label={t('Command for {name}', { name })}
         maxLength={PRESET_COMMAND_MAX}
         spellCheck={false}
         autoCapitalize="off"
@@ -145,7 +145,7 @@ export function PresetRow({
           // discarding it.
           onPointerDown={pending ? (event) => event.preventDefault() : undefined}
           onBlur={() => setConfirming(false)}
-          aria-label={confirming ? `Confirm delete ${name}` : pending ? `Discard new preset` : `Delete ${name}`}
+          aria-label={confirming ? t('Confirm delete {name}', { name }) : pending ? t('Discard new preset') : t('Delete {name}', { name })}
           title={confirming ? t('Click again to delete') : undefined}
           className={cn(
             CONTROL_BUTTON_SHAPE,

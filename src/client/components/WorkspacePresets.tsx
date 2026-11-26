@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { AgentType, Session } from '@shared/types'
 import { getSessionDisplayName, useSessionOrganizationStore, type WorkspaceView } from '../stores/sessionOrganizationStore'
 import { useSessionStore } from '../stores/sessionStore'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 const endpoint = '/api/workspace/presets'
 const harnesses: ReadonlyArray<[AgentType, string]> = [
@@ -35,6 +35,7 @@ export default function WorkspacePresets({
   onClose: () => void
 }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const dialog = useRef<HTMLDialogElement>(null)
   const organization = useSessionOrganizationStore(state => state.organization)
   const workspaceId = useSessionOrganizationStore(state => state.workspace.id)
@@ -96,7 +97,7 @@ export default function WorkspacePresets({
   async function save(event: FormEvent) {
     event.preventDefault()
     setFeedback('')
-    setBusy(editing ? 'Updating…' : 'Saving…')
+    setBusy(editing ? t('Updating…') : t('Saving…'))
     setResults(undefined)
     try {
       const layout = {
@@ -118,7 +119,7 @@ export default function WorkspacePresets({
       })
       setPresets(current => editing ? current.map(entry => entry.id === preset.id ? preset : entry) : [...current, preset])
       showPresets()
-      setFeedback((editing ? 'Updated ' : 'Saved ') + preset.name)
+      setFeedback(editing ? t('Updated {name}', { name: preset.name }) : t('Saved {name}', { name: preset.name }))
     } catch (error) {
       setFeedback(error instanceof Error ? error.message : 'Could not save preset')
     } finally {
@@ -129,12 +130,12 @@ export default function WorkspacePresets({
   async function deletePreset(preset: Preset) {
     setFeedback('')
     setResults(undefined)
-    setBusy('Deleting ' + preset.name + '…')
+    setBusy(t('Deleting {name}…', { name: preset.name }))
     try {
       await request('/' + encodeURIComponent(preset.id), { method: 'DELETE' })
       setPresets(current => current.filter(entry => entry.id !== preset.id))
       setDeleting(undefined)
-      setFeedback('Deleted ' + preset.name)
+      setFeedback(t('Deleted {name}', { name: preset.name }))
     } catch (error) {
       setFeedback(error instanceof Error ? error.message : 'Could not delete preset')
     } finally {
@@ -146,14 +147,14 @@ export default function WorkspacePresets({
     setDeleting(undefined)
     setFeedback('')
     setResults(undefined)
-    setBusy((action === 'load' ? 'Loading ' : 'Restoring ') + preset.name + '…')
+    setBusy(action === 'load' ? t('Loading {name}…', { name: preset.name }) : t('Restoring {name}…', { name: preset.name }))
     try {
       await useSessionOrganizationStore.getState().finishSaving()
       const view = await request('/' + preset.id + '/' + action, { method: 'POST' })
       if (useSessionOrganizationStore.getState().profileId !== profileId) return
       useSessionOrganizationStore.getState().applyWorkspace(view)
       if (action === 'load') {
-        setFeedback('Loaded ' + preset.name)
+        setFeedback(t('Loaded {name}', { name: preset.name }))
         return
       }
       const restored: RestoreResult = view
@@ -163,7 +164,7 @@ export default function WorkspacePresets({
       }
       setResults(restored.results)
       const started = restored.results.filter(result => result.state === 'started').length
-      setFeedback('Started ' + started + ' missing sessions')
+      setFeedback(t('Started {count} missing sessions', { count: started }))
     } catch (error) {
       setFeedback(error instanceof Error ? error.message : 'Preset request failed')
     } finally {
@@ -263,11 +264,11 @@ export default function WorkspacePresets({
           ))}
         </ul>
       )}
-      {(busy || feedback) && <p role="status" className="mt-3 text-sm text-secondary">{t(busy || feedback)}</p>}
+      {(busy || feedback) && <p role="status" className="mt-3 text-sm text-secondary">{busy || translateServerError(locale, feedback)}</p>}
       {!!results?.some(result => result.error) && (
         <ul className="mt-2 space-y-1 text-sm text-secondary">
           {results.filter(result => result.error).map((result, index) => (
-            <li key={index}>{result.label} · {t(result.error ?? '')}</li>
+            <li key={index}>{result.label} · {translateServerError(locale, result.error ?? '')}</li>
           ))}
         </ul>
       )}

@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { clipboardFiles } from '../utils/browserFiles'
 import type { BrowserPaste, PasteState } from '../hooks/useBrowserPaste'
-import { useTranslation } from '../locale'
+import { translateServerError, useLocale, useTranslation } from '../locale'
 
 export default function PasteStatus({ state, cancel, retry, paste, allowFiles }: {
   state: PasteState
@@ -13,10 +13,11 @@ export default function PasteStatus({ state, cancel, retry, paste, allowFiles }:
   allowFiles?: boolean
 }) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   if (state.status === 'idle') return null
   if (state.status === 'awaiting-paste') return <PasteComposer cancel={cancel} paste={paste} allowFiles={allowFiles} />
   return <div className="flex items-center gap-3 border-t border-border bg-elevated px-3 py-2 text-sm text-primary">
-    <span role={state.status === 'error' ? 'alert' : 'status'}>{state.status === 'error' ? state.message : state.status === 'reading' ? t('Reading clipboard…') : t('Uploading files…')}</span>
+    <span role={state.status === 'error' ? 'alert' : 'status'}>{state.status === 'error' ? translateServerError(locale, state.message) : state.status === 'reading' ? t('Reading clipboard…') : t('Uploading files…')}</span>
     {state.status === 'error' && <button type="button" className="min-h-[44px] px-2" onClick={retry}>{t('Retry')}</button>}
     <button type="button" className="min-h-[44px] px-2 text-secondary" onClick={cancel}>{state.status === 'error' ? t('Dismiss') : t('Cancel')}</button>
   </div>
@@ -59,7 +60,7 @@ function PasteComposer({ cancel, paste, allowFiles }: {
       {files.length > 0 && <ul className="mt-2 space-y-2 text-sm">{files.map((file, index) => <li key={index} className="flex items-center gap-2">
         {file.type.startsWith('image/') && <ImageThumbnail file={file} />}
         <span className="min-w-0 flex-1 truncate">{file.name}</span>
-        <button type="button" className="min-h-[44px] px-2" aria-label={`Remove ${file.name}`}
+        <button type="button" className="min-h-[44px] px-2" aria-label={t('Remove {name}', { name: file.name })}
           onClick={() => setFiles(pending => pending.filter((_, i) => i !== index))}>{t('Remove')}</button>
       </li>)}</ul>}
       <div className="mt-3 flex justify-end gap-2">
@@ -74,6 +75,7 @@ function PasteComposer({ cancel, paste, allowFiles }: {
 
 /** Keep preview URLs local to the attachment and release them when it changes or is removed. */
 function ImageThumbnail({ file }: { file: File }) {
+  const t = useTranslation()
   const [preview, setPreview] = useState<{ file: File; url: string } | null>(null)
   const [failed, setFailed] = useState(false)
   useEffect(() => {
@@ -83,7 +85,7 @@ function ImageThumbnail({ file }: { file: File }) {
     return () => URL.revokeObjectURL(url)
   }, [file])
   if (!preview || preview.file !== file || failed) return null
-  return <img src={preview.url} alt={`Preview of ${file.name}`} width={64} height={64}
+  return <img src={preview.url} alt={t('Preview of {name}', { name: file.name })} width={64} height={64}
     className="h-16 w-16 shrink-0 rounded border border-border bg-surface object-contain"
     onError={() => setFailed(true)} />
 }

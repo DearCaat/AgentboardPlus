@@ -5,6 +5,7 @@
  */
 
 import { useState, useRef, useCallback, useEffect, type TouchEvent } from 'react'
+import { useTranslation } from '../locale'
 
 interface NumPadProps {
   onSendKey: (key: string) => void
@@ -90,6 +91,7 @@ export default function NumPad({
   onRefocus,
   isKeyboardVisible,
 }: NumPadProps) {
+  const t = useTranslation()
   const [isOpen, setIsOpen] = useState(false)
   const [activeNum, setActiveNum] = useState<string | null>(null)
   const [padPosition, setPadPosition] = useState({ x: 0, y: 0 })
@@ -304,7 +306,7 @@ export default function NumPad({
                 className="text-center text-white text-sm font-medium select-none"
                 style={{ marginTop: GAP + 2, height: 20 }}
               >
-                {activeNum ? `Release to send "${activeNum}"` : '\u00A0'}
+                {activeNum ? t('Release to send "{key}"', { key: activeNum }) : '\u00A0'}
               </div>
             </div>
           </div>

@@ -4,7 +4,7 @@ import { formatRelativeTime } from '../utils/time'
 import { getPathLeaf } from '../utils/sessionLabel'
 import AgentIcon from './AgentIcon'
 import SessionPreviewContent from './SessionPreviewContent'
-import { useTranslation } from '../locale'
+import { useLocale, useTranslation } from '../locale'
 
 interface SessionPreviewModalProps {
   session: AgentSession
@@ -18,6 +18,7 @@ export default function SessionPreviewModal({
   onResume,
 }: SessionPreviewModalProps) {
   const t = useTranslation()
+  const locale = useLocale((s) => s.locale)
   const modalRef = useRef<HTMLDivElement>(null)
   const [previewState, setPreviewState] = useState({
     loading: true,
@@ -50,7 +51,7 @@ export default function SessionPreviewModal({
   }, [])
 
   const displayName = session.displayName || getPathLeaf(session.projectPath) || session.sessionId.slice(0, 8)
-  const lastActivity = formatRelativeTime(session.lastActivityAt)
+  const lastActivity = formatRelativeTime(session.lastActivityAt, locale)
 
   return (
     <div

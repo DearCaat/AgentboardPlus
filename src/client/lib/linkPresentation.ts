@@ -1,4 +1,6 @@
 /** Local-only link labels: preserve destination distinctions without fetching page titles. */
+import { translate, useLocale } from '../locale'
+
 export function linkPresentation(destination: string, label?: string) {
   const display = destination.replace(/^https:\/\//i, '')
   let parsed: URL
@@ -13,7 +15,7 @@ export function linkPresentation(destination: string, label?: string) {
   if (pr && !meaningful) {
     const anchor = /^#issuecomment-(\d+)$/.exec(parsed.hash)
     return { title: `${pr[2]} · PR #${pr[3]}`, subtitle: `github.com/${pr[1]}`,
-      detail: [pr[4], parsed.search, anchor ? `Comment #${anchor[1]}` : parsed.hash].filter(Boolean).join(' · ') }
+      detail: [pr[4], parsed.search, anchor ? translate(useLocale.getState().locale, 'Comment #{number}', { number: anchor[1] }) : parsed.hash].filter(Boolean).join(' · ') }
   }
   // HTTP remains explicit so http/https destinations never look identical.
   const base = (suffix ? destination.slice(0, -suffix.length) : destination).replace(/^https:\/\//i, '')

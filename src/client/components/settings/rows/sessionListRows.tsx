@@ -128,7 +128,7 @@ function HistoryLookbackControl({ ids }: RowControlProps) {
         onCommit={(draft) => {
           const hours = parseClampedInt(draft, HISTORY_MAX_AGE_MIN_HOURS, HISTORY_MAX_AGE_MAX_HOURS)
           if (hours === null) {
-            return `Enter ${HISTORY_MAX_AGE_MIN_HOURS}–${HISTORY_MAX_AGE_MAX_HOURS}`
+            return t('Enter {min}–{max}', { min: HISTORY_MAX_AGE_MIN_HOURS, max: HISTORY_MAX_AGE_MAX_HOURS })
           }
           if (hours !== value) set(hours)
           return null

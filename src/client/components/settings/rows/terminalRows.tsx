@@ -14,6 +14,7 @@ import { SegmentedControl } from '../controls/SegmentedControl'
 import { SWITCH_TOUCH_TARGET } from '../styles'
 import type { RowControlProps, SettingsRowDef } from '../types'
 import { useServerSetting, type ServerSettingName } from '../useServerSetting'
+import { useTranslation } from '../../../locale'
 
 const SHORTCUTS = [
   ['Session above', '['],
@@ -84,6 +85,7 @@ const MODIFIER_CHOICES: readonly ModifierChoice[] = [
 ]
 
 function ShortcutModifierControl({ ids }: RowControlProps) {
+  const t = useTranslation()
   const value = useSettingsStore((state) => state.shortcutModifier)
   const set = useSettingsStore((state) => state.setShortcutModifier)
   const mod = getModifierDisplay(getEffectiveModifier(value))
@@ -92,7 +94,7 @@ function ShortcutModifierControl({ ids }: RowControlProps) {
       <SegmentedControl<ModifierChoice>
         options={MODIFIER_CHOICES.map((choice) => ({
           value: choice,
-          label: choice === 'auto' ? 'Auto' : getModifierDisplay(choice),
+          label: choice === 'auto' ? t('Auto') : getModifierDisplay(choice),
         }))}
         value={value}
         onChange={set}
@@ -101,7 +103,7 @@ function ShortcutModifierControl({ ids }: RowControlProps) {
       />
       <dl className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-6 gap-y-2 text-[12px] text-secondary">
         {SHORTCUTS.map(([label, key]) => (
-          <ShortcutEntry key={key} label={label} shortcut={`${mod}${key}`} />
+          <ShortcutEntry key={key} label={t(label)} shortcut={`${mod}${key}`} />
         ))}
       </dl>
     </div>

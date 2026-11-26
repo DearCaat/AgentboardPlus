@@ -162,7 +162,7 @@ export function HistorySection({
       onClick={() => setLimit((prev) => prev + HISTORY_PAGE_SIZE)}
       className={`w-full px-3 py-2 text-center text-xs text-muted hover:text-primary hover:bg-hover ${MOBILE_ROW_TARGET_CLASS}`}
     >
-      Show more ({sessions.length - limit} remaining)
+      {t('Show more ({count} remaining)', { count: sessions.length - limit })}
     </button>
   )
 
